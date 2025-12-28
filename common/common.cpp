@@ -1384,6 +1384,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.cuda_params = argv[i];
         return true;
     }
+    if (arg == "-mtp" || arg == "--multi-token-prediction") {
+        params.has_mtp = true;
+        return true;
+    }
     if (arg == "-draft" || arg == "--draft-params") {
         CHECK_ARG
         params.draft_params = argv[i];
@@ -3066,6 +3070,7 @@ struct llama_model_params llama_model_params_from_gpt_params(const gpt_params & 
     mparams.use_thp         = params.use_thp;
     mparams.validate_quants = params.validate_quants;
     mparams.merge_qkv       = params.merge_qkv;
+    mparams.mtp             = params.has_mtp;
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {

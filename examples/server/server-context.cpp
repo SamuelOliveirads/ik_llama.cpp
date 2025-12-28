@@ -159,6 +159,15 @@ bool server_context::load_model(const gpt_params& params_) {
         model_draft = llama_init_dft.model;
         ctx_draft = llama_init_dft.context;
     }
+    // if model has MTP and no draft model is specified...
+    else if (llama_model_n_nextn_layer(model) > 0) {
+        SRV_INF("model has nextn layers = %d\n", llama_model_n_nextn_layer(model));
+        params.has_mtp = true;
+
+
+        SRV_INF("%s\n", "MTP needs embeddings on decode, enabling");
+        llama_set_embeddings(ctx, true);
+    }
     return true;
 }
 
@@ -2597,6 +2606,7 @@ void server_context::update_slots() {
             batch.n_seq_id + i,
             batch.seq_id + i,
             batch.logits + i,
+            { MTP_OP_NONE },
             0, 0, 0, // unused
         };
 
@@ -2632,6 +2642,10 @@ void server_context::update_slots() {
                 });
 
             continue; // continue loop of n_batch
+        }
+
+        if (params.has_mtp) {
+            mtp_update_kv_cache(ctx, batch_view, true);
         }
 
         for (auto& slot : slots) {
@@ -2725,13 +2739,33 @@ void server_context::update_slots() {
 
             llama_token id = slot.sampled;
 
+            llama_tokens draft;
+
             struct llama_speculative_params params_spec;
             params_spec.n_draft = n_draft_max;
-            params_spec.n_reuse = cparams_dft.n_ctx - slot.params.speculative.n_max;
             params_spec.p_min = slot.params.speculative.p_min;
 
-            const std::vector<llama_token>& cached_text_tokens = slot.cache_tokens.tokens_data();
-            std::vector<llama_token> draft = llama_speculative_gen_draft(slot.spec, params_spec, cached_text_tokens, id);
+            if (slot.ctx_dft) {
+                params_spec.n_reuse = cparams_dft.n_ctx - slot.params.speculative.n_max;
+            } else {
+                params_spec.n_reuse = 0;
+            }
+            if (params.has_mtp) {
+                llama_set_draft_input_hidden_state(ctx, llama_get_embeddings_ith(ctx, -1));
+
+                draft = mtp_speculative_gen_draft(
+                    slot.ctx_sampling, 
+                    ctx,
+                    params_spec,
+                    slot.sampled, 
+                    slot.n_past,
+                    slot.id
+                );
+            }
+            else {
+                const std::vector<llama_token>& cached_text_tokens = slot.cache_tokens.tokens_data();
+                std::vector<llama_token> draft = llama_speculative_gen_draft(slot.spec, params_spec, cached_text_tokens, id);
+            }
 
             // ignore small drafts
             if (slot.params.speculative.n_min > (int)draft.size()) {
@@ -2759,6 +2793,16 @@ void server_context::update_slots() {
 
             // the accepted tokens from the speculation
             std::vector<llama_token> ids = llama_sampling_sample_and_accept_n(slot.ctx_sampling, ctx, draft);
+
+            if (params.has_mtp) {
+                if (!ids.empty()) {
+                    llama_set_draft_input_hidden_state(ctx, llama_get_embeddings_ith(ctx, ids.size() - 1));
+                } else {
+                    llama_set_draft_input_hidden_state(ctx, llama_get_embeddings_ith(ctx, 0));
+                }
+
+                mtp_accept_tokens(ctx, ids, slot.n_past, slot.id);
+            }
 
             slot.n_past += ids.size();
             slot.n_decoded += ids.size();
