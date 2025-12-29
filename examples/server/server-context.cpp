@@ -159,14 +159,9 @@ bool server_context::load_model(const gpt_params& params_) {
         model_draft = llama_init_dft.model;
         ctx_draft = llama_init_dft.context;
     }
-    // if model has MTP and no draft model is specified...
-    else if (llama_model_n_nextn_layer(model) > 0) {
-        SRV_INF("model has nextn layers = %d\n", llama_model_n_nextn_layer(model));
-        params.has_mtp = true;
-
-
-        SRV_INF("%s\n", "MTP needs embeddings on decode, enabling");
-        llama_set_embeddings(ctx, true);
+    else if (params.has_mtp && llama_model_n_nextn_layer(model) == 0) {
+        LOG_WARNING("WARNING: -mtp flag provided, but model has 0 NextN layers. MTP will be disabled.\n", {});
+        params.has_mtp = false;
     }
     return true;
 }
@@ -238,6 +233,17 @@ void server_context::init() {
                 llama_speculative_add_replacement_tgt_dft(slot.spec, pair.first.c_str(), pair.second.c_str());
             }
 
+        }
+        else if (params.has_mtp && llama_model_n_nextn_layer(model) > 0) {
+            slot.batch_spec = llama_batch_init(slot.params.speculative.n_max + 1, 0, 1);
+            SLT_DBG(slot, "batch_spec contains %d tokens\n", slot.batch_spec.n_tokens);
+
+            slot.params.speculative.n_min = 0;
+
+            SRV_INF("%s\n", "MTP needs embeddings on decode, enabling");
+            llama_set_embeddings(ctx, true);
+
+            slot.has_mtp = true;
         }
 
         slot.reset();
@@ -368,6 +374,38 @@ bool server_slot::available() const {
 
 bool server_slot::is_processing() const {
     return (state == SLOT_STATE_IDLE && command == SLOT_COMMAND_LOAD_PROMPT) || state == SLOT_STATE_PROCESSING;
+}
+
+bool server_slot::can_speculate() const {
+    return spec != nullptr || has_mtp;
+}
+
+int server_slot::get_n_draft_max() const {
+    if (!can_speculate()) {
+        return 0;
+    }
+
+    // determine the max draft that fits the current slot state
+    int n_draft_max = params.speculative.n_max;
+
+    // note: n_past is not yet increased for the `id` token sampled above
+    //       also, need to leave space for 1 extra token to allow context shifts
+    n_draft_max = std::min(n_draft_max, n_ctx - n_past - 2);
+
+    int n_remaining = n_predict - n_decoded;
+    if (n_remaining > 0) {
+        n_draft_max = std::min(n_draft_max, n_remaining - 1);
+    }
+
+    SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
+
+    if (n_draft_max < params.speculative.n_min) {
+        SLT_DBG(*this, "the max possible draft is too small: %d < %d - skipping speculative decoding\n", 
+                n_draft_max, params.speculative.n_min);
+        return 0;
+    }
+
+    return n_draft_max;
 }
 
 void server_slot::add_token_string(const completion_token_output& token) {
@@ -2699,7 +2737,7 @@ void server_context::update_slots() {
 
         // Do speculative decoding
         for (auto& slot : slots) {
-            if (!slot.is_processing() || !slot.spec) {
+            if (!slot.is_processing() || !slot.can_speculate()) {
                 continue;
             }
 
@@ -2712,28 +2750,9 @@ void server_context::update_slots() {
                 GGML_ABORT("not supported by multimodal");
             }
 
-            // determine the max draft that fits the current slot state
-            int n_draft_max = slot.params.speculative.n_max;
-
-            // note: n_past is not yet increased for the `id` token sampled above
-            //       also, need to leave space for 1 extra token to allow context shifts
-            n_draft_max = std::min(n_draft_max, slot.n_ctx - slot.n_past - 2);
-
-            if (slot.n_predict > 0) {
-                n_draft_max = std::min(n_draft_max, slot.n_predict - slot.n_decoded - 1);
-            }
-
-            LOG_VERBOSE("max possible draft", {
-                {"id_slot", slot.id},
-                {"n_draft_max", n_draft_max}
-                });
-
-            if (n_draft_max < slot.params.speculative.n_min) {
-                LOG_VERBOSE("the max possible draft is too small", {
-                    {"id_slot", slot.id},
-                    {"n_draft_max", n_draft_max},
-                    {"n_min", slot.params.speculative.n_min}
-                    });
+            int n_draft_max = slot.get_n_draft_max();
+        
+            if (n_draft_max <= 0) {
                 continue;
             }
 
