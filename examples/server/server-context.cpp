@@ -557,6 +557,21 @@ void server_slot::print_timings() const {
         {"t_token_generation",  t_token_generation},
         {"t_total",             t_prompt_processing + t_token_generation},
         });
+    
+    if (n_draft_total > 0) {
+        const float ratio = (float)n_draft_accepted / n_draft_total;
+
+        snprintf(buffer, 512, "draft acceptance rate = %10.4f    (%5d accepted / %5d generated)",
+            ratio, n_draft_accepted, n_draft_total);
+
+        LOG_INFO(buffer, {
+            {"id_slot",          id},
+            {"id_task",          id_task},
+            {"n_draft_accepted", n_draft_accepted},
+            {"n_draft_total",    n_draft_total},
+            {"draft_ratio",      ratio},
+        });
+    }
 }
 
 void server_metrics::init() {
@@ -2683,7 +2698,22 @@ void server_context::update_slots() {
         }
 
         if (params.has_mtp) {
-            mtp_update_kv_cache(ctx, batch_view, true);
+            bool is_prompt_phase = false;
+            for (const auto& slot : slots) {
+                if (slot.state == SLOT_STATE_PROCESSING && 
+                    slot.i_batch >= i && 
+                    slot.i_batch < (i + n_tokens)) {
+
+                    if (slot.n_decoded == 0) {
+                        is_prompt_phase = true;
+                        break;
+                    }
+                }
+            }
+
+            if (is_prompt_phase) {
+                mtp_update_kv_cache(ctx, batch_view, is_prompt_phase);
+            }
         }
 
         for (auto& slot : slots) {
