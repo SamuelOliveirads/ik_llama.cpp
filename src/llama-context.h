@@ -352,7 +352,16 @@ struct llama_context {
             ggml_cgraph * cache_graph = nullptr;
             int32_t cache_graph_rows = 0;
             int32_t cache_graph_write_pos = 0;
+            bool cache_graph_device_input = false;
             struct ggml_tensor * cache_input_target_features = nullptr;
+            struct ggml_tensor * device_input_target_features = nullptr;
+            struct ggml_context * device_input_ctx = nullptr;
+            std::vector<ggml_backend_buffer_t> device_input_bufs;
+            bool device_input_ready = false;
+            int32_t device_input_rows = 0;
+            int32_t device_input_row_offset = 0;
+            ggml_backend_t device_input_backend = nullptr;
+            int32_t cache_graph_device_input_row_offset = 0;
             struct ggml_tensor * cache_input_pos_ctx = nullptr;
             struct ggml_tensor * kq_mask_tensor = nullptr;
             struct ggml_tensor * kq_mask_swa_tensor = nullptr;
@@ -360,14 +369,35 @@ struct llama_context {
         };
 
         struct capture_state {
+            ~capture_state();
             std::vector<int32_t> layer_ids;
             std::vector<std::vector<float>> layer_rows;
+            std::vector<ggml_backend_t> layer_backends;
+            struct ggml_context * gpu_ctx = nullptr;
+            std::vector<struct ggml_tensor *> gpu_layer_tensors;
+            std::vector<ggml_backend_buffer_t> gpu_layer_bufs;
+            bool gpu_capture_enabled = false;
+            int32_t gpu_layer_capacity = 0;
+            uint64_t gpu_graph_copy_nodes = 0;
             int32_t row_count = 0;
             int32_t row_width = 0;
             uint64_t capture_batch_id = 0;
             std::vector<uint64_t> layer_seen_batch_id;
+            std::vector<uint64_t> layer_device_produced_batch_id;
+            std::vector<int32_t> layer_device_produced_rows;
             ggml_backend_sched_eval_callback prev_cb_eval = nullptr;
             void * prev_cb_eval_user_data = nullptr;
+            bool telemetry_enabled = false;
+
+            uint64_t capture_enqueue_count = 0;
+            uint64_t capture_d2h_bytes = 0;
+            uint64_t capture_wait_count = 0;
+            uint64_t capture_wait_us = 0;
+
+
+            uint64_t materialize_count = 0;
+            uint64_t materialize_rows = 0;
+            uint64_t last_reported_batch_id = 0;
         };
 
         struct input_state {

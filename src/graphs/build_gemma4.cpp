@@ -1,6 +1,7 @@
 #include "../llama-build-context.h"
 #include "../llama-model.h"
 #include "../llama-context.h"
+#include "../llama-spec-features-dflash.h"
 
 static int gemma4_mtp_target_kv_layer(const llama_hparams & mtp_hparams, const llama_hparams & target_hparams, int mtp_il) {
     GGML_ASSERT(mtp_il >= 0 && mtp_il < (int) mtp_hparams.n_layer);
@@ -847,6 +848,7 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
             }
             cur = lctx.cvec.apply_to(ctx0, cur, il);
             cb(cur, "l_out", il);
+
         }
     }
 
@@ -1119,6 +1121,12 @@ ggml_cgraph * llm_build_context::build_gemma4() {
 
         cur = lctx.cvec.apply_to(ctx0, cur, il);
         cb(cur, "l_out", il);
+
+        if (ggml_tensor * capture_dst = llama_dflash_capture_graph_dst(&lctx, ctx0, il, (int32_t) cur->ne[1])) {
+            ggml_tensor * capture_copy = ggml_cpy(ctx0, cur, capture_dst);
+            ggml_format_name(capture_copy, "dflash_capture-%d", il);
+            ggml_build_forward_expand(gf, capture_copy);
+        }
 
         // input for next layer
         inpL = cur;

@@ -9,6 +9,7 @@
 struct llama_context;
 struct llama_model;
 struct ggml_tensor;
+struct ggml_context;
 struct llama_spec_feature_view;
 
 struct llama_dflash_window_update {
@@ -114,8 +115,26 @@ bool llama_set_dflash_target_features_view(
         const llama_dflash_window_update * window_update = nullptr);
 
 bool llama_set_dflash_capture_layers(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layers);
+
+struct ggml_tensor * llama_dflash_capture_graph_dst(
+        struct llama_context * ctx,
+        struct ggml_context * graph_ctx,
+        int32_t layer_id,
+        int32_t n_rows);
+
+bool llama_dflash_prepare_device_transport(struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
+
+bool llama_dflash_copy_device_append(
+        struct llama_context * ctx_tgt,
+        struct llama_context * ctx_dft,
+        const std::vector<int32_t> & source_row_indices);
+
+void llama_dflash_clear_device_append(struct llama_context * ctx);
+
 void llama_clear_dflash_capture(struct llama_context * ctx);
+
 void llama_begin_dflash_capture_batch(struct llama_context * ctx);
+
 void llama_finish_dflash_capture_batch(struct llama_context * ctx, bool is_prompt_warmup);
 
 bool llama_spec_get_dflash_feature_view(

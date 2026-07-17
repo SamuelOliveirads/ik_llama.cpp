@@ -22,7 +22,14 @@ ggml_cgraph * llm_build_context::build_dflash_kv_cache() {
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes((int) std::max<int64_t>(1, update_rows)) + 24 * n_layer, false);
 
-    lctx.dflash.kv.cache_input_target_features = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_target_features, update_rows);
+    if (lctx.dflash.kv.device_input_ready && lctx.dflash.kv.device_input_target_features != nullptr) {
+        lctx.dflash.kv.cache_input_target_features = ggml_view_2d(
+                ctx0, lctx.dflash.kv.device_input_target_features, n_target_features, update_rows,
+                lctx.dflash.kv.device_input_target_features->nb[1],
+                (size_t) lctx.dflash.kv.device_input_row_offset * lctx.dflash.kv.device_input_target_features->nb[1]);
+    } else {
+        lctx.dflash.kv.cache_input_target_features = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_target_features, update_rows);
+    }
     ggml_set_input(lctx.dflash.kv.cache_input_target_features);
     cb(lctx.dflash.kv.cache_input_target_features, "dflash_kv_input_target_features", -1);
 

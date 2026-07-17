@@ -2059,6 +2059,49 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
 #endif // GGML_USE_CUDA_SYCL_VULKAN
         return true;
     }
+    if (arg == "--split-mode-draft" || arg == "-smd") {
+        CHECK_ARG
+        const std::string arg_next = argv[i];
+        if (arg_next == "none") {
+            params.speculative.split_mode = LLAMA_SPLIT_MODE_NONE;
+        }
+        else if (arg_next == "layer") {
+            params.speculative.split_mode = LLAMA_SPLIT_MODE_LAYER;
+        }
+        else if (arg_next == "attn") {
+            params.speculative.split_mode = LLAMA_SPLIT_MODE_ATTN;
+        }
+        else if (arg_next == "graph") {
+            params.speculative.split_mode = LLAMA_SPLIT_MODE_GRAPH;
+        }
+        else {
+            invalid_param = true;
+            return true;
+        }
+        params.speculative.split_mode_set = true;
+        return true;
+    }
+    if (arg == "--tensor-split-draft" || arg == "-tsd") {
+        CHECK_ARG
+        const std::string arg_next = argv[i];
+        const std::regex regex{ R"([,/]+)" };
+        std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
+        std::vector<std::string> split_arg{ it, {} };
+        if (split_arg.size() >= llama_max_devices()) {
+            invalid_param = true;
+            return true;
+        }
+        for (size_t i = 0; i < llama_max_devices(); ++i) {
+            if (i < split_arg.size()) {
+                params.speculative.tensor_split[i] = std::stof(split_arg[i]);
+            }
+            else {
+                params.speculative.tensor_split[i] = 0.0f;
+            }
+        }
+        params.speculative.tensor_split_set = true;
+        return true;
+    }
     if (arg == "--rpc") {
         CHECK_ARG
 #ifdef GGML_USE_RPC
@@ -3296,6 +3339,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
         options.push_back({ "*",           "-devd,   --device-draft dev1,dev2",
                                                                          "comma-separated list of devices to use for offloading for the draft model (none = don't offload)\n"
                                                                          "Example: CUDA0,CUDA1,RPC[192.168.0.1:8080]\n" });
+        options.push_back({ "*",           "-smd,  --split-mode-draft SPLIT_MODE",
+                                                                        "how to split the draft model across multiple GPUs, one of: none, layer, attn, graph" });
+        options.push_back({ "*",           "-tsd,  --tensor-split-draft SPLIT",
+                                                                        "fraction of the draft model to offload to each GPU, comma-separated list of proportions" });
         options.push_back({ "*",           "-mg,   --main-gpu i",       "the GPU to use for the model (with split-mode = none),\n"
                                                                         "or for intermediate results and KV (with split-mode = row) (default: %d)", params.main_gpu });
         options.push_back({ "*",           "--max-gpu i",               "max. number of GPUs to use at a time with split mode 'graph', (default: %d)", params.max_gpu });

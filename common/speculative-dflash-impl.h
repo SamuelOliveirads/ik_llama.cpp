@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
 static bool common_speculative_are_dflash_compatible(
@@ -91,6 +92,8 @@ struct common_speculative_state_dflash : public common_speculative_state {
     std::vector<llama_pos> target_window_pos_stage;
     std::vector<float> target_window_ring;
     std::vector<float> target_window_append_features;
+    std::vector<int32_t> target_window_append_source_indices;
+    std::vector<int32_t> pending_device_append_source_indices;
     int32_t target_window_rows = 0;
     int32_t target_window_ring_write_pos = 0;
     int32_t target_window_ring_filled = 0;
@@ -204,6 +207,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
 
+        // Device append is experimental and fail-closed; the host feature path remains authoritative.
+        llama_dflash_prepare_device_transport(ctx_tgt, ctx_dft);
+
         batch = llama_batch_init(std::max(1, block_size), 0, 1);
         target_window.reserve((size_t) this->cross_ctx * (size_t) n_target_features);
         target_window_stage.reserve((size_t) this->cross_ctx * (size_t) n_target_features);
@@ -264,6 +270,15 @@ struct common_speculative_state_dflash : public common_speculative_state {
         const llama_dflash_kv_cache_transition cache_plan =
                 llama_plan_dflash_kv_cache_transition_for_ctx(ctx_dft, window_update, target_window_rows);
 
+        const bool device_append_ready = !cache_plan.rebuild_cache &&
+                cache_plan.append_rows > 0 &&
+                cache_plan.append_rows == target_window_append_rows &&
+                target_window_append_source_indices.size() == (size_t) cache_plan.append_rows &&
+                llama_dflash_copy_device_append(ctx_tgt, ctx_dft, target_window_append_source_indices);
+        if (!device_append_ready) {
+            llama_dflash_clear_device_append(ctx_dft);
+        }
+
         if (cache_plan.rebuild_cache) {
             dflash_materialize_target_window_features(*this);
             target_features = target_window.data();
@@ -311,6 +326,10 @@ struct common_speculative_state_dflash : public common_speculative_state {
     }
 };
 
+static bool dflash_pipeline_log_enabled() {
+    const char * enabled = std::getenv("IK_DFLASH_PIPELINE_LOG");
+    return enabled != nullptr && enabled[0] == '1';
+}
 static void dflash_record_window_update(
         common_speculative_state_dflash & state,
         int32_t keep_rows,
@@ -320,8 +339,17 @@ static void dflash_record_window_update(
     state.target_window_append_rows = std::max<int32_t>(0, append_rows);
     state.target_window_replace = replace;
     state.target_window_version++;
+    if (dflash_pipeline_log_enabled()) {
+        LOG_INF("DFlash pipeline window update version=%llu keep=%d append=%d replace=%d rows=%d ring_filled=%d ring_write=%d",
+                (unsigned long long) state.target_window_version,
+                state.target_window_keep_rows,
+                state.target_window_append_rows,
+                state.target_window_replace ? 1 : 0,
+                state.target_window_rows,
+                state.target_window_ring_filled,
+                state.target_window_ring_write_pos);
+    }
 }
-
 static void dflash_ring_reset_rows(
         common_speculative_state_dflash & state,
         const float * rows,
@@ -438,6 +466,11 @@ static bool dflash_append_target_features(
         state.target_window_append_features.assign(
                 new_rows.begin() + (ptrdiff_t) keep_from * (ptrdiff_t) row_width,
                 new_rows.end());
+        state.target_window_append_source_indices = state.pending_device_append_source_indices;
+        if (state.target_window_append_source_indices.size() != (size_t) state.cross_ctx) {
+            state.target_window_append_source_indices.clear();
+        }
+        state.pending_device_append_source_indices.clear();
         dflash_ring_reset_rows(state, state.target_window_append_features.data(), state.cross_ctx);
 
         state.target_window_rows = state.cross_ctx;
@@ -456,6 +489,11 @@ static bool dflash_append_target_features(
     }
 
     state.target_window_append_features.assign(new_rows.begin(), new_rows.end());
+    state.target_window_append_source_indices = state.pending_device_append_source_indices;
+    if (state.target_window_append_source_indices.size() != (size_t) n_rows) {
+        state.target_window_append_source_indices.clear();
+    }
+    state.pending_device_append_source_indices.clear();
     dflash_ring_append_rows(state, state.target_window_append_features.data(), n_rows);
     std::copy(new_positions.begin(), new_positions.end(), next_window_pos.begin() + keep_old_rows);
 
@@ -474,6 +512,8 @@ static void dflash_clear_target_features(common_speculative_state_dflash & state
     state.target_window_stage.clear();
     state.target_window_pos_stage.clear();
     state.target_window_append_features.clear();
+    state.target_window_append_source_indices.clear();
+    state.pending_device_append_source_indices.clear();
     state.target_window_rows = 0;
     state.target_window_ring_write_pos = 0;
     state.target_window_ring_filled = 0;
@@ -495,7 +535,10 @@ static void dflash_context_shift(
     }
 
     dflash_materialize_target_window_features(state);
-
+    if (dflash_pipeline_log_enabled()) {
+        LOG_INF("DFlash pipeline context shift keep=%lld discard=%lld past=%lld before_rows=%d",
+                (long long) kv_keep, (long long) kv_discard, (long long) kv_past, state.target_window_rows);
+    }
     const size_t row_width = (size_t) state.n_target_features;
     const llama_pos discard_begin = kv_keep;
     const llama_pos discard_end = kv_keep + kv_discard;

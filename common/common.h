@@ -213,6 +213,10 @@ struct common_params_speculative {
     int recurrent_ckpt_mode = LLAMA_SPEC_CKPT_AUTO;
 
     std::string devices;
+    enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER;
+    bool split_mode_set = false;
+    float tensor_split[128] = {0};
+    bool tensor_split_set = false;
     std::string params;
     int32_t n_threads = -1;
     int32_t n_threads_batch = -1;
