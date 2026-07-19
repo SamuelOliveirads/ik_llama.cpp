@@ -183,6 +183,9 @@ void llama_context::free_dflash_kv_cache_tensors() {
     dflash.kv.cache_graph_device_input = false;
     dflash.kv.cache_input_target_features = nullptr;
     dflash.kv.device_input_target_features = nullptr;
+    dflash.kv.device_window_target_features = nullptr;
+    dflash.kv.device_window_capacity = 0;
+    dflash.kv.device_window_valid = false;
     dflash.kv.device_input_ready = false;
     dflash.kv.device_input_rows = 0;
     dflash.kv.device_input_row_offset = 0;
@@ -204,6 +207,12 @@ void llama_context::free_dflash_kv_cache_tensors() {
         }
     }
     release_vector(dflash.kv.device_input_bufs);
+    for (ggml_backend_buffer_t buf : dflash.kv.device_window_bufs) {
+        if (buf != nullptr) {
+            ggml_backend_buffer_free(buf);
+        }
+    }
+    release_vector(dflash.kv.device_window_bufs);
     if (dflash.kv.device_input_ctx != nullptr) {
         ggml_free(dflash.kv.device_input_ctx);
         dflash.kv.device_input_ctx = nullptr;
@@ -490,8 +499,9 @@ bool llama_prepare_dflash_graph_inputs(
             update_src = src + (size_t) (n_rows - update_rows) * (size_t) width;
         }
         const llama_pos * update_pos = src_pos + (n_rows - update_rows);
+        const bool device_update = lctx.dflash.kv.device_input_ready && lctx.dflash.kv.device_input_rows == update_rows;
 
-        if (update_src == nullptr) {
+        if (update_src == nullptr && !device_update) {
             LLAMA_LOG_ERROR("%s: missing DFlash appended target features for cached update (rows=%d append_rows=%d floats=%zu)\n",
                     __func__, n_rows, update_rows, append_floats);
             return false;
@@ -528,7 +538,7 @@ bool llama_prepare_dflash_graph_inputs(
             lctx.dflash.kv.cache_graph_device_input_row_offset = lctx.dflash.kv.device_input_row_offset;
         }
 
-        if (lctx.dflash.kv.device_input_ready && lctx.dflash.kv.device_input_rows == update_rows) {
+        if (device_update) {
             // The persistent device tensor was copied with the full source/destination layout.
             // The KV graph consumes its leading update_rows columns through a view.
         } else {

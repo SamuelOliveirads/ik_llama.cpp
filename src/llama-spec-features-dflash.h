@@ -128,7 +128,23 @@ bool llama_dflash_copy_device_append(
         struct llama_context * ctx_tgt,
         struct llama_context * ctx_dft,
         const std::vector<int32_t> & source_row_indices);
+bool llama_dflash_copy_device_window_rows(
+        struct llama_context * ctx_tgt,
+        struct llama_context * ctx_dft,
+        const std::vector<int32_t> & source_row_indices,
+        const std::vector<int32_t> & destination_row_indices);
+bool llama_dflash_upload_device_window(
+        struct llama_context * ctx_dft,
+        const float * rows,
+        int32_t n_rows);
+bool llama_dflash_read_device_window(
+        struct llama_context * ctx_dft,
+        float * rows,
+        int32_t n_rows);
 
+bool llama_dflash_device_window_is_valid(const struct llama_context * ctx);
+void llama_dflash_disable_gpu_features(struct llama_context * ctx);
+bool llama_dflash_device_feature_path_enabled(const struct llama_context * ctx);
 void llama_dflash_clear_device_append(struct llama_context * ctx);
 
 void llama_clear_dflash_capture(struct llama_context * ctx);
@@ -136,6 +152,17 @@ void llama_clear_dflash_capture(struct llama_context * ctx);
 void llama_begin_dflash_capture_batch(struct llama_context * ctx);
 
 void llama_finish_dflash_capture_batch(struct llama_context * ctx, bool is_prompt_warmup);
+
+bool llama_spec_get_dflash_device_feature_view(
+        struct llama_context   * ctx,
+        const llama_batch      & batch,
+        llama_spec_feature_view & view);
+
+bool llama_spec_get_dflash_device_feature_view_for_seq(
+        struct llama_context   * ctx,
+        const llama_batch      & batch,
+        llama_seq_id             seq_id,
+        llama_spec_feature_view & view);
 
 bool llama_spec_get_dflash_feature_view(
         struct llama_context   * ctx,

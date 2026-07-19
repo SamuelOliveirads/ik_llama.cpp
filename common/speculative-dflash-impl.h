@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <numeric>
 #include <cstdlib>
 #include <vector>
 
@@ -102,6 +103,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
     int32_t target_window_append_rows = 0;
     bool target_window_replace = false;
     bool target_window_materialized = false;
+    bool target_window_device_only = false;
     llama_pos last_target_pos = -1;
 
     common_speculative_state_dflash(
@@ -207,8 +209,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
 
+        llama_set_dflash_visible_cross_ctx(ctx_dft, this->cross_ctx);
         // Device append is experimental and fail-closed; the host feature path remains authoritative.
-        llama_dflash_prepare_device_transport(ctx_tgt, ctx_dft);
+        if (!llama_dflash_prepare_device_transport(ctx_tgt, ctx_dft)) {
+            llama_dflash_disable_gpu_features(ctx_tgt);
+        }
 
         batch = llama_batch_init(std::max(1, block_size), 0, 1);
         target_window.reserve((size_t) this->cross_ctx * (size_t) n_target_features);
@@ -219,7 +224,6 @@ struct common_speculative_state_dflash : public common_speculative_state {
         target_window_pos_stage.reserve((size_t) this->cross_ctx);
         ready = true;
 
-        llama_set_dflash_visible_cross_ctx(ctx_dft, this->cross_ctx);
         LOG_INF("%s: DFlash context ready (n_ctx=%d, block_size=%d, cross_ctx=%d, n_target_features=%d, n_target_layers=%d)\n",
                 __func__, llama_n_ctx(ctx_dft), block_size, this->cross_ctx, n_target_features, n_target_layers);
     }
@@ -274,6 +278,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
                 cache_plan.append_rows > 0 &&
                 cache_plan.append_rows == target_window_append_rows &&
                 target_window_append_source_indices.size() == (size_t) cache_plan.append_rows &&
+                target_window_device_only &&
                 llama_dflash_copy_device_append(ctx_tgt, ctx_dft, target_window_append_source_indices);
         if (!device_append_ready) {
             llama_dflash_clear_device_append(ctx_dft);
@@ -409,6 +414,22 @@ static void dflash_materialize_target_window_features(common_speculative_state_d
     }
 
     const size_t row_width = (size_t) state.n_target_features;
+    if (state.target_window_device_only && llama_dflash_device_window_is_valid(state.ctx_dft)) {
+        std::vector<float> physical((size_t) state.cross_ctx * row_width);
+        if (!llama_dflash_read_device_window(state.ctx_dft, physical.data(), state.cross_ctx)) {
+            return;
+        }
+        state.target_window.resize((size_t) state.target_window_rows * row_width);
+        const int32_t read_start = (state.target_window_ring_write_pos - state.target_window_rows + state.cross_ctx) % state.cross_ctx;
+        for (int32_t row = 0; row < state.target_window_rows; ++row) {
+            const int32_t physical_row = (read_start + row) % state.cross_ctx;
+            std::memcpy(state.target_window.data() + (size_t) row * row_width,
+                    physical.data() + (size_t) physical_row * row_width,
+                    row_width * sizeof(float));
+        }
+        state.target_window_materialized = true;
+        return;
+    }
     state.target_window.resize((size_t) state.target_window_rows * row_width);
 
     const int32_t read_start = (state.target_window_ring_write_pos - state.target_window_rows + state.cross_ctx) % state.cross_ctx;
@@ -432,7 +453,8 @@ static void dflash_materialize_target_window_features(common_speculative_state_d
 static bool dflash_append_target_features(
         common_speculative_state_dflash & state,
         const common_speculative_feature_view & features,
-        llama_seq_id seq_id) {
+        llama_seq_id seq_id,
+        bool is_prompt_warmup) {
     if (features.kind != COMMON_SPECULATIVE_FEATURE_HIDDEN_STATE ||
             features.width != state.n_target_features ||
             features.rows.empty() ||
@@ -441,20 +463,32 @@ static bool dflash_append_target_features(
     }
 
     const size_t row_width = (size_t) state.n_target_features;
-    std::vector<float> new_rows;
-    std::vector<llama_pos> new_positions;
-    new_rows.reserve(features.rows.size() * row_width);
-    new_positions.reserve(features.rows.size());
-
+    bool metadata_only = !is_prompt_warmup;
     for (const auto & row : features.rows) {
-        if (row.seq_id != seq_id || row.data == nullptr) {
-            continue;
+        if (row.data != nullptr) {
+            metadata_only = false;
         }
-
-        new_positions.push_back(row.pos);
-        new_rows.insert(new_rows.end(), row.data, row.data + row_width);
+    }
+    if (metadata_only && (!llama_dflash_device_window_is_valid(state.ctx_dft) ||
+            state.pending_device_append_source_indices.empty())) {
+        return false;
     }
 
+    std::vector<float> new_rows;
+    std::vector<llama_pos> new_positions;
+    if (!metadata_only) {
+        new_rows.reserve(features.rows.size() * row_width);
+    }
+    new_positions.reserve(features.rows.size());
+    for (const auto & row : features.rows) {
+        if (row.seq_id != seq_id || (!metadata_only && row.data == nullptr)) {
+            continue;
+        }
+        new_positions.push_back(row.pos);
+        if (!metadata_only) {
+            new_rows.insert(new_rows.end(), row.data, row.data + row_width);
+        }
+    }
     if (new_positions.empty()) {
         return false;
     }
@@ -463,19 +497,39 @@ static bool dflash_append_target_features(
     if (n_rows >= state.cross_ctx) {
         const int32_t keep_from = n_rows - state.cross_ctx;
         state.target_window_pos.assign(new_positions.begin() + keep_from, new_positions.end());
-        state.target_window_append_features.assign(
-                new_rows.begin() + (ptrdiff_t) keep_from * (ptrdiff_t) row_width,
-                new_rows.end());
-        state.target_window_append_source_indices = state.pending_device_append_source_indices;
-        if (state.target_window_append_source_indices.size() != (size_t) state.cross_ctx) {
-            state.target_window_append_source_indices.clear();
+
+        std::vector<int32_t> source_indices = state.pending_device_append_source_indices;
+        if (metadata_only) {
+            if (source_indices.size() != (size_t) n_rows) {
+                return false;
+            }
+            source_indices.erase(source_indices.begin(), source_indices.begin() + keep_from);
+            std::vector<int32_t> destination_indices((size_t) state.cross_ctx);
+            std::iota(destination_indices.begin(), destination_indices.end(), 0);
+            if (!llama_dflash_copy_device_window_rows(state.ctx_tgt, state.ctx_dft, source_indices, destination_indices)) {
+                return false;
+            }
+            state.target_window_device_only = true;
+            state.target_window_append_features.clear();
+        } else {
+            state.target_window_device_only = false;
+            state.target_window_append_features.assign(
+                    new_rows.begin() + (ptrdiff_t) keep_from * (ptrdiff_t) row_width,
+                    new_rows.end());
+            dflash_ring_reset_rows(state, state.target_window_append_features.data(), state.cross_ctx);
         }
-        state.pending_device_append_source_indices.clear();
-        dflash_ring_reset_rows(state, state.target_window_append_features.data(), state.cross_ctx);
 
         state.target_window_rows = state.cross_ctx;
         state.target_window_ring_filled = state.target_window_rows;
-        state.last_target_pos = state.target_window_pos.empty() ? -1 : state.target_window_pos.back();
+        state.target_window_ring_write_pos = 0;
+        state.target_window_append_source_indices.clear();
+        state.pending_device_append_source_indices.clear();
+        state.target_window_materialized = false;
+        if (!metadata_only) {
+            dflash_materialize_target_window_features(state);
+            llama_dflash_upload_device_window(state.ctx_dft, state.target_window.data(), state.target_window_rows);
+        }
+        state.last_target_pos = state.target_window_pos.back();
         dflash_record_window_update(state, 0, state.target_window_rows, true);
         return true;
     }
@@ -483,29 +537,56 @@ static bool dflash_append_target_features(
     const int32_t keep_old_rows = std::min<int32_t>(state.target_window_rows, state.cross_ctx - n_rows);
     std::vector<llama_pos> & next_window_pos = state.target_window_pos_stage;
     next_window_pos.resize((size_t) (keep_old_rows + n_rows));
-
     if (keep_old_rows > 0) {
         std::copy(state.target_window_pos.end() - keep_old_rows, state.target_window_pos.end(), next_window_pos.begin());
     }
 
-    state.target_window_append_features.assign(new_rows.begin(), new_rows.end());
-    state.target_window_append_source_indices = state.pending_device_append_source_indices;
+    std::vector<int32_t> source_indices = state.pending_device_append_source_indices;
+    if (metadata_only) {
+        if (source_indices.size() != (size_t) n_rows) {
+            return false;
+        }
+        const int32_t write_pos = state.target_window_ring_write_pos;
+        std::vector<int32_t> destination_indices((size_t) n_rows);
+        for (int32_t i = 0; i < n_rows; ++i) {
+            destination_indices[(size_t) i] = (write_pos + i) % state.cross_ctx;
+        }
+        if (!llama_dflash_copy_device_window_rows(state.ctx_tgt, state.ctx_dft, source_indices, destination_indices)) {
+            return false;
+        }
+        state.target_window_device_only = true;
+        state.target_window_append_features.clear();
+        state.target_window_ring_write_pos = (write_pos + n_rows) % state.cross_ctx;
+        state.target_window_ring_filled = std::min(state.cross_ctx, state.target_window_ring_filled + n_rows);
+    } else {
+        state.target_window_device_only = false;
+        state.target_window_append_features.assign(new_rows.begin(), new_rows.end());
+        dflash_ring_append_rows(state, state.target_window_append_features.data(), n_rows);
+    }
+
+    state.target_window_append_source_indices = metadata_only
+            ? source_indices
+            : state.pending_device_append_source_indices;
     if (state.target_window_append_source_indices.size() != (size_t) n_rows) {
         state.target_window_append_source_indices.clear();
     }
     state.pending_device_append_source_indices.clear();
-    dflash_ring_append_rows(state, state.target_window_append_features.data(), n_rows);
     std::copy(new_positions.begin(), new_positions.end(), next_window_pos.begin() + keep_old_rows);
-
     state.target_window_pos.swap(next_window_pos);
     next_window_pos.clear();
     state.target_window_rows = keep_old_rows + n_rows;
-    state.target_window_ring_filled = state.target_window_rows;
-    state.last_target_pos = state.target_window_pos.empty() ? -1 : state.target_window_pos.back();
+    if (!metadata_only) {
+        state.target_window_ring_filled = state.target_window_rows;
+        state.target_window_materialized = false;
+        dflash_materialize_target_window_features(state);
+        llama_dflash_upload_device_window(state.ctx_dft, state.target_window.data(), state.target_window_rows);
+    } else {
+        state.target_window_materialized = false;
+    }
+    state.last_target_pos = state.target_window_pos.back();
     dflash_record_window_update(state, keep_old_rows, n_rows, false);
     return true;
 }
-
 static void dflash_clear_target_features(common_speculative_state_dflash & state) {
     state.target_window.clear();
     state.target_window_pos.clear();
@@ -521,6 +602,7 @@ static void dflash_clear_target_features(common_speculative_state_dflash & state
     state.target_window_append_rows = 0;
     state.target_window_replace = false;
     state.target_window_materialized = false;
+    state.target_window_device_only = false;
     state.last_target_pos = -1;
     llama_reset_dflash_kv_cache_state(state.ctx_dft);
 }
@@ -567,7 +649,10 @@ static void dflash_context_shift(
     state.target_window_pos = std::move(shifted_positions);
     state.target_window_rows = (int32_t) state.target_window_pos.size();
     dflash_ring_reset_rows(state, state.target_window.data(), state.target_window_rows);
+    state.target_window_device_only = false;
+    llama_dflash_upload_device_window(state.ctx_dft, state.target_window.data(), state.target_window_rows);
     state.last_target_pos = state.target_window_pos.empty() ? -1 : state.target_window_pos.back();
     dflash_record_window_update(state, 0, state.target_window_rows, true);
     llama_reset_dflash_kv_cache_state(state.ctx_dft);
+    llama_dflash_upload_device_window(state.ctx_dft, state.target_window.data(), state.target_window_rows);
 }

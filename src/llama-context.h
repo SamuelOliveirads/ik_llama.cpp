@@ -361,6 +361,10 @@ struct llama_context {
             int32_t device_input_rows = 0;
             int32_t device_input_row_offset = 0;
             ggml_backend_t device_input_backend = nullptr;
+            struct ggml_tensor * device_window_target_features = nullptr;
+            std::vector<ggml_backend_buffer_t> device_window_bufs;
+            int32_t device_window_capacity = 0;
+            bool device_window_valid = false;
             int32_t cache_graph_device_input_row_offset = 0;
             struct ggml_tensor * cache_input_pos_ctx = nullptr;
             struct ggml_tensor * kq_mask_tensor = nullptr;
@@ -377,6 +381,7 @@ struct llama_context {
             std::vector<struct ggml_tensor *> gpu_layer_tensors;
             std::vector<ggml_backend_buffer_t> gpu_layer_bufs;
             bool gpu_capture_enabled = false;
+            bool gpu_features_enabled = false;
             int32_t gpu_layer_capacity = 0;
             uint64_t gpu_graph_copy_nodes = 0;
             int32_t row_count = 0;

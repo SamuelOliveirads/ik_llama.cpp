@@ -243,7 +243,11 @@ static bool llama_set_dflash_target_features_impl(
             window_update->append_floats > 0 &&
             window_update->append_rows > 0;
 
-    if (ctx == nullptr || n_rows <= 0 || (!have_full_features && !have_append_features)) {
+    const bool have_device_features = ctx != nullptr && window_update != nullptr &&
+            window_update->append_rows > 0 && ctx->dflash.kv.device_input_ready &&
+            ctx->dflash.kv.device_input_rows == window_update->append_rows;
+
+    if (ctx == nullptr || n_rows <= 0 || (!have_full_features && !have_append_features && !have_device_features)) {
         return false;
     }
 
@@ -418,6 +422,8 @@ static int llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool 
 
         capture.layer_device_produced_batch_id[(size_t) layer_idx] = capture.capture_batch_id;
         capture.layer_device_produced_rows[(size_t) layer_idx] = rows;
+        capture.row_width = (int32_t) ctx->model.hparams.n_embd;
+        capture.row_count = rows;
         if (capture.telemetry_enabled) {
             LLAMA_LOG_INFO("DFlash pipeline device_capture layer=%d rows=%d batch=%llu\n",
                     (int32_t) parsed_layer, rows, (unsigned long long) capture.capture_batch_id);
@@ -454,11 +460,22 @@ static int llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool 
         capture.layer_seen_batch_id.assign(capture.layer_ids.size(), 0);
     }
 
-    auto & rows = capture.layer_rows[(size_t) layer_idx];
-    rows.resize((size_t) row_count * (size_t) row_width);
     auto backend = ggml_backend_sched_get_tensor_backend(ctx->sched, tensor);
     GGML_ASSERT(backend);
     capture.layer_backends[(size_t) layer_idx] = backend;
+    if (capture.gpu_features_enabled) {
+        capture.row_width = row_width;
+        capture.row_count = row_count;
+        capture.layer_seen_batch_id[(size_t) layer_idx] = 0;
+        if (capture.telemetry_enabled) {
+            LLAMA_LOG_INFO("DFlash pipeline capture gpu_only layer=%d tensor=%s backend=%s rows=%d width=%d batch=%llu\n",
+                    layer_id, tensor->name, ggml_backend_name(backend), row_count, row_width,
+                    (unsigned long long) capture.capture_batch_id);
+        }
+        return 2;
+    }
+    auto & rows = capture.layer_rows[(size_t) layer_idx];
+    rows.resize((size_t) row_count * (size_t) row_width);
     if (capture.telemetry_enabled) {
         capture.capture_enqueue_count++;
         capture.capture_d2h_bytes += (uint64_t) ggml_nbytes(tensor);
@@ -547,6 +564,8 @@ static bool llama_dflash_init_gpu_capture(
     }
 
     capture.gpu_capture_enabled = true;
+    const char * gpu_features = std::getenv("IK_DFLASH_GPU_FEATURES");
+    capture.gpu_features_enabled = gpu_features != nullptr && gpu_features[0] == '1';
     return true;
 }
 
@@ -743,6 +762,15 @@ bool llama_dflash_prepare_device_transport(struct llama_context * ctx_tgt, struc
             }
         }
         kv.device_input_bufs.clear();
+        for (ggml_backend_buffer_t buf : kv.device_window_bufs) {
+            if (buf != nullptr) {
+                ggml_backend_buffer_free(buf);
+            }
+        }
+        kv.device_window_bufs.clear();
+        kv.device_window_target_features = nullptr;
+        kv.device_window_capacity = 0;
+        kv.device_window_valid = false;
         if (kv.device_input_ctx != nullptr) {
             ggml_free(kv.device_input_ctx);
             kv.device_input_ctx = nullptr;
@@ -751,8 +779,10 @@ bool llama_dflash_prepare_device_transport(struct llama_context * ctx_tgt, struc
         kv.device_input_backend = nullptr;
     };
 
-    if (kv.device_input_target_features != nullptr && !kv.device_input_bufs.empty() &&
-            kv.device_input_target_features->buffer != nullptr && kv.device_input_backend != nullptr) {
+    if (kv.device_input_target_features != nullptr && kv.device_window_target_features != nullptr &&
+            !kv.device_input_bufs.empty() && !kv.device_window_bufs.empty() &&
+            kv.device_input_target_features->buffer != nullptr && kv.device_window_target_features->buffer != nullptr &&
+            kv.device_input_backend != nullptr) {
         return true;
     }
     if (kv.device_input_target_features != nullptr || kv.device_input_ctx != nullptr || !kv.device_input_bufs.empty()) {
@@ -761,7 +791,7 @@ bool llama_dflash_prepare_device_transport(struct llama_context * ctx_tgt, struc
     const int64_t feature_width = (int64_t) ctx_tgt->model.hparams.n_embd * (int64_t) ctx_tgt->dflash.capture->layer_ids.size();
     const int64_t capacity = ctx_tgt->dflash.capture->gpu_layer_capacity;
     ggml_init_params params = {
-        /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
+        /*.mem_size   =*/ 3 * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -776,6 +806,19 @@ bool llama_dflash_prepare_device_transport(struct llama_context * ctx_tgt, struc
         clear_partial();
         return false;
     }
+
+    const int64_t window_capacity = ctx_dft->dflash.visible_cross_ctx;
+    if (window_capacity <= 0) {
+        clear_partial();
+        return false;
+    }
+    kv.device_window_target_features = ggml_new_tensor_2d(
+            kv.device_input_ctx, GGML_TYPE_F32, feature_width, window_capacity);
+    if (kv.device_window_target_features == nullptr) {
+        clear_partial();
+        return false;
+    }
+    kv.device_window_capacity = (int32_t) window_capacity;
 
     const ggml_backend_t device_backend = llama_dflash_select_device_input_backend(*ctx_dft);
     if (device_backend == nullptr) {
@@ -793,6 +836,17 @@ bool llama_dflash_prepare_device_transport(struct llama_context * ctx_tgt, struc
     ggml_backend_tensor_alloc(buffer, kv.device_input_target_features, ggml_backend_buffer_get_base(buffer));
     ggml_backend_buffer_clear(buffer, 0);
     kv.device_input_bufs.push_back(buffer);
+
+    const size_t window_bytes = ggml_backend_buft_get_alloc_size(buft, kv.device_window_target_features);
+    ggml_backend_buffer_t window_buffer = ggml_backend_buft_alloc_buffer(buft, window_bytes);
+    if (window_buffer == nullptr) {
+        clear_partial();
+        return false;
+    }
+    ggml_backend_buffer_set_usage(window_buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    ggml_backend_tensor_alloc(window_buffer, kv.device_window_target_features, ggml_backend_buffer_get_base(window_buffer));
+    ggml_backend_buffer_clear(window_buffer, 0);
+    kv.device_window_bufs.push_back(window_buffer);
     kv.device_input_backend = device_backend;
     LLAMA_LOG_INFO("DFlash pipeline device_append prepared width=%lld capacity=%lld\n", (long long) feature_width, (long long) capacity);
     return true;
@@ -955,6 +1009,170 @@ bool llama_dflash_copy_device_append(
             ggml_backend_name(ctx_dft->dflash.kv.device_input_backend));
     return true;
 }
+bool llama_dflash_copy_device_window_rows(
+        struct llama_context * ctx_tgt,
+        struct llama_context * ctx_dft,
+        const std::vector<int32_t> & source_row_indices,
+        const std::vector<int32_t> & destination_row_indices) {
+    if (ctx_tgt == nullptr || ctx_dft == nullptr || !ctx_tgt->dflash.capture ||
+            source_row_indices.empty() || source_row_indices.size() != destination_row_indices.size() ||
+            ctx_dft->dflash.kv.device_window_target_features == nullptr ||
+            ctx_dft->dflash.kv.device_input_backend == nullptr) {
+        return false;
+    }
+
+    auto & capture = *ctx_tgt->dflash.capture;
+    const int32_t n_layers = (int32_t) capture.layer_ids.size();
+    if (!capture.gpu_capture_enabled || n_layers <= 0 ||
+            capture.gpu_layer_tensors.size() != (size_t) n_layers ||
+            capture.layer_device_produced_batch_id.size() != (size_t) n_layers ||
+            capture.layer_device_produced_rows.size() != (size_t) n_layers) {
+        return false;
+    }
+
+    const int32_t produced_rows = capture.layer_device_produced_rows.front();
+    const int32_t layer_width = (int32_t) ctx_tgt->model.hparams.n_embd;
+    ggml_tensor * destination = ctx_dft->dflash.kv.device_window_target_features;
+    if (capture.capture_batch_id == 0 || produced_rows <= 0 || layer_width <= 0 ||
+            destination->ne[0] < (int64_t) layer_width * n_layers ||
+            destination->ne[1] < ctx_dft->dflash.kv.device_window_capacity) {
+        return false;
+    }
+
+    for (int32_t layer_idx = 0; layer_idx < n_layers; ++layer_idx) {
+        if (capture.layer_device_produced_batch_id[(size_t) layer_idx] != capture.capture_batch_id ||
+                capture.layer_device_produced_rows[(size_t) layer_idx] != produced_rows ||
+                capture.gpu_layer_tensors[(size_t) layer_idx] == nullptr ||
+                capture.gpu_layer_tensors[(size_t) layer_idx]->buffer == nullptr) {
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < source_row_indices.size(); ++i) {
+        if (source_row_indices[i] < 0 || source_row_indices[i] >= produced_rows ||
+                destination_row_indices[i] < 0 ||
+                destination_row_indices[i] >= ctx_dft->dflash.kv.device_window_capacity) {
+            return false;
+        }
+    }
+
+    ggml_init_params view_params = {
+        /*.mem_size   =*/ (size_t) (2 * n_layers * source_row_indices.size() + 1) * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * view_ctx = ggml_init(view_params);
+    if (view_ctx == nullptr) {
+        return false;
+    }
+
+    std::vector<ggml_backend_t> source_backends;
+    source_backends.reserve((size_t) n_layers);
+    for (int32_t layer_idx = 0; layer_idx < n_layers; ++layer_idx) {
+        ggml_tensor * source = capture.gpu_layer_tensors[(size_t) layer_idx];
+        ggml_backend_t source_backend = llama_dflash_backend_for_buffer(*ctx_tgt, source->buffer);
+        if (source_backend == nullptr) {
+            source_backend = capture.layer_backends[(size_t) layer_idx];
+        }
+        if (source_backend == nullptr ||
+                !llama_dflash_backends_share_device(source_backend, ctx_dft->dflash.kv.device_input_backend)) {
+            LLAMA_LOG_WARN("DFlash pipeline device_window rejected mixed or unknown device layer=%d src=%s dst=%s\n",
+                    capture.layer_ids[(size_t) layer_idx],
+                    source_backend != nullptr ? ggml_backend_name(source_backend) : "<unknown>",
+                    ggml_backend_name(ctx_dft->dflash.kv.device_input_backend));
+            ggml_free(view_ctx);
+            return false;
+        }
+        source_backends.push_back(source_backend);
+    }
+
+    bool copied = true;
+    for (int32_t layer_idx = 0; layer_idx < n_layers && copied; ++layer_idx) {
+        ggml_tensor * source = capture.gpu_layer_tensors[(size_t) layer_idx];
+        ggml_backend_t source_backend = source_backends[(size_t) layer_idx];
+        for (size_t i = 0; i < source_row_indices.size(); ++i) {
+            ggml_tensor * src_view = ggml_view_2d(
+                    view_ctx, source, layer_width, 1, source->nb[1],
+                    (size_t) source_row_indices[i] * source->nb[1]);
+            ggml_tensor * dst_view = ggml_view_2d(
+                    view_ctx, destination, layer_width, 1, destination->nb[1],
+                    (size_t) layer_idx * (size_t) layer_width * sizeof(float) +
+                    (size_t) destination_row_indices[i] * destination->nb[1]);
+            if (src_view == nullptr || dst_view == nullptr) {
+                copied = false;
+                break;
+            }
+            ggml_backend_view_init(src_view);
+            ggml_backend_view_init(dst_view);
+            for (int j = 1; j < GGML_MAX_DIMS; ++j) {
+                dst_view->nb[j] = src_view->nb[j];
+            }
+            ggml_backend_tensor_copy_async(source_backend, ctx_dft->dflash.kv.device_input_backend, src_view, dst_view);
+        }
+    }
+
+    if (copied) {
+        for (ggml_backend_t backend : source_backends) {
+            if (backend != nullptr) {
+                ggml_backend_synchronize(backend);
+            }
+        }
+        ggml_backend_synchronize(ctx_dft->dflash.kv.device_input_backend);
+    }
+    ggml_free(view_ctx);
+    if (!copied) {
+        return false;
+    }
+
+    ctx_dft->dflash.kv.device_window_valid = true;
+    return true;
+}
+
+bool llama_dflash_upload_device_window(
+        struct llama_context * ctx_dft,
+        const float * rows,
+        int32_t n_rows) {
+    if (ctx_dft == nullptr || rows == nullptr ||
+            ctx_dft->dflash.kv.device_window_target_features == nullptr ||
+            ctx_dft->dflash.kv.device_input_backend == nullptr ||
+            n_rows <= 0 || n_rows > ctx_dft->dflash.kv.device_window_capacity) {
+        return false;
+    }
+    const size_t bytes = (size_t) n_rows * (size_t) ctx_dft->dflash.kv.device_window_target_features->ne[0] * sizeof(float);
+    ggml_backend_tensor_set_async(ctx_dft->dflash.kv.device_input_backend,
+            ctx_dft->dflash.kv.device_window_target_features, rows, 0, bytes);
+    ggml_backend_synchronize(ctx_dft->dflash.kv.device_input_backend);
+    ctx_dft->dflash.kv.device_window_valid = true;
+    return true;
+}
+
+bool llama_dflash_read_device_window(
+        struct llama_context * ctx_dft,
+        float * rows,
+        int32_t n_rows) {
+    if (ctx_dft == nullptr || rows == nullptr ||
+            ctx_dft->dflash.kv.device_window_target_features == nullptr ||
+            n_rows <= 0 || n_rows > ctx_dft->dflash.kv.device_window_capacity) {
+        return false;
+    }
+    const size_t bytes = (size_t) n_rows * (size_t) ctx_dft->dflash.kv.device_window_target_features->ne[0] * sizeof(float);
+    ggml_backend_tensor_get(ctx_dft->dflash.kv.device_window_target_features, rows, 0, bytes);
+    return true;
+}
+bool llama_dflash_device_window_is_valid(const struct llama_context * ctx) {
+    return ctx != nullptr && ctx->dflash.kv.device_window_valid;
+}
+
+bool llama_dflash_device_feature_path_enabled(const struct llama_context * ctx) {
+    return ctx != nullptr && ctx->dflash.capture && ctx->dflash.capture->gpu_features_enabled;
+}
+
+void llama_dflash_disable_gpu_features(struct llama_context * ctx) {
+    if (ctx != nullptr && ctx->dflash.capture) {
+        ctx->dflash.capture->gpu_features_enabled = false;
+    }
+}
+
 void llama_dflash_clear_device_append(struct llama_context * ctx) {
     if (ctx != nullptr) {
         ctx->dflash.kv.device_input_ready = false;
@@ -1044,36 +1262,29 @@ static bool llama_spec_prepare_dflash_capture(
     row_count = capture.row_count;
     row_width = capture.row_width;
     n_layers = (int32_t) capture.layer_ids.size();
-    if (row_count <= 0 || row_width <= 0 || n_layers <= 0 || capture.layer_rows.size() != (size_t) n_layers) {
+    if (row_count <= 0 || row_width <= 0 || n_layers <= 0 || capture.layer_seen_batch_id.size() != (size_t) n_layers ||
+            capture.layer_device_produced_batch_id.size() != (size_t) n_layers || capture.layer_device_produced_rows.size() != (size_t) n_layers) {
         return false;
     }
 
-    if (capture.capture_batch_id == 0 || capture.layer_seen_batch_id.size() != (size_t) n_layers) {
-        LLAMA_LOG_WARN("%s: DFlash capture batch markers are not initialized (batch_id=%llu layers=%zu expected=%d)\n",
-                __func__,
-                (unsigned long long) capture.capture_batch_id,
-                capture.layer_seen_batch_id.size(),
-                n_layers);
+    if (capture.capture_batch_id == 0) {
+        LLAMA_LOG_WARN("%s: DFlash capture batch markers are not initialized (batch_id=0)\n", __func__);
         return false;
     }
 
     for (int32_t layer_idx = 0; layer_idx < n_layers; ++layer_idx) {
-        if (capture.layer_seen_batch_id[(size_t) layer_idx] != capture.capture_batch_id) {
-            LLAMA_LOG_WARN("%s: DFlash capture is stale for layer %d (seen_batch=%llu current_batch=%llu rows=%d width=%d)\n",
-                    __func__,
-                    capture.layer_ids[(size_t) layer_idx],
-                    (unsigned long long) capture.layer_seen_batch_id[(size_t) layer_idx],
-                    (unsigned long long) capture.capture_batch_id,
-                    row_count,
-                    row_width);
-            return false;
-        }
-
         const auto & rows = capture.layer_rows[(size_t) layer_idx];
-        if (rows.size() != (size_t) row_count * (size_t) row_width) {
-            LLAMA_LOG_WARN("%s: DFlash capture rows mismatch for layer %d: got=%zu expected=%zu (rows=%d width=%d)\n",
+        const bool cpu_ready = capture.layer_seen_batch_id[(size_t) layer_idx] == capture.capture_batch_id &&
+                rows.size() == (size_t) row_count * (size_t) row_width;
+        const bool gpu_ready = capture.layer_device_produced_batch_id[(size_t) layer_idx] == capture.capture_batch_id &&
+                capture.layer_device_produced_rows[(size_t) layer_idx] == row_count &&
+                capture.gpu_layer_tensors.size() == (size_t) n_layers &&
+                capture.gpu_layer_tensors[(size_t) layer_idx] != nullptr &&
+                capture.gpu_layer_tensors[(size_t) layer_idx]->buffer != nullptr;
+        if (!cpu_ready && !gpu_ready) {
+            LLAMA_LOG_WARN("%s: DFlash capture rows unavailable for layer %d (rows=%zu expected=%zu cpu=%d gpu=%d)\n",
                     __func__, capture.layer_ids[(size_t) layer_idx], rows.size(),
-                    (size_t) row_count * (size_t) row_width, row_count, row_width);
+                    (size_t) row_count * (size_t) row_width, cpu_ready ? 1 : 0, gpu_ready ? 1 : 0);
             return false;
         }
     }
@@ -1161,8 +1372,24 @@ static bool llama_spec_materialize_dflash_rows_prepared(
 
         float * dst = rows_out.data() + out_row * (size_t) combined_width;
         for (int32_t layer_idx = 0; layer_idx < n_layers; ++layer_idx) {
-            const float * src = layer_rows[(size_t) layer_idx].data() + (size_t) row_index * (size_t) row_width;
-            std::memcpy(dst + (size_t) layer_idx * (size_t) row_width, src, (size_t) row_width * sizeof(float));
+            const auto & layer = layer_rows[(size_t) layer_idx];
+            if (layer.size() == (size_t) row_count * (size_t) row_width) {
+                const float * src = layer.data() + (size_t) row_index * (size_t) row_width;
+                std::memcpy(dst + (size_t) layer_idx * (size_t) row_width, src, (size_t) row_width * sizeof(float));
+            } else {
+                const ggml_tensor * source = capture.gpu_layer_tensors[(size_t) layer_idx];
+                if (source == nullptr || source->buffer == nullptr) {
+                    rows_out.clear();
+                    combined_width = 0;
+                    return false;
+                }
+                ggml_backend_tensor_get(source,
+                        dst + (size_t) layer_idx * (size_t) row_width,
+                        (size_t) row_index * source->nb[1], (size_t) row_width * sizeof(float));
+                if (capture.telemetry_enabled) {
+                    capture.capture_d2h_bytes += (uint64_t) row_width * sizeof(float);
+                }
+            }
         }
     }
 
@@ -1170,6 +1397,91 @@ static bool llama_spec_materialize_dflash_rows_prepared(
 }
 
 
+static bool llama_spec_prepare_dflash_device_capture(
+        struct llama_context * ctx,
+        int32_t & row_count,
+        int32_t & row_width,
+        int32_t & n_layers) {
+    if (ctx == nullptr || !ctx->dflash.capture || !ctx->dflash.capture->gpu_features_enabled) {
+        return false;
+    }
+
+    if (!llama_spec_prepare_dflash_capture(ctx, row_count, row_width, n_layers)) {
+        return false;
+    }
+
+    auto & capture = *ctx->dflash.capture;
+    for (int32_t layer_idx = 0; layer_idx < n_layers; ++layer_idx) {
+        if (capture.layer_device_produced_batch_id[(size_t) layer_idx] != capture.capture_batch_id ||
+                capture.layer_device_produced_rows[(size_t) layer_idx] != row_count ||
+                capture.gpu_layer_tensors[(size_t) layer_idx] == nullptr ||
+                capture.gpu_layer_tensors[(size_t) layer_idx]->buffer == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool llama_spec_fill_dflash_device_view(
+        struct llama_context * ctx,
+        const llama_batch & batch,
+        llama_seq_id seq_id,
+        bool filter_seq,
+        llama_spec_feature_view & view) {
+    if (ctx == nullptr || batch.n_tokens <= 0 || batch.pos == nullptr ||
+            batch.n_seq_id == nullptr || batch.seq_id == nullptr) {
+        return false;
+    }
+
+    int32_t row_count = 0;
+    int32_t row_width = 0;
+    int32_t n_layers = 0;
+    if (!llama_spec_prepare_dflash_device_capture(ctx, row_count, row_width, n_layers)) {
+        return false;
+    }
+
+    const int32_t batch_row_offset = std::max<int32_t>(0, batch.n_tokens - row_count);
+    view = {};
+    view.kind = LLAMA_SPEC_FEATURE_HIDDEN_STATE;
+    view.width = row_width * n_layers;
+    view.rows.reserve((size_t) batch.n_tokens);
+    for (int32_t batch_index = batch_row_offset; batch_index < batch.n_tokens; ++batch_index) {
+        if (batch.n_seq_id[batch_index] <= 0 || batch.seq_id[batch_index] == nullptr) {
+            view.rows.clear();
+            return false;
+        }
+        const llama_seq_id row_seq_id = batch.seq_id[batch_index][0];
+        if (filter_seq) {
+            bool has_seq = false;
+            for (int32_t j = 0; j < batch.n_seq_id[batch_index]; ++j) {
+                if (batch.seq_id[batch_index][j] == seq_id) {
+                    has_seq = true;
+                    break;
+                }
+            }
+            if (!has_seq) {
+                continue;
+            }
+        }
+        view.rows.push_back({ row_seq_id, batch.pos[batch_index], nullptr });
+    }
+    return !view.rows.empty();
+}
+
+bool llama_spec_get_dflash_device_feature_view(
+        struct llama_context * ctx,
+        const llama_batch & batch,
+        llama_spec_feature_view & view) {
+    return llama_spec_fill_dflash_device_view(ctx, batch, 0, false, view);
+}
+
+bool llama_spec_get_dflash_device_feature_view_for_seq(
+        struct llama_context * ctx,
+        const llama_batch & batch,
+        llama_seq_id seq_id,
+        llama_spec_feature_view & view) {
+    return llama_spec_fill_dflash_device_view(ctx, batch, seq_id, true, view);
+}
 bool llama_spec_get_dflash_feature_view(
         struct llama_context   * ctx,
         const llama_batch      & batch,

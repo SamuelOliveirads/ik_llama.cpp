@@ -1763,9 +1763,13 @@ static bool common_speculative_collect_target_batch_features(
         const common_speculative * spec,
         llama_context * ctx,
         const llama_batch & batch,
+        bool is_prompt_warmup,
         common_speculative_feature_view & features) {
     features = {};
     if (common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH)) {
+        if (!is_prompt_warmup && llama_spec_get_dflash_device_feature_view(ctx, batch, features)) {
+            return true;
+        }
         return llama_spec_get_dflash_feature_view(ctx, batch, features);
     }
 
@@ -1785,9 +1789,13 @@ static bool common_speculative_collect_target_seq_batch_features(
         llama_context * ctx,
         const llama_batch & batch,
         llama_seq_id seq_id,
+        bool is_prompt_warmup,
         common_speculative_feature_view & features) {
     features = {};
     if (common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH)) {
+        if (!is_prompt_warmup && llama_spec_get_dflash_device_feature_view_for_seq(ctx, batch, seq_id, features)) {
+            return true;
+        }
         return llama_spec_get_dflash_feature_view_for_seq(ctx, batch, seq_id, features);
     }
 
@@ -2168,14 +2176,14 @@ int32_t common_speculative_on_target_seq_batch(
             return n_seq_tokens < 0 ? -1 : 0;
         }
 
-        if (!common_speculative_collect_target_seq_batch_features(spec, ctx_tgt, batch, seq_id, feature_view)) {
+        if (!common_speculative_collect_target_seq_batch_features(spec, ctx_tgt, batch, seq_id, is_prompt_warmup, feature_view)) {
             llama_batch_free(seq_batch);
             return -1;
         }
 
         batch_for_spec = &seq_batch;
     } else {
-        if (!common_speculative_collect_target_batch_features(spec, ctx_tgt, batch, feature_view)) {
+        if (!common_speculative_collect_target_batch_features(spec, ctx_tgt, batch, is_prompt_warmup, feature_view)) {
             return -1;
         }
     }
@@ -2261,6 +2269,25 @@ static bool common_speculative_apply_hidden_rows(
     return ret == 0;
 }
 
+static bool common_speculative_apply_device_rows(
+        common_speculative * spec, llama_seq_id seq_id, llama_pos pos_base,
+        const std::vector<llama_token> & ids) {
+    const int32_t feature_width = common_speculative_feature_width(spec);
+    if (feature_width <= 0 || ids.empty()) { return true; }
+    llama_batch accepted_batch = llama_batch_init(ids.size(), 0, 1);
+    common_speculative_feature_view feature_view;
+    feature_view.kind = COMMON_SPECULATIVE_FEATURE_HIDDEN_STATE;
+    feature_view.width = feature_width;
+    feature_view.rows.reserve(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        common_batch_add(accepted_batch, ids[i], pos_base + (llama_pos) i, { seq_id }, true);
+        feature_view.rows.push_back({ seq_id, pos_base + (llama_pos) i, nullptr });
+    }
+    const int32_t ret = common_speculative_on_target_batch(spec, accepted_batch, feature_view, false);
+    llama_batch_free(accepted_batch);
+    return ret == 0;
+}
+
 bool common_speculative_commit_accepted_hidden_rows(
         common_speculative * spec,
         common_speculative_type spec_type_used,
@@ -2296,6 +2323,21 @@ bool common_speculative_commit_accepted_output(
 
     if (auto * dflash_state = common_speculative_get_dflash_state(spec); dflash_state != nullptr) {
         dflash_state->pending_device_append_source_indices = output_indices;
+    }
+
+    if (llama_dflash_device_feature_path_enabled(ctx) && !output_indices.empty()) {
+        std::vector<llama_token> commit_tokens;
+        if (!common_speculative_build_commit_tokens(spec_type_used, sampled_before, ids, commit_tokens)) {
+            if (auto * dflash_state = common_speculative_get_dflash_state(spec); dflash_state != nullptr) {
+                dflash_state->pending_device_append_source_indices.clear();
+            }
+            return false;
+        }
+        const bool committed = common_speculative_apply_device_rows(spec, seq_id, pos_base, commit_tokens);
+        if (auto * dflash_state = common_speculative_get_dflash_state(spec); dflash_state != nullptr) {
+            dflash_state->pending_device_append_source_indices.clear();
+        }
+        return committed;
     }
 
     std::vector<float> hidden_rows;
@@ -2871,7 +2913,7 @@ int32_t common_speculative_on_target_batch(
             }
         }
 
-        if (!dflash_append_target_features(*dflash_state, features, seq_id)) {
+        if (!dflash_append_target_features(*dflash_state, features, seq_id, is_prompt_warmup)) {
             return -1;
         }
         return 0;
