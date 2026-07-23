@@ -12,6 +12,8 @@ struct llama_model;
 #include <map>
 #include <set>
 #include <memory>
+#include <string>
+
 
 struct llama_openpangu_swa_window_view {
     int64_t w_view  = 0;
@@ -379,11 +381,14 @@ struct llama_context {
             std::vector<ggml_backend_t> layer_backends;
             struct ggml_context * gpu_ctx = nullptr;
             std::vector<struct ggml_tensor *> gpu_layer_tensors;
+            std::vector<struct ggml_tensor *> gpu_layer_views;
+            std::vector<struct ggml_tensor *> gpu_source_tensors;
+            std::vector<ggml_backend_t> gpu_layer_backends;
+
             std::vector<ggml_backend_buffer_t> gpu_layer_bufs;
             bool gpu_capture_enabled = false;
             bool gpu_features_enabled = false;
             int32_t gpu_layer_capacity = 0;
-            uint64_t gpu_graph_copy_nodes = 0;
             int32_t row_count = 0;
             int32_t row_width = 0;
             uint64_t capture_batch_id = 0;
@@ -394,15 +399,14 @@ struct llama_context {
             void * prev_cb_eval_user_data = nullptr;
             bool telemetry_enabled = false;
 
-            uint64_t capture_enqueue_count = 0;
             uint64_t capture_d2h_bytes = 0;
-            uint64_t capture_wait_count = 0;
-            uint64_t capture_wait_us = 0;
-
-
-            uint64_t materialize_count = 0;
-            uint64_t materialize_rows = 0;
-            uint64_t last_reported_batch_id = 0;
+            uint64_t device_sync_count = 0;
+            uint64_t device_sync_us = 0;
+            uint64_t device_same_device_bytes = 0;
+            uint64_t device_cross_device_bytes = 0;
+            uint64_t device_host_fallback_count = 0;
+            uint64_t device_append_count = 0;
+            std::string device_last_fallback_reason;
         };
 
         struct input_state {

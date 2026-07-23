@@ -65,11 +65,7 @@ ggml_cgraph * llm_build_context::build_mimo2() {
         cur = lctx.cvec.apply_to(ctx0, cur, il);
         cb(cur, "l_out", il);
 
-        if (ggml_tensor * capture_dst = llama_dflash_capture_graph_dst(&lctx, ctx0, il, (int32_t) cur->ne[1])) {
-            ggml_tensor * capture_copy = ggml_cpy(ctx0, cur, capture_dst);
-            ggml_format_name(capture_copy, "dflash_capture-%d", il);
-            ggml_build_forward_expand(gf, capture_copy);
-        }
+        llama_dflash_capture_graph_dst(&lctx, ctx0, il, (int32_t) cur->ne[1]);
 
         if (is_final_layer && needs_dflash_full_final_rows && inp_out_ids != nullptr) {
             cur = ggml_get_rows(ctx0, cur, inp_out_ids);

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 
@@ -388,48 +389,59 @@ static int32_t llama_dflash_find_layer_index(const struct llama_context * ctx, i
     return it == layer_ids.end() ? -1 : (int32_t) std::distance(layer_ids.begin(), it);
 }
 
+static ggml_backend_t llama_dflash_backend_for_buffer(
+        const llama_context & ctx,
+        ggml_backend_buffer_t buffer);
+
+static bool llama_dflash_capture_layout_matches(
+        const ggml_tensor * source,
+        const ggml_tensor * destination) {
+    if (source == nullptr || destination == nullptr || source->type != destination->type) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (source->ne[i] != destination->ne[i] || source->nb[i] != destination->nb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void llama_dflash_capture_host_fallback(llama_context * ctx) {
+    if (ctx == nullptr || !ctx->dflash.capture) {
+        return;
+    }
+
+    auto & capture = *ctx->dflash.capture;
+    capture.gpu_features_enabled = false;
+    for (size_t layer_idx = 0; layer_idx < capture.layer_ids.size(); ++layer_idx) {
+        ggml_tensor * source = layer_idx < capture.gpu_source_tensors.size()
+                ? capture.gpu_source_tensors[layer_idx] : nullptr;
+        if (source == nullptr || ctx->sched == nullptr || source->ne[0] <= 0 || source->ne[1] <= 0) {
+            continue;
+        }
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(ctx->sched, source);
+        if (backend == nullptr) {
+            continue;
+        }
+        const size_t n_floats = (size_t) source->ne[0] * (size_t) source->ne[1];
+        capture.layer_rows[layer_idx].resize(n_floats);
+        ggml_backend_tensor_get_async(backend, source, capture.layer_rows[layer_idx].data(), 0, n_floats * sizeof(float));
+        capture.layer_seen_batch_id[layer_idx] = capture.capture_batch_id;
+        capture.row_width = (int32_t) source->ne[0];
+        capture.row_count = (int32_t) source->ne[1];
+        if (capture.telemetry_enabled) {
+            capture.capture_d2h_bytes += n_floats * sizeof(float);
+        }
+    }
+}
+
 static int llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool ask, void * user_data) {
     auto * ctx = static_cast<llama_context *>(user_data);
     if (ctx == nullptr || !ctx->dflash.capture) {
         return false;
     }
 
-    static constexpr const char * device_capture_prefix = "dflash_capture-";
-    if (std::strncmp(tensor->name, device_capture_prefix, std::strlen(device_capture_prefix)) == 0) {
-        if (ask) {
-            return 2;
-        }
-
-        auto & capture = *ctx->dflash.capture;
-        if (!capture.gpu_capture_enabled || capture.capture_batch_id == 0) {
-            return 2;
-        }
-
-        const char * suffix = tensor->name + std::strlen(device_capture_prefix);
-        char * end = nullptr;
-        const long parsed_layer = std::strtol(suffix, &end, 10);
-        if (end == suffix || *end != 0 || parsed_layer < 0 || parsed_layer > 1000000) {
-            return 2;
-        }
-
-        const int32_t layer_idx = llama_dflash_find_layer_index(ctx, (int32_t) parsed_layer);
-        const int32_t rows = tensor->ne[1] > 0 ? (int32_t) tensor->ne[1] : 0;
-        if (layer_idx < 0 || rows <= 0 ||
-                capture.layer_device_produced_batch_id.size() != capture.layer_ids.size() ||
-                capture.layer_device_produced_rows.size() != capture.layer_ids.size()) {
-            return 2;
-        }
-
-        capture.layer_device_produced_batch_id[(size_t) layer_idx] = capture.capture_batch_id;
-        capture.layer_device_produced_rows[(size_t) layer_idx] = rows;
-        capture.row_width = (int32_t) ctx->model.hparams.n_embd;
-        capture.row_count = rows;
-        if (capture.telemetry_enabled) {
-            LLAMA_LOG_INFO("DFlash pipeline device_capture layer=%d rows=%d batch=%llu\n",
-                    (int32_t) parsed_layer, rows, (unsigned long long) capture.capture_batch_id);
-        }
-        return 2;
-    }
     int32_t layer_id = -1;
     if (!llama_dflash_parse_layer_id(tensor, layer_id)) {
         return 0;
@@ -460,38 +472,67 @@ static int llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool 
         capture.layer_seen_batch_id.assign(capture.layer_ids.size(), 0);
     }
 
+    if (capture.gpu_source_tensors.size() == capture.layer_ids.size()) {
+        capture.gpu_source_tensors[(size_t) layer_idx] = tensor;
+    }
     auto backend = ggml_backend_sched_get_tensor_backend(ctx->sched, tensor);
-    GGML_ASSERT(backend);
     capture.layer_backends[(size_t) layer_idx] = backend;
+    if (backend == nullptr) {
+        capture.device_last_fallback_reason = "capture-backend-unresolved";
+        LLAMA_LOG_WARN("DFlash capture callback rejected layer=%d tensor=%s reason=%s; using host recovery\n",
+                layer_id, tensor->name, capture.device_last_fallback_reason.c_str());
+        llama_dflash_capture_host_fallback(ctx);
+        return 2;
+    }
     if (capture.gpu_features_enabled) {
         capture.row_width = row_width;
         capture.row_count = row_count;
         capture.layer_seen_batch_id[(size_t) layer_idx] = 0;
+
+        ggml_tensor * destination = capture.gpu_layer_views.size() == capture.layer_ids.size()
+                ? capture.gpu_layer_views[(size_t) layer_idx] : nullptr;
+        if (destination != nullptr && destination->buffer == nullptr) {
+            ggml_backend_view_init(destination);
+        }
+        ggml_backend_t destination_backend = capture.gpu_layer_backends.size() == capture.layer_ids.size()
+                ? capture.gpu_layer_backends[(size_t) layer_idx] : nullptr;
+        if (destination_backend == nullptr) {
+            destination_backend = llama_dflash_backend_for_buffer(
+                    *ctx, destination != nullptr ? destination->buffer : nullptr);
+        }
+        const bool backend_match = backend != nullptr && destination_backend != nullptr &&
+                (backend == destination_backend ||
+                 ggml_backend_get_default_buffer_type(backend) == ggml_backend_get_default_buffer_type(destination_backend));
+        const bool shape_match = llama_dflash_capture_layout_matches(tensor, destination);
+        if (!backend_match || !shape_match) {
+            capture.device_last_fallback_reason = !backend_match
+                    ? "capture-backend-mismatch" : "capture-layout-mismatch";
+            LLAMA_LOG_WARN("DFlash capture callback rejected layer=%d source=%s destination=%s reason=%s\n",
+                    layer_id,
+                    backend != nullptr ? ggml_backend_name(backend) : "<unknown>",
+                    destination_backend != nullptr ? ggml_backend_name(destination_backend) : "<unknown>",
+                    capture.device_last_fallback_reason.c_str());
+            llama_dflash_capture_host_fallback(ctx);
+            return 2;
+        }
+
+        ggml_backend_tensor_copy_async(backend, destination_backend, tensor, destination);
+        capture.layer_device_produced_batch_id[(size_t) layer_idx] = capture.capture_batch_id;
+        capture.layer_device_produced_rows[(size_t) layer_idx] = row_count;
         if (capture.telemetry_enabled) {
-            LLAMA_LOG_INFO("DFlash pipeline capture gpu_only layer=%d tensor=%s backend=%s rows=%d width=%d batch=%llu\n",
-                    layer_id, tensor->name, ggml_backend_name(backend), row_count, row_width,
-                    (unsigned long long) capture.capture_batch_id);
+            const size_t bytes = ggml_nbytes(tensor);
+            capture.device_same_device_bytes += bytes;
         }
         return 2;
     }
     auto & rows = capture.layer_rows[(size_t) layer_idx];
     rows.resize((size_t) row_count * (size_t) row_width);
     if (capture.telemetry_enabled) {
-        capture.capture_enqueue_count++;
         capture.capture_d2h_bytes += (uint64_t) ggml_nbytes(tensor);
-        LLAMA_LOG_INFO("DFlash pipeline capture layer=%d tensor=%s backend=%s rows=%d width=%d bytes=%zu batch=%llu\n",
-                layer_id,
-                tensor->name,
-                ggml_backend_name(backend),
-                row_count,
-                row_width,
-                ggml_nbytes(tensor),
-                (unsigned long long) capture.capture_batch_id);
     }
-    // Use the tensor-owned buffer callback.  It selects the CUDA device from
-    // the buffer context and synchronizes that owning stream; the generic
-    // async backend entry point does not perform that device selection.
-    ggml_backend_tensor_get(tensor, rows.data(), 0, ggml_nbytes(tensor));
+    // Queue the host read on the tensor backend. llama_spec_prepare_dflash_capture()
+    // synchronizes the scheduler before materialization consumes these rows.
+    ggml_backend_tensor_get_async(backend, tensor, rows.data(), 0, ggml_nbytes(tensor));
 
     capture.row_width = row_width;
     capture.row_count = row_count;
@@ -502,15 +543,15 @@ static int llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool 
 static ggml_backend_buffer_type_t llama_dflash_capture_layer_buft(
         const llama_context & ctx,
         int32_t layer_id) {
-    if (layer_id >= 0 && layer_id < (int32_t) ctx.model.buft_layer.size() && ctx.model.buft_layer[layer_id].buft != nullptr) {
-        return ctx.model.buft_layer[layer_id].buft;
-    }
-
     if (layer_id >= 0 && layer_id < (int32_t) ctx.model.layers.size()) {
         const ggml_tensor * wk = ctx.model.layers[layer_id].wk;
         if (wk != nullptr && wk->buffer != nullptr) {
             return ggml_backend_buffer_get_type(wk->buffer);
         }
+    }
+
+    if (layer_id >= 0 && layer_id < (int32_t) ctx.model.buft_layer.size() && ctx.model.buft_layer[layer_id].buft != nullptr) {
+        return ctx.model.buft_layer[layer_id].buft;
     }
 
     return llama_default_buffer_type_cpu(true);
@@ -519,7 +560,7 @@ static ggml_backend_buffer_type_t llama_dflash_capture_layer_buft(
 static bool llama_dflash_init_gpu_capture(
         const llama_context & ctx,
         llama_context::dflash_runtime::capture_state & capture) {
-    const char * enabled = std::getenv("IK_DFLASH_GPU_CAPTURE");
+    const char * enabled = std::getenv("IK_DFLASH_DEVICE_FEATURES");
     if (enabled == nullptr || enabled[0] != '1') {
         return true;
     }
@@ -539,6 +580,7 @@ static bool llama_dflash_init_gpu_capture(
     capture.gpu_layer_capacity = capacity;
     capture.gpu_layer_tensors.resize(capture.layer_ids.size(), nullptr);
     capture.gpu_layer_bufs.resize(capture.layer_ids.size(), nullptr);
+    capture.gpu_layer_backends.resize(capture.layer_ids.size(), nullptr);
     for (size_t i = 0; i < capture.layer_ids.size(); ++i) {
         const int32_t layer_id = capture.layer_ids[i];
         ggml_tensor * tensor = ggml_new_tensor_2d(capture.gpu_ctx, GGML_TYPE_F32, ctx.model.hparams.n_embd, capacity);
@@ -549,6 +591,18 @@ static bool llama_dflash_init_gpu_capture(
         }
         ggml_format_name(tensor, "dflash_gpu_capture_%d", layer_id);
         const ggml_backend_buffer_type_t buft = llama_dflash_capture_layer_buft(ctx, layer_id);
+        ggml_backend_t capture_backend = nullptr;
+        for (ggml_backend_t candidate : ctx.backends) {
+            if (candidate != nullptr && ggml_backend_get_default_buffer_type(candidate) == buft) {
+                capture_backend = candidate;
+                break;
+            }
+        }
+        if (capture_backend == nullptr || ggml_backend_is_cpu(capture_backend)) {
+            LLAMA_LOG_WARN("%s: no non-CPU capture backend for layer %d; using CPU capture fallback\n", __func__, layer_id);
+            capture.gpu_capture_enabled = false;
+            return false;
+        }
         const size_t bytes = ggml_backend_buft_get_alloc_size(buft, tensor);
         ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, bytes);
         if (buffer == nullptr) {
@@ -561,11 +615,11 @@ static bool llama_dflash_init_gpu_capture(
         ggml_backend_buffer_clear(buffer, 0);
         capture.gpu_layer_tensors[i] = tensor;
         capture.gpu_layer_bufs[i] = buffer;
+        capture.gpu_layer_backends[i] = capture_backend;
     }
 
     capture.gpu_capture_enabled = true;
-    const char * gpu_features = std::getenv("IK_DFLASH_GPU_FEATURES");
-    capture.gpu_features_enabled = gpu_features != nullptr && gpu_features[0] == '1';
+    capture.gpu_features_enabled = true;
     return true;
 }
 
@@ -578,18 +632,19 @@ bool llama_set_dflash_capture_layers(
     }
 
     auto capture = std::make_unique<llama_context::dflash_runtime::capture_state>();
-    const char * telemetry = std::getenv("IK_DFLASH_PIPELINE_LOG");
+    const char * telemetry = std::getenv("IK_DFLASH_TELEMETRY");
     capture->telemetry_enabled = telemetry != nullptr && telemetry[0] == '1';
     capture->layer_ids.assign(layer_ids, layer_ids + n_layers);
     capture->layer_rows.resize((size_t) n_layers);
     capture->layer_backends.resize((size_t) n_layers, nullptr);
+    capture->gpu_layer_views.resize((size_t) n_layers, nullptr);
+    capture->gpu_source_tensors.resize((size_t) n_layers, nullptr);
     capture->layer_seen_batch_id.assign((size_t) n_layers, 0);
     capture->layer_device_produced_batch_id.assign((size_t) n_layers, 0);
     capture->layer_device_produced_rows.assign((size_t) n_layers, 0);
     llama_dflash_init_gpu_capture(*ctx, *capture);
     capture->prev_cb_eval = ctx->cparams.cb_eval;
     capture->prev_cb_eval_user_data = ctx->cparams.cb_eval_user_data;
-    const bool telemetry_enabled = capture->telemetry_enabled;
     ctx->dflash.capture = std::move(capture);
     ctx->dflash.feature_view_buffer.clear();
 
@@ -597,23 +652,6 @@ bool llama_set_dflash_capture_layers(
     ctx->cparams.cb_eval_user_data = ctx;
     if (ctx->sched != nullptr) {
         ggml_backend_sched_set_eval_callback(ctx->sched, ctx->cparams.cb_eval, ctx->cparams.cb_eval_user_data);
-    }
-
-    if (telemetry_enabled) {
-        std::string devices;
-        for (size_t i = 0; i < ctx->cparams.devices.size(); ++i) {
-            if (i > 0) {
-                devices += ",";
-            }
-            devices += ctx->cparams.devices[i];
-        }
-        const llama_model * model = llama_get_model(ctx);
-        LLAMA_LOG_INFO("DFlash pipeline placement target_devices=%s target_graph_split=%d capture_layers=%d gpu_capture=%d gpu_capacity=%d\n",
-                devices.c_str(),
-                model != nullptr && llama_model_is_split_mode_graph(model) ? 1 : 0,
-                n_layers,
-                ctx->dflash.capture != nullptr && ctx->dflash.capture->gpu_capture_enabled ? 1 : 0,
-                ctx->dflash.capture != nullptr ? ctx->dflash.capture->gpu_layer_capacity : 0);
     }
 
     return true;
@@ -661,10 +699,13 @@ struct ggml_tensor * llama_dflash_capture_graph_dst(
         return nullptr;
     }
     ggml_backend_sched_set_tensor_backend(ctx->sched, view, producer_backend);
-    capture.gpu_graph_copy_nodes++;
+    ggml_backend_view_init(view);
+    if (capture.gpu_layer_views.size() != capture.layer_ids.size()) {
+        capture.gpu_layer_views.assign(capture.layer_ids.size(), nullptr);
+    }
+    capture.gpu_layer_views[(size_t) layer_idx] = view;
     return view;
 }
-
 
 static ggml_backend_t llama_dflash_select_device_input_backend(const llama_context & ctx) {
     if (ctx.model.dflash_fc != nullptr && ctx.model.dflash_fc->buffer != nullptr) {
@@ -719,42 +760,69 @@ static bool llama_dflash_backends_share_device(ggml_backend_t source, ggml_backe
         return true;
     }
 
+    const char * source_name = ggml_backend_name(source);
+    const char * destination_name = ggml_backend_name(destination);
+    const bool source_cuda = source_name != nullptr && std::strncmp(source_name, "CUDA", 4) == 0 &&
+            std::strcmp(source_name, "CUDA_Host") != 0;
+    const bool destination_cuda = destination_name != nullptr && std::strncmp(destination_name, "CUDA", 4) == 0 &&
+            std::strcmp(destination_name, "CUDA_Host") != 0;
+    if (source_cuda && destination_cuda && source_name != nullptr && destination_name != nullptr) {
+        return std::strcmp(source_name, destination_name) == 0;
+    }
+
     const ggml_backend_buffer_type_t source_buft = ggml_backend_get_default_buffer_type(source);
     const ggml_backend_buffer_type_t destination_buft = ggml_backend_get_default_buffer_type(destination);
     return source_buft != nullptr && source_buft == destination_buft;
 }
 
+enum class llama_dflash_copy_route {
+    same_device,
+    cross_device,
+    unsupported,
+};
+
+static bool llama_dflash_is_cuda_device_backend(ggml_backend_t backend) {
+    const char * name = backend != nullptr ? ggml_backend_name(backend) : nullptr;
+    return name != nullptr && std::strncmp(name, "CUDA", 4) == 0 &&
+            std::strcmp(name, "CUDA_Host") != 0;
+}
+
+static llama_dflash_copy_route llama_dflash_copy_route_for(
+        ggml_backend_t source, ggml_backend_t destination) {
+    if (llama_dflash_backends_share_device(source, destination)) {
+        return llama_dflash_copy_route::same_device;
+    }
+    if (llama_dflash_is_cuda_device_backend(source) &&
+            llama_dflash_is_cuda_device_backend(destination)) {
+        return llama_dflash_copy_route::cross_device;
+    }
+    return llama_dflash_copy_route::unsupported;
+}
+
+static void llama_dflash_note_device_copy(
+        llama_context::dflash_capture_state & capture,
+        llama_dflash_copy_route route,
+        size_t bytes) {
+    switch (route) {
+        case llama_dflash_copy_route::same_device:
+            capture.device_same_device_bytes += bytes;
+            break;
+        case llama_dflash_copy_route::cross_device:
+            capture.device_cross_device_bytes += bytes;
+            break;
+        case llama_dflash_copy_route::unsupported:
+            break;
+    }
+}
+
 bool llama_dflash_prepare_device_transport(struct llama_context * ctx_tgt, struct llama_context * ctx_dft) {
-    const char * enabled = std::getenv("IK_DFLASH_DEVICE_APPEND");
-    if (enabled == nullptr || enabled[0] != '1' || ctx_tgt == nullptr || ctx_dft == nullptr ||
+    if (ctx_tgt == nullptr || ctx_dft == nullptr ||
             !ctx_tgt->dflash.capture || !ctx_tgt->dflash.capture->gpu_capture_enabled ||
             ctx_tgt->dflash.capture->gpu_layer_tensors.empty()) {
         return false;
     }
 
     auto & kv = ctx_dft->dflash.kv;
-    if (ctx_tgt->dflash.capture->telemetry_enabled) {
-        const bool draft_graph_split = llama_model_is_split_mode_graph(&ctx_dft->model);
-        int graph_layers = 0;
-        int graph_devices = 0;
-        for (const auto & layer : ctx_dft->model.layers) {
-            const auto * wk = layer.wk;
-            const auto * wv = layer.wv;
-            if (!draft_graph_split || wk == nullptr || wv == nullptr || wk->extra == nullptr || wv->extra == nullptr) {
-                continue;
-            }
-            const auto * split_wk = (const ggml_split_tensor_t *) wk->extra;
-            const auto * split_wv = (const ggml_split_tensor_t *) wv->extra;
-            if (split_wk->n_device != split_wv->n_device) {
-                continue;
-            }
-            ++graph_layers;
-            graph_devices = std::max(graph_devices, split_wk->n_device);
-        }
-        LLAMA_LOG_INFO("DFlash pipeline draft_placement devices=%zu graph_split=%d rank_local_layers=%d rank_devices=%d fc_replicated=%d\n",
-                ctx_dft->cparams.devices.size(), draft_graph_split ? 1 : 0, graph_layers, graph_devices,
-                ctx_dft->model.dflash_fc != nullptr && ctx_dft->model.dflash_fc->extra == nullptr ? 1 : 0);
-    }
     auto clear_partial = [&]() {
         for (ggml_backend_buffer_t buf : kv.device_input_bufs) {
             if (buf != nullptr) {
@@ -788,8 +856,21 @@ bool llama_dflash_prepare_device_transport(struct llama_context * ctx_tgt, struc
     if (kv.device_input_target_features != nullptr || kv.device_input_ctx != nullptr || !kv.device_input_bufs.empty()) {
         clear_partial();
     }
-    const int64_t feature_width = (int64_t) ctx_tgt->model.hparams.n_embd * (int64_t) ctx_tgt->dflash.capture->layer_ids.size();
-    const int64_t capacity = ctx_tgt->dflash.capture->gpu_layer_capacity;
+    const int64_t layer_width = (int64_t) ctx_tgt->model.hparams.n_embd;
+    const int64_t layer_count = (int64_t) ctx_tgt->dflash.capture->layer_ids.size();
+    const int64_t window_capacity = ctx_dft->dflash.visible_cross_ctx;
+    if (layer_width <= 0 || layer_count <= 0 || layer_width > std::numeric_limits<int64_t>::max() / layer_count ||
+            window_capacity <= 0 || window_capacity > std::numeric_limits<int32_t>::max()) {
+        clear_partial();
+        return false;
+    }
+    const int64_t feature_width = layer_width * layer_count;
+    const int64_t capture_capacity = ctx_tgt->dflash.capture->gpu_layer_capacity;
+    if (capture_capacity <= 0 || capture_capacity > std::numeric_limits<int32_t>::max()) {
+        clear_partial();
+        return false;
+    }
+    const int64_t capacity = std::max(capture_capacity, window_capacity);
     ggml_init_params params = {
         /*.mem_size   =*/ 3 * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
@@ -807,11 +888,6 @@ bool llama_dflash_prepare_device_transport(struct llama_context * ctx_tgt, struc
         return false;
     }
 
-    const int64_t window_capacity = ctx_dft->dflash.visible_cross_ctx;
-    if (window_capacity <= 0) {
-        clear_partial();
-        return false;
-    }
     kv.device_window_target_features = ggml_new_tensor_2d(
             kv.device_input_ctx, GGML_TYPE_F32, feature_width, window_capacity);
     if (kv.device_window_target_features == nullptr) {
@@ -829,6 +905,7 @@ bool llama_dflash_prepare_device_transport(struct llama_context * ctx_tgt, struc
     const size_t bytes = ggml_backend_buft_get_alloc_size(buft, kv.device_input_target_features);
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, bytes);
     if (buffer == nullptr) {
+        LLAMA_LOG_WARN("DFlash device input allocation failed width=%lld capacity=%lld bytes=%zu\n", (long long) feature_width, (long long) capacity, bytes);
         clear_partial();
         return false;
     }
@@ -840,6 +917,7 @@ bool llama_dflash_prepare_device_transport(struct llama_context * ctx_tgt, struc
     const size_t window_bytes = ggml_backend_buft_get_alloc_size(buft, kv.device_window_target_features);
     ggml_backend_buffer_t window_buffer = ggml_backend_buft_alloc_buffer(buft, window_bytes);
     if (window_buffer == nullptr) {
+        LLAMA_LOG_WARN("DFlash device window allocation failed width=%lld capacity=%lld bytes=%zu\n", (long long) feature_width, (long long) window_capacity, window_bytes);
         clear_partial();
         return false;
     }
@@ -848,70 +926,36 @@ bool llama_dflash_prepare_device_transport(struct llama_context * ctx_tgt, struc
     ggml_backend_buffer_clear(window_buffer, 0);
     kv.device_window_bufs.push_back(window_buffer);
     kv.device_input_backend = device_backend;
-    LLAMA_LOG_INFO("DFlash pipeline device_append prepared width=%lld capacity=%lld\n", (long long) feature_width, (long long) capacity);
     return true;
 }
 
-bool llama_dflash_copy_device_append(
+bool llama_dflash_copy_device_input_from_window(
         struct llama_context * ctx_tgt,
         struct llama_context * ctx_dft,
         const std::vector<int32_t> & source_row_indices) {
-    if (ctx_tgt == nullptr || ctx_dft == nullptr || source_row_indices.empty() || !ctx_tgt->dflash.capture ||
+    if (ctx_dft == nullptr || source_row_indices.empty() ||
+            ctx_dft->dflash.kv.device_window_target_features == nullptr ||
             ctx_dft->dflash.kv.device_input_target_features == nullptr ||
             ctx_dft->dflash.kv.device_input_backend == nullptr) {
         return false;
     }
 
-    auto & capture = *ctx_tgt->dflash.capture;
-    const int32_t n_layers = (int32_t) capture.layer_ids.size();
-    if (!capture.gpu_capture_enabled || n_layers <= 0 ||
-            capture.gpu_layer_tensors.size() != (size_t) n_layers ||
-            capture.layer_device_produced_batch_id.size() != (size_t) n_layers ||
-            capture.layer_device_produced_rows.size() != (size_t) n_layers) {
-        return false;
-    }
-
-    const int32_t produced_rows = capture.layer_device_produced_rows.front();
-    if (capture.capture_batch_id == 0 || produced_rows <= 0) {
-        return false;
-    }
-    for (int32_t layer_idx = 0; layer_idx < n_layers; ++layer_idx) {
-        if (capture.layer_device_produced_batch_id[(size_t) layer_idx] != capture.capture_batch_id ||
-                capture.layer_device_produced_rows[(size_t) layer_idx] != produced_rows ||
-                capture.gpu_layer_tensors[(size_t) layer_idx] == nullptr ||
-                capture.gpu_layer_tensors[(size_t) layer_idx]->buffer == nullptr) {
-            return false;
-        }
-    }
-
-    const int32_t n_rows = (int32_t) source_row_indices.size();
+    ggml_tensor * source = ctx_dft->dflash.kv.device_window_target_features;
     ggml_tensor * destination = ctx_dft->dflash.kv.device_input_target_features;
-    const int32_t layer_width = (int32_t) ctx_tgt->model.hparams.n_embd;
-    if (layer_width <= 0 || destination->ne[0] < (int64_t) layer_width * n_layers || n_rows > destination->ne[1]) {
+    const int32_t n_rows = (int32_t) source_row_indices.size();
+    const int64_t row_width = source->ne[0];
+    if (row_width <= 0 || destination->ne[0] != row_width ||
+            n_rows > destination->ne[1]) {
         return false;
     }
-
-    std::vector<int32_t> normalized_indices;
-    normalized_indices.reserve(source_row_indices.size());
     for (int32_t row : source_row_indices) {
-        if (row < 0 || row >= produced_rows) {
-            LLAMA_LOG_WARN("DFlash pipeline device_append source row out of range row=%d produced_rows=%d",
-                    row, produced_rows);
+        if (row < 0 || row >= ctx_dft->dflash.kv.device_window_capacity) {
             return false;
-        }
-        normalized_indices.push_back(row);
-    }
-
-    bool contiguous = true;
-    for (int32_t i = 1; i < n_rows; ++i) {
-        if (normalized_indices[(size_t) i] != normalized_indices[0] + i) {
-            contiguous = false;
-            break;
         }
     }
 
     ggml_init_params view_params = {
-        /*.mem_size   =*/ (size_t) (2 * n_layers * n_rows + 1) * ggml_tensor_overhead(),
+        /*.mem_size   =*/ (size_t) (2 * n_rows + 1) * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -920,77 +964,30 @@ bool llama_dflash_copy_device_append(
         return false;
     }
 
-    std::vector<ggml_backend_t> source_backends;
-    source_backends.reserve((size_t) n_layers);
-    for (int32_t layer_idx = 0; layer_idx < n_layers; ++layer_idx) {
-        ggml_tensor * source = capture.gpu_layer_tensors[(size_t) layer_idx];
-        ggml_backend_t source_backend = llama_dflash_backend_for_buffer(*ctx_tgt, source->buffer);
-        if (source_backend == nullptr) {
-            source_backend = capture.layer_backends[(size_t) layer_idx];
-        }
-        if (source_backend == nullptr ||
-                !llama_dflash_backends_share_device(source_backend, ctx_dft->dflash.kv.device_input_backend)) {
-            LLAMA_LOG_WARN("DFlash pipeline device_append rejected mixed or unknown device layer=%d src=%s dst=%s\n",
-                    capture.layer_ids[(size_t) layer_idx],
-                    source_backend != nullptr ? ggml_backend_name(source_backend) : "<unknown>",
-                    ggml_backend_name(ctx_dft->dflash.kv.device_input_backend));
-            ggml_free(view_ctx);
-            return false;
-        }
-        source_backends.push_back(source_backend);
-    }
-
-    auto copy_view = [&](ggml_tensor * source, ggml_backend_t source_backend,
-            int32_t layer_idx, int32_t source_row, int32_t destination_row, int32_t rows) {
+    bool copied = true;
+    for (int32_t row_idx = 0; row_idx < n_rows && copied; ++row_idx) {
         ggml_tensor * src_view = ggml_view_2d(
-                view_ctx, source, layer_width, rows, source->nb[1],
-                (size_t) source_row * source->nb[1]);
+                view_ctx, source, row_width, 1, source->nb[1],
+                (size_t) source_row_indices[(size_t) row_idx] * source->nb[1]);
         ggml_tensor * dst_view = ggml_view_2d(
-                view_ctx, destination, layer_width, rows, destination->nb[1],
-                (size_t) layer_idx * (size_t) layer_width * sizeof(float) +
-                (size_t) destination_row * destination->nb[1]);
-        if (src_view == nullptr || dst_view == nullptr || source_backend == nullptr) {
-            return false;
+                view_ctx, destination, row_width, 1, destination->nb[1],
+                (size_t) row_idx * destination->nb[1]);
+        if (src_view == nullptr || dst_view == nullptr) {
+            copied = false;
+            break;
         }
         ggml_backend_view_init(src_view);
         ggml_backend_view_init(dst_view);
-        if (rows == 1) {
-            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
-                dst_view->nb[i] = src_view->nb[i];
-            }
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            dst_view->nb[i] = src_view->nb[i];
         }
-        if (!llama_dflash_backends_share_device(source_backend, ctx_dft->dflash.kv.device_input_backend)) {
-            return false;
-        }
-        ggml_backend_tensor_copy_async(source_backend, ctx_dft->dflash.kv.device_input_backend, src_view, dst_view);
-        return true;
-    };
-
-    bool copied = true;
-    for (int32_t layer_idx = 0; layer_idx < n_layers && copied; ++layer_idx) {
-        ggml_tensor * source = capture.gpu_layer_tensors[(size_t) layer_idx];
-        ggml_backend_t source_backend = source_backends[(size_t) layer_idx];
-        if (capture.telemetry_enabled) {
-            LLAMA_LOG_INFO("DFlash pipeline device_append source layer=%d backend=%s buffer=%s dst_backend=%s dst_buffer=%s",
-                    capture.layer_ids[(size_t) layer_idx],
-                    ggml_backend_name(source_backend),
-                    ggml_backend_buffer_name(source->buffer),
-                    ggml_backend_name(ctx_dft->dflash.kv.device_input_backend),
-                    ggml_backend_buffer_name(destination->buffer));
-        }
-
-        for (int32_t row_idx = 0; row_idx < n_rows && copied; ++row_idx) {
-            copied = copy_view(source, source_backend, layer_idx,
-                    normalized_indices[(size_t) row_idx], row_idx, 1);
-        }
+        ggml_backend_tensor_copy_async(
+                ctx_dft->dflash.kv.device_input_backend,
+                ctx_dft->dflash.kv.device_input_backend,
+                src_view, dst_view);
     }
 
     if (copied) {
-        for (ggml_backend_t backend : source_backends) {
-            if (backend != nullptr) {
-                ggml_backend_synchronize(backend);
-            }
-        }
         ggml_backend_synchronize(ctx_dft->dflash.kv.device_input_backend);
     }
     ggml_free(view_ctx);
@@ -1001,14 +998,30 @@ bool llama_dflash_copy_device_append(
     ctx_dft->dflash.kv.device_input_ready = true;
     ctx_dft->dflash.kv.device_input_rows = n_rows;
     ctx_dft->dflash.kv.device_input_row_offset = 0;
-    const bool mixed_producer = std::adjacent_find(
-            source_backends.begin(), source_backends.end(),
-            std::not_equal_to<ggml_backend_t>()) != source_backends.end();
-    LLAMA_LOG_INFO("DFlash pipeline device_append copied rows=%d contiguous=%d layers=%d mixed=%d dst=%s",
-            n_rows, contiguous ? 1 : 0, n_layers, mixed_producer ? 1 : 0,
-            ggml_backend_name(ctx_dft->dflash.kv.device_input_backend));
+    GGML_UNUSED(ctx_tgt);
     return true;
 }
+
+bool llama_dflash_rebuild_device_input_from_window(
+        struct llama_context * ctx_dft,
+        int32_t n_rows,
+        int32_t ring_write_pos) {
+    if (ctx_dft == nullptr || ctx_dft->dflash.kv.device_window_capacity <= 0 ||
+            n_rows <= 0 || n_rows > ctx_dft->dflash.kv.device_window_capacity ||
+            ctx_dft->dflash.kv.device_input_target_features == nullptr ||
+            n_rows > ctx_dft->dflash.kv.device_input_target_features->ne[1]) {
+        return false;
+    }
+    const int32_t capacity = ctx_dft->dflash.kv.device_window_capacity;
+    const int32_t normalized_write_pos = ((ring_write_pos % capacity) + capacity) % capacity;
+    const int32_t read_start = (normalized_write_pos - n_rows + capacity) % capacity;
+    std::vector<int32_t> source_rows((size_t) n_rows);
+    for (int32_t i = 0; i < n_rows; ++i) {
+        source_rows[(size_t) i] = (read_start + i) % capacity;
+    }
+    return llama_dflash_copy_device_input_from_window(nullptr, ctx_dft, source_rows);
+}
+
 bool llama_dflash_copy_device_window_rows(
         struct llama_context * ctx_tgt,
         struct llama_context * ctx_dft,
@@ -1067,23 +1080,34 @@ bool llama_dflash_copy_device_window_rows(
     }
 
     std::vector<ggml_backend_t> source_backends;
+    std::vector<llama_dflash_copy_route> copy_routes;
     source_backends.reserve((size_t) n_layers);
+    copy_routes.reserve((size_t) n_layers);
     for (int32_t layer_idx = 0; layer_idx < n_layers; ++layer_idx) {
         ggml_tensor * source = capture.gpu_layer_tensors[(size_t) layer_idx];
-        ggml_backend_t source_backend = llama_dflash_backend_for_buffer(*ctx_tgt, source->buffer);
+        ggml_backend_t source_backend = capture.gpu_layer_backends.size() == capture.layer_ids.size()
+                ? capture.gpu_layer_backends[(size_t) layer_idx] : nullptr;
+        if (source_backend == nullptr) {
+            source_backend = llama_dflash_backend_for_buffer(*ctx_tgt, source->buffer);
+        }
         if (source_backend == nullptr) {
             source_backend = capture.layer_backends[(size_t) layer_idx];
         }
-        if (source_backend == nullptr ||
-                !llama_dflash_backends_share_device(source_backend, ctx_dft->dflash.kv.device_input_backend)) {
-            LLAMA_LOG_WARN("DFlash pipeline device_window rejected mixed or unknown device layer=%d src=%s dst=%s\n",
-                    capture.layer_ids[(size_t) layer_idx],
+        const llama_dflash_copy_route route = llama_dflash_copy_route_for(
+                source_backend, ctx_dft->dflash.kv.device_input_backend);
+        if (route == llama_dflash_copy_route::unsupported) {
+            capture.device_last_fallback_reason = source_backend == nullptr
+                    ? "unknown-source-backend"
+                    : "mixed-transport-disabled-or-unsupported-backend";
+            LLAMA_LOG_WARN("DFlash device window rejected source=%s destination=%s reason=%s\n",
                     source_backend != nullptr ? ggml_backend_name(source_backend) : "<unknown>",
-                    ggml_backend_name(ctx_dft->dflash.kv.device_input_backend));
+                    ggml_backend_name(ctx_dft->dflash.kv.device_input_backend),
+                    capture.device_last_fallback_reason.c_str());
             ggml_free(view_ctx);
             return false;
         }
         source_backends.push_back(source_backend);
+        copy_routes.push_back(route);
     }
 
     bool copied = true;
@@ -1108,16 +1132,23 @@ bool llama_dflash_copy_device_window_rows(
                 dst_view->nb[j] = src_view->nb[j];
             }
             ggml_backend_tensor_copy_async(source_backend, ctx_dft->dflash.kv.device_input_backend, src_view, dst_view);
+            llama_dflash_note_device_copy(capture, copy_routes[(size_t) layer_idx],
+                    (size_t) ctx_tgt->model.hparams.n_embd * sizeof(float));
         }
     }
 
     if (copied) {
+        const int64_t sync_start_us = ggml_time_us();
         for (ggml_backend_t backend : source_backends) {
             if (backend != nullptr) {
                 ggml_backend_synchronize(backend);
             }
         }
         ggml_backend_synchronize(ctx_dft->dflash.kv.device_input_backend);
+        if (capture.telemetry_enabled) {
+            capture.device_sync_count++;
+            capture.device_sync_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - sync_start_us);
+        }
     }
     ggml_free(view_ctx);
     if (!copied) {
@@ -1173,6 +1204,54 @@ void llama_dflash_disable_gpu_features(struct llama_context * ctx) {
     }
 }
 
+void llama_dflash_note_device_host_fallback(
+        struct llama_context * ctx, const char * reason) {
+    if (ctx == nullptr || !ctx->dflash.capture) {
+        return;
+    }
+    auto & capture = *ctx->dflash.capture;
+    capture.device_host_fallback_count++;
+    capture.device_last_fallback_reason = reason != nullptr ? reason : "host-fallback";
+}
+
+void llama_dflash_note_device_append(struct llama_context * ctx) {
+    if (ctx != nullptr && ctx->dflash.capture && ctx->dflash.capture->telemetry_enabled) {
+        ctx->dflash.capture->device_append_count++;
+    }
+}
+
+void llama_dflash_log_telemetry_summary(
+        const struct llama_context * ctx,
+        int32_t ring_filled,
+        int32_t ring_write_pos,
+        int32_t window_rows,
+        bool device_only) {
+    if (ctx == nullptr || !ctx->dflash.capture || !ctx->dflash.capture->telemetry_enabled) {
+        return;
+    }
+
+    const auto & capture = *ctx->dflash.capture;
+    LLAMA_LOG_INFO(
+            "DFlash telemetry gpu_features=%d same_device_bytes=%llu cross_device_bytes=%llu "
+            "feature_d2h_bytes=%llu host_fallbacks=%llu device_appends=%llu "
+            "sync_count=%llu sync_us=%llu capture_layers=%zu ring_filled=%d ring_write=%d "
+            "window_rows=%d device_only=%d fallback_reason=%s\n",
+            capture.gpu_features_enabled ? 1 : 0,
+            (unsigned long long) capture.device_same_device_bytes,
+            (unsigned long long) capture.device_cross_device_bytes,
+            (unsigned long long) capture.capture_d2h_bytes,
+            (unsigned long long) capture.device_host_fallback_count,
+            (unsigned long long) capture.device_append_count,
+            (unsigned long long) capture.device_sync_count,
+            (unsigned long long) capture.device_sync_us,
+            capture.layer_ids.size(),
+            ring_filled,
+            ring_write_pos,
+            window_rows,
+            device_only ? 1 : 0,
+            capture.device_last_fallback_reason.empty() ? "none" : capture.device_last_fallback_reason.c_str());
+}
+
 void llama_dflash_clear_device_append(struct llama_context * ctx) {
     if (ctx != nullptr) {
         ctx->dflash.kv.device_input_ready = false;
@@ -1217,15 +1296,7 @@ void llama_begin_dflash_capture_batch(struct llama_context * ctx) {
     std::fill(capture.layer_seen_batch_id.begin(), capture.layer_seen_batch_id.end(), 0);
     std::fill(capture.layer_device_produced_batch_id.begin(), capture.layer_device_produced_batch_id.end(), 0);
     std::fill(capture.layer_device_produced_rows.begin(), capture.layer_device_produced_rows.end(), 0);
-    if (capture.telemetry_enabled) {
-        capture.capture_enqueue_count = 0;
-        capture.capture_d2h_bytes = 0;
-        capture.capture_wait_count = 0;
-        capture.capture_wait_us = 0;
-        capture.materialize_count = 0;
-        capture.materialize_rows = 0;
-        capture.last_reported_batch_id = 0;
-    }
+    std::fill(capture.gpu_source_tensors.begin(), capture.gpu_source_tensors.end(), nullptr);
 }
 
 void llama_finish_dflash_capture_batch(
@@ -1256,8 +1327,8 @@ static bool llama_spec_prepare_dflash_capture(
     const int64_t wait_start_us = ggml_time_us();
     llama_synchronize(ctx);
     if (capture.telemetry_enabled) {
-        capture.capture_wait_count++;
-        capture.capture_wait_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - wait_start_us);
+        capture.device_sync_count++;
+        capture.device_sync_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - wait_start_us);
     }
     row_count = capture.row_count;
     row_width = capture.row_width;
@@ -1287,21 +1358,6 @@ static bool llama_spec_prepare_dflash_capture(
                     (size_t) row_count * (size_t) row_width, cpu_ready ? 1 : 0, gpu_ready ? 1 : 0);
             return false;
         }
-    }
-
-    if (capture.telemetry_enabled && capture.last_reported_batch_id != capture.capture_batch_id) {
-        LLAMA_LOG_INFO("DFlash pipeline capture batch=%llu layers=%d rows=%d width=%d enqueue=%llu d2h_bytes=%llu waits=%llu wait_us=%llu materialize_calls=%llu materialize_rows=%llu\n",
-                (unsigned long long) capture.capture_batch_id,
-                n_layers,
-                row_count,
-                row_width,
-                (unsigned long long) capture.capture_enqueue_count,
-                (unsigned long long) capture.capture_d2h_bytes,
-                (unsigned long long) capture.capture_wait_count,
-                (unsigned long long) capture.capture_wait_us,
-                (unsigned long long) capture.materialize_count,
-                (unsigned long long) capture.materialize_rows);
-        capture.last_reported_batch_id = capture.capture_batch_id;
     }
 
     return true;
@@ -1353,11 +1409,6 @@ static bool llama_spec_materialize_dflash_rows_prepared(
     rows_out.resize((size_t) row_indices.size() * (size_t) combined_width);
 
     auto & capture = *ctx->dflash.capture;
-    if (capture.telemetry_enabled) {
-        capture.materialize_count++;
-        capture.materialize_rows += (uint64_t) row_indices.size();
-    }
-
     const auto & layer_rows = capture.layer_rows;
     for (size_t out_row = 0; out_row < row_indices.size(); ++out_row) {
         int32_t row_index = row_indices[out_row];

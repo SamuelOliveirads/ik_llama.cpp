@@ -11,7 +11,6 @@ struct llama_model;
 struct ggml_tensor;
 struct ggml_context;
 struct llama_spec_feature_view;
-
 struct llama_dflash_window_update {
         uint64_t version = 0;
         int32_t keep_rows = 0;
@@ -124,27 +123,49 @@ struct ggml_tensor * llama_dflash_capture_graph_dst(
 
 bool llama_dflash_prepare_device_transport(struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
 
-bool llama_dflash_copy_device_append(
+bool llama_dflash_rebuild_device_input_from_window(
+        struct llama_context * ctx_dft,
+        int32_t n_rows,
+        int32_t ring_write_pos);
+
+bool llama_dflash_copy_device_input_from_window(
         struct llama_context * ctx_tgt,
         struct llama_context * ctx_dft,
         const std::vector<int32_t> & source_row_indices);
+
 bool llama_dflash_copy_device_window_rows(
         struct llama_context * ctx_tgt,
         struct llama_context * ctx_dft,
         const std::vector<int32_t> & source_row_indices,
         const std::vector<int32_t> & destination_row_indices);
+
 bool llama_dflash_upload_device_window(
         struct llama_context * ctx_dft,
         const float * rows,
         int32_t n_rows);
+
 bool llama_dflash_read_device_window(
         struct llama_context * ctx_dft,
         float * rows,
         int32_t n_rows);
 
 bool llama_dflash_device_window_is_valid(const struct llama_context * ctx);
+
+void llama_dflash_note_device_host_fallback(struct llama_context * ctx, const char * reason);
+
+void llama_dflash_note_device_append(struct llama_context * ctx);
+
+void llama_dflash_log_telemetry_summary(
+        const struct llama_context * ctx,
+        int32_t ring_filled,
+        int32_t ring_write_pos,
+        int32_t window_rows,
+        bool device_only);
+
 void llama_dflash_disable_gpu_features(struct llama_context * ctx);
+
 bool llama_dflash_device_feature_path_enabled(const struct llama_context * ctx);
+
 void llama_dflash_clear_device_append(struct llama_context * ctx);
 
 void llama_clear_dflash_capture(struct llama_context * ctx);

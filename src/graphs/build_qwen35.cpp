@@ -2,6 +2,7 @@
 #include "../llama-model.h"
 #include "../llama-context.h"
 #include "../llama-delta-net.h"
+#include "../llama-spec-features-dflash.h"
 
 ggml_cgraph * llm_build_context::build_qwen35moe() {
 
@@ -147,6 +148,8 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
             cur = lctx.cvec.apply_to(ctx0, cur, il);
             cb(cur, "l_out", il);
+
+            llama_dflash_capture_graph_dst(&lctx, ctx0, il, (int32_t) cur->ne[1]);
 
             inpL = cur;
         }
