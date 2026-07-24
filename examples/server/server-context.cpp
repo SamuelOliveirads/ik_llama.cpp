@@ -4749,7 +4749,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         speculative_decoding_accept();
 
         if (finish_prompt_warmup_batch) {
-            llama_finish_dflash_capture_batch(ctx, true);
+            llama_finish_dflash_capture_batch(ctx);
         }
     }
 }

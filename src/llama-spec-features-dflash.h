@@ -172,7 +172,7 @@ void llama_clear_dflash_capture(struct llama_context * ctx);
 
 void llama_begin_dflash_capture_batch(struct llama_context * ctx);
 
-void llama_finish_dflash_capture_batch(struct llama_context * ctx, bool is_prompt_warmup);
+void llama_finish_dflash_capture_batch(struct llama_context * ctx);
 
 bool llama_spec_get_dflash_device_feature_view(
         struct llama_context   * ctx,

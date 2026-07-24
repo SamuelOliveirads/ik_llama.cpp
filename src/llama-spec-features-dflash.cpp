@@ -530,8 +530,6 @@ static int llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool 
     if (capture.telemetry_enabled) {
         capture.capture_d2h_bytes += (uint64_t) ggml_nbytes(tensor);
     }
-    // Queue the host read on the tensor backend. llama_spec_prepare_dflash_capture()
-    // synchronizes the scheduler before materialization consumes these rows.
     ggml_backend_tensor_get_async(backend, tensor, rows.data(), 0, ggml_nbytes(tensor));
 
     capture.row_width = row_width;
@@ -739,8 +737,6 @@ static ggml_backend_t llama_dflash_backend_for_buffer(
         }
     }
 
-    // A single non-CPU backend is unambiguous even when a scheduler or
-    // allocator wraps its buffer type.
     ggml_backend_t only_non_cpu = nullptr;
     int non_cpu_count = 0;
     for (ggml_backend_t backend : ctx.backends) {
@@ -1299,14 +1295,11 @@ void llama_begin_dflash_capture_batch(struct llama_context * ctx) {
     std::fill(capture.gpu_source_tensors.begin(), capture.gpu_source_tensors.end(), nullptr);
 }
 
-void llama_finish_dflash_capture_batch(
-        struct llama_context * ctx,
-        bool is_prompt_warmup) {
+void llama_finish_dflash_capture_batch(struct llama_context * ctx) {
     if (ctx == nullptr || !ctx->dflash.capture) {
         return;
     }
 
-    GGML_UNUSED(is_prompt_warmup);
     auto & capture = *ctx->dflash.capture;
     // Reset the batch-local reference shape so the next decode only compares layers within
     // the same batch, not against the previous prompt/verify batch.

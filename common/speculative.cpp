@@ -1904,34 +1904,12 @@ bool common_speculative_load_draft_model(
     params_dft.k_cache_hadamard = params_base.k_cache_hadamard;
     params_dft.v_cache_hadamard = params_base.v_cache_hadamard;
 
-    if (params.split_mode_set) {
-        params_dft.split_mode = params.split_mode;
-    }
-    if (params.tensor_split_set) {
-        for (size_t i = 0; i < std::size(params_dft.tensor_split); ++i) {
-            params_dft.tensor_split[i] = params.tensor_split[i];
-        }
-    }
-
     if (params.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
-        if (!params.split_mode_set) {
-            params_dft.split_mode = params_base.split_mode;
-        }
-        for (size_t i = 0; i < std::size(params_dft.tensor_split); ++i) {
-            if (!params.tensor_split_set) {
-                params_dft.tensor_split[i] = params_base.tensor_split[i];
-            }
-        }
         params_dft.attn_max_batch = params_base.attn_max_batch;
         params_dft.graph_reuse = params_base.graph_reuse;
-        params_dft.split_mode_graph_scheduling = params_base.split_mode_graph_scheduling;
         params_dft.scheduler_async = params_base.scheduler_async;
         params_dft.max_extra_alloc_MiB = params_base.max_extra_alloc_MiB;
         params_dft.reduce_type = params_base.reduce_type;
-    }
-
-    if (params.split_mode_set && params.split_mode == LLAMA_SPLIT_MODE_NONE && !params.tensor_split_set) {
-        std::fill(std::begin(params_dft.tensor_split), std::end(params_dft.tensor_split), 0.0f);
     }
 
     if (!params.params.empty()) {
@@ -1944,30 +1922,8 @@ bool common_speculative_load_draft_model(
         free_command_line(argc, argv);
     }
 
-    if (params.split_mode_set && params.tensor_split_set && params.split_mode == LLAMA_SPLIT_MODE_NONE) {
-        LOG_ERR("%s: --split-mode-draft none cannot be combined with --tensor-split-draft\n", __func__);
-        return false;
-    }
-
-    std::string draft_tensor_split = "default";
-    int last_tensor_split = -1;
-    for (size_t i = 0; i < std::size(params_dft.tensor_split); ++i) {
-        if (params_dft.tensor_split[i] != 0.0f) {
-            last_tensor_split = (int) i;
-        }
-    }
-    if (last_tensor_split >= 0) {
-        draft_tensor_split.clear();
-        for (int i = 0; i <= last_tensor_split; ++i) {
-            if (i > 0) {
-                draft_tensor_split += ",";
-            }
-            draft_tensor_split += std::to_string(params_dft.tensor_split[i]);
-        }
-    }
-    LOG_INF("%s: resolved target placement devices=%s split_mode=%d; draft devices=%s split_mode=%d tensor_split=%s\n",
-            __func__, params_base.devices.c_str(), (int) params_base.split_mode,
-            params_dft.devices.c_str(), (int) params_dft.split_mode, draft_tensor_split.c_str());
+    LOG_INF("%s: resolved target placement devices=%s; draft devices=%s\n",
+            __func__, params_base.devices.c_str(), params_dft.devices.c_str());
 
 
     LOG_INF("%s: loading draft model '%s'\n", __func__, params_dft.model.c_str());

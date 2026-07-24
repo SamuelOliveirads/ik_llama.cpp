@@ -211,7 +211,6 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         llama_set_dflash_visible_cross_ctx(ctx_dft, this->cross_ctx);
-        // Device append is experimental and fail-closed; the host feature path remains authoritative.
         if (!llama_dflash_prepare_device_transport(ctx_tgt, ctx_dft)) {
             llama_dflash_disable_gpu_features(ctx_tgt);
         }

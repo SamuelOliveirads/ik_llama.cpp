@@ -538,10 +538,7 @@ bool llama_prepare_dflash_graph_inputs(
             lctx.dflash.kv.cache_graph_device_input_row_offset = lctx.dflash.kv.device_input_row_offset;
         }
 
-        if (device_update) {
-            // The persistent device tensor was copied with the full source/destination layout.
-            // The KV graph consumes its leading update_rows columns through a view.
-        } else {
+        if (!device_update) {
             ggml_backend_t kv_feature_backend = llama_backend_for_tensor(lctx, lctx.dflash.kv.cache_input_target_features);
             if (kv_feature_backend != nullptr) {
             ggml_backend_tensor_set_async(kv_feature_backend, lctx.dflash.kv.cache_input_target_features, update_src, 0, ggml_nbytes(lctx.dflash.kv.cache_input_target_features));
