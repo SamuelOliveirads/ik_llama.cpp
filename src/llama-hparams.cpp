@@ -1660,6 +1660,15 @@ void llm_load_hparams(
         case LLM_ARCH_GLM_DSA:
             {
                 ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+                // A standalone MTP assistant appends its predictor block after the
+                // base blocks, so n_layer - nextn_predict_layers is its first MTP
+                // block.  Base DSV4 GGUFs may omit nextn_predict_layers entirely;
+                // in that form n_layer is the block count and the last valid probe
+                // block is n_layer - 1 (not n_layer).
+                const uint32_t dsv4_probe_offset = std::max<uint32_t>(1, hparams.nextn_predict_layers);
+                const uint32_t dsv4_probe_layer = hparams.n_layer > dsv4_probe_offset
+                    ? hparams.n_layer - dsv4_probe_offset
+                    : 0;
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
                 // GLM-DSA lightning-indexer k_norm is a (non-RMS) LayerNorm built via LLM_NORM,
@@ -1693,7 +1702,7 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,      hparams.n_lora_q);
                 ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,     hparams.n_lora_kv, false);
                 if (model.arch == LLM_ARCH_DEEPSEEK4 && hparams.n_lora_kv == 0) {
-                    const uint32_t probe_layer = hparams.n_layer - hparams.nextn_predict_layers;
+                    const uint32_t probe_layer = dsv4_probe_layer;
                     if (auto * kv_norm = ml.get_tensor_meta(format("blk.%u.attn_kv_a_norm.weight", probe_layer).c_str())) {
                         hparams.n_lora_kv = (uint32_t) kv_norm->ne[0];
                     } else if (auto * kv = ml.get_tensor_meta(format("blk.%u.attn_kv.weight", probe_layer).c_str())) {
@@ -1742,7 +1751,7 @@ void llm_load_hparams(
                     }
 
                     const auto * hc_head_base = ml.get_tensor_meta("hc_head_base");
-                    const uint32_t probe_layer = hparams.n_layer - hparams.nextn_predict_layers;
+                    const uint32_t probe_layer = dsv4_probe_layer;
                     const auto * wo_a_0 = ml.get_tensor_meta(format("blk.%u.attn_output_a.weight", probe_layer).c_str());
                     const auto * wo_b_0 = ml.get_tensor_meta(format("blk.%u.attn_output_b.weight", probe_layer).c_str());
 
@@ -1765,6 +1774,13 @@ void llm_load_hparams(
                         } else if (wo_a_0 != nullptr) {
                             hparams.dsv4_hc_mult = (uint32_t) (wo_a_0->ne[1] / hparams.n_embd);
                         }
+                    }
+                    // Base DSV4 GGUFs do not carry the companion's
+                    // embedding_length_out metadata.  The target still
+                    // exports the hyper-connection state consumed by the
+                    // standalone MTP predictor, whose width is n_embd * hc.
+                    if (hparams.n_embd_out == hparams.n_embd && hparams.dsv4_hc_mult > 1) {
+                        hparams.n_embd_out = hparams.n_embd * hparams.dsv4_hc_mult;
                     }
                     if (!ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters, false)) {
                         hparams.dsv4_hc_sinkhorn_iters = 3;

@@ -3713,6 +3713,11 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
         if (name == "output_norm.weight") {
             continue;
         }
+        if (name == "hc_head_base.weight" || name == "hc_head_fn.weight" || name == "hc_head_scale.weight" ||
+            name == "output_hc_base.weight" || name == "output_hc_fn.weight" || name == "output_hc_scale.weight") {
+            output_misc_size += size;
+            continue;
+        }
         if (model.arch == LLM_ARCH_GEMMA4) {
             if (name == "per_layer_token_embd.weight" ||
                 name == "per_layer_model_proj.weight" ||
@@ -5649,7 +5654,8 @@ static bool llama_context_has_mtp_outputs(const llama_context & lctx) {
         lctx.model.hparams.nextn_predict_layers > 0 ||
         lctx.model.arch == LLM_ARCH_GEMMA4 ||
         lctx.model.arch == LLM_ARCH_GEMMA4_MTP ||
-        lctx.model.arch == LLM_ARCH_GEMMA4_ASSISTANT);
+        lctx.model.arch == LLM_ARCH_GEMMA4_ASSISTANT ||
+        lctx.model.arch == LLM_ARCH_DEEPSEEK4);
 }
 
 static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
@@ -6198,24 +6204,33 @@ static int llama_decode_internal(
             const bool has_mtp = llama_context_has_mtp_outputs(lctx);
             const bool use_raw_mtp_embd = has_mtp && (lctx.model.arch == LLM_ARCH_GEMMA4    ||
                                                       lctx.model.arch == LLM_ARCH_GEMMA4_MTP||
-                                                      lctx.model.arch == LLM_ARCH_GEMMA4_ASSISTANT);
+                                                      lctx.model.arch == LLM_ARCH_GEMMA4_ASSISTANT ||
+                                                      lctx.model.arch == LLM_ARCH_DEEPSEEK4);
             if (cparams.embeddings || has_mtp) {
-                for (int i = gf->n_nodes - 1; i >= 0; --i) {
-                    if (use_raw_mtp_embd && strcmp(gf->nodes[i]->name, "result_mtp_embd") == 0) {
-                        // MTP recurrent state can be wider/different than the logits head hidden state.
-                        embd = gf->nodes[i];
-                        break;
+                // Pooling may append a generic result_embd_pooled node after the model's
+                // raw MTP export.  Prefer the raw recurrent state for MTP models even when
+                // that node is not the last graph output; its width is the MTP contract.
+                if (use_raw_mtp_embd) {
+                    for (int i = gf->n_nodes - 1; i >= 0; --i) {
+                        if (strcmp(gf->nodes[i]->name, "result_mtp_embd") == 0) {
+                            embd = gf->nodes[i];
+                            break;
+                        }
                     }
-                    if (strcmp(gf->nodes[i]->name, "result_embd_pooled") == 0) {
-                        embd = gf->nodes[i];
-                        break;
-                    }
-                    // Strictly speaking we should use if (!use_raw_mtp_embd && strcmp(gf->nodes[i]->name, "result_norm") == 0)
-                    // as Gemma4 MTP is supposed to be using embeddings before rms_norm.
-                    // I don't see any significant difference between this and what we had before, so not making the change (yet).
-                    if (strcmp(gf->nodes[i]->name, "result_norm") == 0) {
-                        embd = gf->nodes[i];
-                        break;
+                }
+                if (!embd) {
+                    for (int i = gf->n_nodes - 1; i >= 0; --i) {
+                        if (strcmp(gf->nodes[i]->name, "result_embd_pooled") == 0) {
+                            embd = gf->nodes[i];
+                            break;
+                        }
+                        // Strictly speaking we should use if (!use_raw_mtp_embd && strcmp(gf->nodes[i]->name, "result_norm") == 0)
+                        // as Gemma4 MTP is supposed to be using embeddings before rms_norm.
+                        // I don't see any significant difference between this and what we had before, so not making the change (yet).
+                        if (strcmp(gf->nodes[i]->name, "result_norm") == 0) {
+                            embd = gf->nodes[i];
+                            break;
+                        }
                     }
                 }
             }
@@ -6303,9 +6318,9 @@ static int llama_decode_internal(
                 float * logits_out = lctx.logits + n_outputs_prev*n_vocab;
                 const int32_t n_outputs_new = lctx.n_outputs;
 
-                if (n_outputs_new) {
-                    GGML_ASSERT( n_outputs_prev + n_outputs_new <= n_outputs);
-                    GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_vocab <= (int64_t) lctx.logits_size);
+                        if (n_outputs_new) {
+                            GGML_ASSERT( n_outputs_prev + n_outputs_new <= n_outputs);
+                            GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_vocab <= (int64_t) lctx.logits_size);
 
                     if (res->ne[1] == n_tokens && n_outputs_new < n_tokens) {
                         int32_t i_out = 0;
@@ -6319,9 +6334,16 @@ static int llama_decode_internal(
                         } else if (cur_token + n_tokens >= n_tokens_all) {
                             ggml_backend_tensor_get_async(backend_res, res, logits_out, (n_tokens - 1)*n_vocab*sizeof(float), n_vocab*sizeof(float));
                         }
-                    } else {
-                        ggml_backend_tensor_get_async(backend_res, res, logits_out, 0, n_outputs_new*n_vocab*sizeof(float));
-                    }
+                        } else {
+                            if ((size_t) n_outputs_new*n_vocab*sizeof(float) > ggml_nbytes(res)) {
+                                LLAMA_LOG_ERROR("%s: logits read exceeds tensor '%s': ne=[%lld,%lld,%lld,%lld], nbytes=%zu, requested=%zu\n",
+                                        __func__, res->name, (long long) res->ne[0], (long long) res->ne[1],
+                                        (long long) res->ne[2], (long long) res->ne[3], ggml_nbytes(res),
+                                        (size_t) n_outputs_new*n_vocab*sizeof(float));
+                                return GGML_STATUS_FAILED;
+                            }
+                            ggml_backend_tensor_get_async(backend_res, res, logits_out, 0, n_outputs_new*n_vocab*sizeof(float));
+                        }
                 }
             }
 #if IK_PRINT_TIMING
@@ -6350,6 +6372,14 @@ static int llama_decode_internal(
                         if (n_outputs_new_embd) {
                             GGML_ASSERT( n_outputs_prev_embd + n_outputs_new_embd <= n_outputs_embd);
                             GGML_ASSERT((n_outputs_prev_embd + n_outputs_new_embd)*n_embd_output <= (int64_t) lctx.embd_size);
+                            if ((size_t) n_outputs_new_embd*n_embd_output*sizeof(float) > ggml_nbytes(embd)) {
+                                LLAMA_LOG_ERROR("%s: embedding read exceeds tensor '%s': ne=[%lld,%lld,%lld,%lld], nbytes=%zu, requested=%zu, width=%u, rows=%d\n",
+                                        __func__, embd->name, (long long) embd->ne[0], (long long) embd->ne[1],
+                                        (long long) embd->ne[2], (long long) embd->ne[3], ggml_nbytes(embd),
+                                        (size_t) n_outputs_new_embd*n_embd_output*sizeof(float), n_embd_output,
+                                        n_outputs_new_embd);
+                                return GGML_STATUS_FAILED;
+                            }
                             ggml_backend_tensor_get_async(backend_embd, embd, embd_out, 0, n_outputs_new_embd*n_embd_output*sizeof(float));
                         }
                     } break;
@@ -8313,10 +8343,10 @@ struct llama_context * llama_init_from_model(
         }
     }
 
-    if (cparams.mtp && hparams.nextn_predict_layers > 0) {
+    if (cparams.mtp && (hparams.nextn_predict_layers > 0 || model->arch == LLM_ARCH_DEEPSEEK4)) {
         const auto n_batch = cparams.n_batch;
         const auto n_vocab = hparams.n_vocab;
-        const auto n_embd  = hparams.n_embd;
+        const auto n_embd  = llama_output_embd_width(*ctx);
 
         const size_t logits_size = n_vocab*n_batch;
         const size_t embd_size   = n_embd*n_batch;
@@ -12099,7 +12129,7 @@ void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float 
     ctx->draft_input_hidden_state = hidden_state;
     ctx->draft_input_hidden_state_n_floats = ctx->inp_mtp_states
         ? ggml_nbytes(ctx->inp_mtp_states) / sizeof(float)
-        : 0;
+        : llama_mtp_state_n_embd(ctx);
 }
 
 void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_context * target_ctx) {
