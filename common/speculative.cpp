@@ -2024,8 +2024,9 @@ bool common_speculative_finalize_startup(
     }
 
     params_base.has_mtp = params.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
-    const bool has_external_mtp = params_base.has_mtp &&
-        llama_model_is_gemma4_mtp_assistant(params.model_dft);
+    const bool has_external_mtp = params_base.has_mtp && params.model_dft &&
+        (llama_model_is_gemma4_mtp_assistant(params.model_dft) ||
+         llama_model_is_deepseek4_mtp_assistant(params.model_dft));
 
     params_base.has_mtp = common_speculative_prepare_mtp_runtime(
         params,

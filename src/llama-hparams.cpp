@@ -161,6 +161,10 @@ void llm_load_hparams(
 
     ml.get_key(LLM_KV_CONTEXT_LENGTH,    hparams.n_ctx_train);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH,  hparams.n_embd);
+    ml.get_key(LLM_KV_EMBEDDING_LENGTH_OUT, hparams.n_embd_out, false);
+    if (hparams.n_embd_out == 0) {
+        hparams.n_embd_out = hparams.n_embd;
+    }
     ml.get_key(LLM_KV_EXPERT_COUNT,      hparams.n_expert,      false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used, false);
 
@@ -1655,6 +1659,7 @@ void llm_load_hparams(
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_GLM_DSA:
             {
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
                 // GLM-DSA lightning-indexer k_norm is a (non-RMS) LayerNorm built via LLM_NORM,
@@ -1688,16 +1693,17 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,      hparams.n_lora_q);
                 ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,     hparams.n_lora_kv, false);
                 if (model.arch == LLM_ARCH_DEEPSEEK4 && hparams.n_lora_kv == 0) {
-                    if (auto * kv_norm = ml.get_tensor_meta("blk.0.attn_kv_a_norm.weight")) {
+                    const uint32_t probe_layer = hparams.n_layer - hparams.nextn_predict_layers;
+                    if (auto * kv_norm = ml.get_tensor_meta(format("blk.%u.attn_kv_a_norm.weight", probe_layer).c_str())) {
                         hparams.n_lora_kv = (uint32_t) kv_norm->ne[0];
-                    } else if (auto * kv = ml.get_tensor_meta("blk.0.attn_kv.weight")) {
+                    } else if (auto * kv = ml.get_tensor_meta(format("blk.%u.attn_kv.weight", probe_layer).c_str())) {
                         const int64_t kv_inner = kv->ne[0] == hparams.n_embd ? kv->ne[1] : kv->ne[0];
                         hparams.n_lora_kv = (uint32_t) kv_inner;
                     } else {
-                        auto * kv_a = ml.get_tensor_meta("blk.0.attn_kv_latent.weight");
+                        auto * kv_a = ml.get_tensor_meta(format("blk.%u.attn_kv_latent.weight", probe_layer).c_str());
                         bool subtract_rope = false;
                         if (kv_a == nullptr) {
-                            kv_a = ml.require_tensor_meta("blk.0.attn_kv_a_mqa.weight");
+                            kv_a = ml.require_tensor_meta(format("blk.%u.attn_kv_a_mqa.weight", probe_layer).c_str());
                             subtract_rope = true;
                         }
 
@@ -1736,8 +1742,9 @@ void llm_load_hparams(
                     }
 
                     const auto * hc_head_base = ml.get_tensor_meta("hc_head_base");
-                    const auto * wo_a_0 = ml.get_tensor_meta("blk.0.attn_output_a.weight");
-                    const auto * wo_b_0 = ml.get_tensor_meta("blk.0.attn_output_b.weight");
+                    const uint32_t probe_layer = hparams.n_layer - hparams.nextn_predict_layers;
+                    const auto * wo_a_0 = ml.get_tensor_meta(format("blk.%u.attn_output_a.weight", probe_layer).c_str());
+                    const auto * wo_b_0 = ml.get_tensor_meta(format("blk.%u.attn_output_b.weight", probe_layer).c_str());
 
                     if (!ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT, hparams.dsv4_o_group_count, false) && wo_a_0 != nullptr) {
                         GGML_ASSERT(wo_a_0->ne[0] > 0);
