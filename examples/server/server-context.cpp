@@ -4209,6 +4209,8 @@ void server_context::speculative_decoding_accept() {
             }
         }
 
+        const llama_tokens proposals = slot.drafted;
+
         slot.i_batch_dft.clear();
         slot.drafted.clear();
 
@@ -4245,9 +4247,11 @@ void server_context::speculative_decoding_accept() {
             slot.id,
             sampled_before,
             ids,
+            proposals,
             n_draft,
             spec_pos_base,
-            accepted_output_indices);
+            accepted_output_indices,
+            false);
         slot.spec_target_only = false;
 
         for (size_t i = 0; i < ids.size(); ++i) {
@@ -4830,7 +4834,8 @@ void server_context::update_slots() {
     // make sure we're in the right embedding mode
     llama_set_embeddings(ctx, batch_type == 1);
 
-    if (llama_model_has_recurrent(model) || llama_model_is_openpangu(model)) {
+    const bool target_is_dsv4 = std::strcmp(llama_model_arch_string(model), "deepseek4") == 0;
+    if (llama_model_has_recurrent(model) || llama_model_is_openpangu(model) || target_is_dsv4) {
         const int ckpt_mode = params_base.speculative.recurrent_ckpt_mode;
 
         for (auto & slot : slots) {

@@ -148,6 +148,17 @@ struct llama_kv_cache {
         // Serialised sequence state for CPU mode
         std::vector<uint8_t> cpu_state_data;
 
+        // DSV4 keeps architecture-private compressed-cache tensors outside
+        // kv_self.  The preferred speculative checkpoint stores these tensors
+        // in backend-local shadow buffers; this CPU copy remains as a fallback
+        // when a compatible shadow buffer cannot be allocated.
+        std::vector<std::vector<uint8_t>> dsv4_state_data;
+        std::vector<ggml_tensor *> dsv4_state_shadow;
+        std::vector<struct ggml_context *> dsv4_shadow_ctxs;
+        std::vector<ggml_backend_buffer_t> dsv4_shadow_bufs;
+        bool dsv4_shadow_allocated = false;
+        bool dsv4_shadow_saved = false;
+
         // Separate storage for per-step allocations
         std::vector<struct ggml_context *>   per_step_ctxs;
         std::vector<ggml_backend_buffer_t>   per_step_bufs;
@@ -159,19 +170,47 @@ struct llama_kv_cache {
         bool shadow_conv_only = false;
         bool saved     = false;
 
-        ~gpu_checkpoint() {
+        void release() {
+            for (struct ggml_context * ctx : dsv4_shadow_ctxs) {
+                ggml_free(ctx);
+            }
+            dsv4_shadow_ctxs.clear();
+            for (ggml_backend_buffer_t buf : dsv4_shadow_bufs) {
+                ggml_backend_buffer_free(buf);
+            }
+            dsv4_shadow_bufs.clear();
+            dsv4_state_shadow.clear();
+            dsv4_shadow_allocated = false;
+            dsv4_shadow_saved = false;
+
             for (struct ggml_context * ctx : shadow_ctxs) {
                 ggml_free(ctx);
             }
+            shadow_ctxs.clear();
             for (ggml_backend_buffer_t buf : shadow_bufs) {
                 ggml_backend_buffer_free(buf);
             }
+            shadow_bufs.clear();
+            s_l_shadow.clear();
+            split_s_l_shadow.clear();
+            allocated = false;
+            saved = false;
+
             for (struct ggml_context * ctx : per_step_ctxs) {
                 ggml_free(ctx);
             }
+            per_step_ctxs.clear();
             for (ggml_backend_buffer_t buf : per_step_bufs) {
                 ggml_backend_buffer_free(buf);
             }
+            per_step_bufs.clear();
+            per_step_ssm.clear();
+            per_step_conv.clear();
+            per_step_max_allocated = 0;
+        }
+
+        ~gpu_checkpoint() {
+            release();
         }
     };
 

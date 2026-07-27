@@ -26,6 +26,39 @@
 void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_context * target_ctx);
 void llama_set_mtp_step_idx(struct llama_context * ctx, int32_t mtp_step_idx);
 void llama_set_mtp_n_heads(struct llama_context * ctx, int32_t mtp_n_heads);
+bool llama_dsv4_spec_ckpt_gpu_active(const struct llama_context * ctx);
+uint64_t llama_dsv4_state_fingerprint(const struct llama_context * ctx);
+
+static bool common_speculative_trace_enabled() {
+    static const bool enabled = std::getenv("LLAMA_MTP_TRACE") != nullptr;
+    return enabled;
+}
+
+static void common_speculative_trace_snapshot_timing(
+        int64_t save_us,
+        int64_t restore_state_us,
+        int64_t restore_us,
+        int64_t cycle_us) {
+    if (!common_speculative_trace_enabled()) {
+        return;
+    }
+
+    const int64_t snapshot_us = save_us + restore_state_us;
+    const double snapshot_pct = cycle_us > 0
+        ? 100.0 * (double) snapshot_us / (double) cycle_us
+        : 0.0;
+    const double save_pct = cycle_us > 0
+        ? 100.0 * (double) save_us / (double) cycle_us
+        : 0.0;
+    LLAMA_LOG_INFO("MTP_TRACE timing save_us=%lld restore_state_us=%lld restore_total_us=%lld snapshot_us=%lld cycle_us=%lld snapshot_pct=%.2f save_pct=%.2f\n",
+            (long long) save_us,
+            (long long) restore_state_us,
+            (long long) restore_us,
+            (long long) snapshot_us,
+            (long long) cycle_us,
+            snapshot_pct,
+            save_pct);
+}
 
 const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NONE,
@@ -60,6 +93,8 @@ void common_speculative_checkpoint::clear() {
     per_step_enabled = false;
     n_past = 0;
     sampled = LLAMA_TOKEN_NULL;
+    cycle_start_us = 0;
+    save_us = 0;
 
     if (sampler != nullptr) {
         common_sampler_free(sampler);
@@ -1067,6 +1102,8 @@ struct common_speculative {
     std::unique_ptr<spec_tuner> tuner;
     int last_n_drafted = 0;
     int64_t t_step_start_us = 0;
+    int64_t last_snapshot_restore_us = 0;
+    int64_t last_snapshot_restore_state_us = 0;
     bool last_step_target_only = false;
 };
 
@@ -1338,8 +1375,11 @@ common_speculative * common_speculative_init(
         configs.push_back(common_speculative_config(stage, stage_params));
     }
 
-    if (!configs.empty() && (llama_model_has_recurrent(llama_get_model(ctx_tgt)) ||
-                             llama_model_is_openpangu(llama_get_model(ctx_tgt)))) {
+    const llama_model * target_model = llama_get_model(ctx_tgt);
+    const bool target_is_dsv4 = target_model != nullptr &&
+        std::strcmp(llama_model_arch_string(target_model), "deepseek4") == 0;
+    if (!configs.empty() && (llama_model_has_recurrent(target_model) ||
+                             llama_model_is_openpangu(target_model) || target_is_dsv4)) {
         const int ckpt_tokens = std::max(1, params.get_max_stage_n_max() + 1);
         const int actual_mode = llama_spec_ckpt_init(ctx_tgt, params.recurrent_ckpt_mode, ckpt_tokens);
         if (actual_mode == LLAMA_SPEC_CKPT_NONE) {
@@ -2055,6 +2095,9 @@ bool common_speculative_before_draft(
         return false;
     }
 
+    spec->last_snapshot_restore_us = 0;
+    spec->last_snapshot_restore_state_us = 0;
+
     return common_speculative_checkpoint_save(
         spec->checkpoint,
         model,
@@ -2261,6 +2304,7 @@ static bool common_speculative_checkpoint_save(
         int max_tokens,
         int ckpt_mode) {
     ckpt.clear();
+    ckpt.cycle_start_us = ggml_time_us();
     ckpt.n_past = n_past;
     ckpt.sampled = sampled;
 
@@ -2270,7 +2314,9 @@ static bool common_speculative_checkpoint_save(
     }
     ckpt.per_step_enabled = (actual_mode == LLAMA_SPEC_CKPT_PER_STEP);
 
+    const int64_t save_start_us = ggml_time_us();
     ckpt.valid = llama_spec_ckpt_save(ctx, seq_id);
+    ckpt.save_us = ggml_time_us() - save_start_us;
     if (!ckpt.valid) {
         llama_spec_ckpt_discard(ctx);
         return false;
@@ -2284,6 +2330,16 @@ static bool common_speculative_checkpoint_save(
 
     if (sampler_src != nullptr) {
         common_sampler_clone(sampler_src, ckpt.sampler);
+    }
+
+    if (common_speculative_trace_enabled() && std::strcmp(llama_model_arch_string(model), "deepseek4") == 0) {
+        const char * mode = ckpt.per_step_enabled
+            ? "per-step"
+            : (llama_dsv4_spec_ckpt_gpu_active(ctx) ? "dsv4-gpu" : "cpu");
+        LLAMA_LOG_INFO("MTP_TRACE checkpoint seq=%d n_past=%d sampled=%d max_tokens=%d mode=%s target_fp=%016llx\n",
+                (int) seq_id, (int) n_past, (int) sampled, max_tokens,
+                mode,
+                (unsigned long long) llama_dsv4_state_fingerprint(ctx));
     }
 
     return true;
@@ -2316,9 +2372,14 @@ void common_speculative_checkpoint_restore(
         return;
     }
 
+    const int64_t restore_start_us = ggml_time_us();
+    int64_t restore_state_us = 0;
+
     if (ckpt.per_step_enabled) {
         const int step = (int) ids.size() - 1;
+        const int64_t state_restore_start_us = ggml_time_us();
         llama_spec_ckpt_restore(ctx, seq_id, ckpt.n_past, step);
+        restore_state_us = ggml_time_us() - state_restore_start_us;
 
         if (ckpt.sampler != nullptr && sampler_dst != nullptr) {
             common_sampler_clone(ckpt.sampler, sampler_dst);
@@ -2348,7 +2409,9 @@ void common_speculative_checkpoint_restore(
         LOG_DBG("%s: seq_id=%d per-step restore: step=%d (rejected %d drafts)\n",
                 __func__, (int) seq_id, step, (int) (n_draft - (ids.size() - 1)));
     } else {
+        const int64_t state_restore_start_us = ggml_time_us();
         llama_spec_ckpt_restore(ctx, seq_id, ckpt.n_past, 0);
+        restore_state_us = ggml_time_us() - state_restore_start_us;
 
         if (ckpt.sampler != nullptr && sampler_dst != nullptr) {
             common_sampler_clone(ckpt.sampler, sampler_dst);
@@ -2356,6 +2419,7 @@ void common_speculative_checkpoint_restore(
 
         if (!ids.empty()) {
             const int n_re = (int) ids.size();
+            std::vector<float> redecoded_hidden;
             llama_batch re_batch = llama_batch_init(n_re, 0, 1);
             common_batch_add(re_batch, ckpt.sampled, ckpt.n_past, { seq_id }, n_re == 1);
             for (int j = 0; j < n_re - 1; ++j) {
@@ -2366,7 +2430,6 @@ void common_speculative_checkpoint_restore(
                 for (int j = 0; j < re_batch.n_tokens; ++j) {
                     re_batch.logits[j] = true;
                 }
-                llama_set_embeddings(ctx, true);
             }
 
             const int ret = llama_decode(ctx, re_batch);
@@ -2393,6 +2456,7 @@ void common_speculative_checkpoint_restore(
                     common_speculative_clear_sequence_hidden(spec, seq_id);
                 }
             }
+            llama_batch_free(re_batch);
 
             if (sampler_dst != nullptr) {
                 for (llama_token id : ids) {
@@ -2400,10 +2464,14 @@ void common_speculative_checkpoint_restore(
                 }
             }
 
-            llama_batch_free(re_batch);
             LOG_DBG("%s: seq_id=%d spec checkpoint restored: re-decoded %d tokens (rejected %d drafts)\n",
                     __func__, (int) seq_id, n_re, (int) (n_draft - (ids.size() - 1)));
         }
+    }
+
+    if (spec != nullptr) {
+        spec->last_snapshot_restore_state_us = restore_state_us;
+        spec->last_snapshot_restore_us = ggml_time_us() - restore_start_us;
     }
 
     common_speculative_checkpoint_discard(ckpt, ctx);
@@ -2416,9 +2484,11 @@ void common_speculative_commit(
         llama_seq_id seq_id,
         llama_token sampled_before,
         const std::vector<llama_token> & ids,
+        const std::vector<llama_token> & proposals,
         int n_draft,
         llama_pos pos_base,
-        const std::vector<int32_t> & accepted_output_indices) {
+        const std::vector<int32_t> & accepted_output_indices,
+        bool no_bonus_token) {
     GGML_ASSERT(spec != nullptr);
     GGML_ASSERT(!ids.empty());
 
@@ -2427,10 +2497,46 @@ void common_speculative_commit(
         ? spec->curr_impl->type
         : COMMON_SPECULATIVE_TYPE_NONE;
 
-    const bool any_rejected = (int) ids.size() - 1 < n_draft;
+    const int n_accepted = no_bonus_token ? (int) ids.size() : (int) ids.size() - 1;
+    const bool any_rejected = n_accepted < n_draft;
     std::vector<float> mtp_hidden_state_pre;
+    const int64_t cycle_start_us = ckpt.cycle_start_us;
+    const int64_t snapshot_save_us = ckpt.save_us;
 
-    common_speculative_accept(spec, ids.size() - 1);
+    const bool trace_dsv4 = common_speculative_trace_enabled() &&
+        std::strcmp(llama_model_arch_string(llama_get_model(ctx)), "deepseek4") == 0;
+    const uint64_t target_fp_after_verify = trace_dsv4 ? llama_dsv4_state_fingerprint(ctx) : 0;
+    llama_context * ctx_mtp_trace = trace_dsv4 ? common_speculative_get_companion_ctx(spec) : nullptr;
+    const uint64_t companion_fp_after_verify = ctx_mtp_trace != nullptr
+        ? llama_dsv4_state_fingerprint(ctx_mtp_trace) : 0;
+
+    if (trace_dsv4) {
+        std::ostringstream ids_text;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (i > 0) {
+                ids_text << ',';
+            }
+            ids_text << ids[i];
+        }
+        std::ostringstream proposals_text;
+        for (size_t i = 0; i < proposals.size(); ++i) {
+            if (i > 0) {
+                proposals_text << ',';
+            }
+            proposals_text << proposals[i];
+        }
+        LLAMA_LOG_INFO("MTP_TRACE cycle seq=%d pos_base=%d sampled=%d drafted=%d accepted=%d rejected=%d ckpt=%d proposals=[%s] ids=[%s] target_after=%016llx companion_after=%016llx target_pos=%d companion_pos=%d\n",
+                (int) seq_id, (int) pos_base, (int) sampled_before, n_draft,
+                n_accepted, any_rejected ? 1 : 0, ckpt.valid ? 1 : 0,
+                proposals_text.str().c_str(),
+                ids_text.str().c_str(),
+                (unsigned long long) target_fp_after_verify,
+                (unsigned long long) companion_fp_after_verify,
+                (int) llama_kv_cache_seq_pos_max(ctx, seq_id),
+                ctx_mtp_trace != nullptr ? (int) llama_kv_cache_seq_pos_max(ctx_mtp_trace, seq_id) : -1);
+    }
+
+    common_speculative_accept(spec, n_accepted);
 
     if (common_speculative_has_target_features(spec) &&
             any_rejected &&
@@ -2454,6 +2560,21 @@ void common_speculative_commit(
             n_draft,
             mtp_hidden_state_pre,
             pos_base);
+        if (trace_dsv4) {
+            common_speculative_trace_snapshot_timing(
+                    snapshot_save_us,
+                    spec->last_snapshot_restore_state_us,
+                    spec->last_snapshot_restore_us,
+                    cycle_start_us > 0 ? ggml_time_us() - cycle_start_us : 0);
+        }
+        if (trace_dsv4) {
+            LLAMA_LOG_INFO("MTP_TRACE restored seq=%d target_fp=%016llx companion_fp=%016llx target_pos=%d companion_pos=%d\n",
+                    (int) seq_id,
+                    (unsigned long long) llama_dsv4_state_fingerprint(ctx),
+                    ctx_mtp_trace != nullptr ? (unsigned long long) llama_dsv4_state_fingerprint(ctx_mtp_trace) : 0ull,
+                    (int) llama_kv_cache_seq_pos_max(ctx, seq_id),
+                    ctx_mtp_trace != nullptr ? (int) llama_kv_cache_seq_pos_max(ctx_mtp_trace, seq_id) : -1);
+        }
         return;
     }
 
@@ -2476,6 +2597,13 @@ void common_speculative_commit(
 
     llama_kv_cache_seq_rm(ctx, seq_id, pos_base + (llama_pos) (ids.size() - 1), -1);
     common_speculative_checkpoint_discard(ckpt, ctx);
+    if (trace_dsv4) {
+        common_speculative_trace_snapshot_timing(
+                snapshot_save_us,
+                0,
+                0,
+                cycle_start_us > 0 ? ggml_time_us() - cycle_start_us : 0);
+    }
 }
 
 void common_speculative_print_stats(const common_speculative * spec, double slot_tps, int n_decoded, int n_past, common_params_speculative * active_params) {
