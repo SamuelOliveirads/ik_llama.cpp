@@ -1288,7 +1288,7 @@ int main(int argc, char ** argv) {
                             n_past,
                             sampled_before,
                             (int) draft.size() + 1,
-                            params.speculative.recurrent_ckpt_mode)) {
+                            params.speculative.spec_ckpt_mode)) {
                             LOG_TEE("%s: speculative checkpoint setup failed, falling back to one-token decode\n", __func__);
                             draft.clear();
                         }
@@ -1336,7 +1336,7 @@ int main(int argc, char ** argv) {
                             accepted_output_indices.assign(verify_indices.begin(), verify_indices.begin() + ids.size());
                         }
 
-                        common_speculative_commit(
+                        if (!common_speculative_commit(
                             spec,
                             ctx,
                             ctx_sampling,
@@ -1347,7 +1347,11 @@ int main(int argc, char ** argv) {
                             (int) draft.size(),
                             n_past + 1,
                             accepted_output_indices,
-                            false);
+                            false)) {
+                            llama_batch_free(verify_batch);
+                            LOG_TEE("%s: speculative checkpoint restore/commit failed\n", __func__);
+                            return 1;
+                        }
 
                         llama_batch_free(verify_batch);
 

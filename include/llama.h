@@ -847,6 +847,12 @@ extern "C" {
         LLAMA_SPEC_CKPT_CPU         =  3,
     };
 
+    enum llama_spec_ckpt_restore_result {
+        LLAMA_SPEC_CKPT_RESTORE_FAILED = 0,
+        LLAMA_SPEC_CKPT_RESTORE_DIRECT = 1,
+        LLAMA_SPEC_CKPT_RESTORE_BASE_REPLAY_REQUIRED = 2,
+    };
+
     // Initialise the checkpoint system for the upcoming speculation window.
     LLAMA_API int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens);
 
@@ -856,6 +862,10 @@ extern "C" {
     // Restore the recurrent state after speculative decode.
     LLAMA_API bool llama_spec_ckpt_restore(struct llama_context * ctx, llama_seq_id seq_id,
                                             llama_pos n_past, int accepted_step);
+
+    LLAMA_API enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
+            struct llama_context * ctx, llama_seq_id seq_id,
+            llama_pos n_past, int accepted_step);
 
     // Discard the saved checkpoint and reset internal mode state.
     LLAMA_API void llama_spec_ckpt_discard(struct llama_context * ctx);

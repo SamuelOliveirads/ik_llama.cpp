@@ -141,6 +141,25 @@ struct llama_kv_cache {
         int64_t per_step_conv_dim = 0;
         int32_t per_step_d_conv = 0;
 
+        // DSV4 per-step checkpoints keep one pre-window compressor-state
+        // shadow and device-local rows for each verification token.
+        std::vector<ggml_tensor *> dsv4_per_step_state;
+        std::vector<ggml_tensor *> dsv4_per_step_state_shadow;
+        std::vector<ggml_tensor *> dsv4_per_step_delta;
+        std::vector<ggml_context *> dsv4_per_step_shadow_ctxs;
+        std::vector<ggml_backend_buffer_t> dsv4_per_step_shadow_bufs;
+        std::vector<int32_t> dsv4_per_step_csa_dst;
+        std::vector<int32_t> dsv4_per_step_hca_dst;
+        std::vector<int32_t> dsv4_per_step_lid_dst;
+        std::vector<int32_t> dsv4_per_step_csa_src;
+        std::vector<int32_t> dsv4_per_step_hca_src;
+        std::vector<int32_t> dsv4_per_step_lid_src;
+        bool dsv4_per_step_allocated = false;
+        bool dsv4_per_step_saved = false;
+        int32_t dsv4_per_step_max_tokens = 0;
+        size_t dsv4_per_step_base_bytes = 0;
+        size_t dsv4_per_step_delta_bytes = 0;
+
         int selected_spec_mode = -1;
         int fixed_spec_mode = LLAMA_SPEC_CKPT_NONE;
         int32_t fixed_max_tokens = 0;
@@ -171,6 +190,29 @@ struct llama_kv_cache {
         bool saved     = false;
 
         void release() {
+            for (struct ggml_context * ctx : dsv4_per_step_shadow_ctxs) {
+                ggml_free(ctx);
+            }
+            dsv4_per_step_shadow_ctxs.clear();
+            for (ggml_backend_buffer_t buf : dsv4_per_step_shadow_bufs) {
+                ggml_backend_buffer_free(buf);
+            }
+            dsv4_per_step_shadow_bufs.clear();
+            dsv4_per_step_state.clear();
+            dsv4_per_step_state_shadow.clear();
+            dsv4_per_step_delta.clear();
+            dsv4_per_step_csa_dst.clear();
+            dsv4_per_step_hca_dst.clear();
+            dsv4_per_step_lid_dst.clear();
+            dsv4_per_step_csa_src.clear();
+            dsv4_per_step_hca_src.clear();
+            dsv4_per_step_lid_src.clear();
+            dsv4_per_step_allocated = false;
+            dsv4_per_step_saved = false;
+            dsv4_per_step_max_tokens = 0;
+            dsv4_per_step_base_bytes = 0;
+            dsv4_per_step_delta_bytes = 0;
+
             for (struct ggml_context * ctx : dsv4_shadow_ctxs) {
                 ggml_free(ctx);
             }
@@ -485,6 +527,8 @@ struct llama_context {
 
         struct comp_plan {
             std::vector<int32_t> state_pos;
+            std::vector<int32_t> state_delta_src_idxs;
+            std::vector<int32_t> state_delta_dst_idxs;
             std::vector<int32_t> state_persist_src_idxs;
             std::vector<int32_t> state_persist_dst_idxs;
             std::vector<int32_t> state_read_idxs;
