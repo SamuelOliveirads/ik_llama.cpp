@@ -774,9 +774,7 @@ llama_context::~llama_context() {
     if (dflash.kv.cache_sched != nullptr) {
         ggml_backend_sched_free(dflash.kv.cache_sched);
     }
-    // kv_self owns backend-local checkpoint buffers. Release them while their
-    // scheduler and backends are still alive; member destruction happens after
-    // this body and would otherwise run too late.
+    // Release checkpoint buffers while scheduler and backends are still alive.
     kv_self.ckpt.release();
     free_dflash_kv_cache_tensors();
     free_dsv4_cache_tensors();
@@ -6211,9 +6209,7 @@ static int llama_decode_internal(
                                                       lctx.model.arch == LLM_ARCH_GEMMA4_ASSISTANT ||
                                                       lctx.model.arch == LLM_ARCH_DEEPSEEK4);
             if (cparams.embeddings || has_mtp) {
-                // Pooling may append a generic result_embd_pooled node after the model's
-                // raw MTP export.  Prefer the raw recurrent state for MTP models even when
-                // that node is not the last graph output; its width is the MTP contract.
+                // Prefer raw MTP output over a pooled output when both are present.
                 if (use_raw_mtp_embd) {
                     for (int i = gf->n_nodes - 1; i >= 0; --i) {
                         if (strcmp(gf->nodes[i]->name, "result_mtp_embd") == 0) {
@@ -6228,9 +6224,6 @@ static int llama_decode_internal(
                             embd = gf->nodes[i];
                             break;
                         }
-                        // Strictly speaking we should use if (!use_raw_mtp_embd && strcmp(gf->nodes[i]->name, "result_norm") == 0)
-                        // as Gemma4 MTP is supposed to be using embeddings before rms_norm.
-                        // I don't see any significant difference between this and what we had before, so not making the change (yet).
                         if (strcmp(gf->nodes[i]->name, "result_norm") == 0) {
                             embd = gf->nodes[i];
                             break;
@@ -6262,9 +6255,7 @@ static int llama_decode_internal(
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
         llama_graph_compute(lctx, gf, n_threads);
 
-        // The per-step DSV4 delta is captured after the normal graph has been
-        // queued.  Keeping this as an ordered backend copy leaves the target
-        // graph, FA path, and fused compressor operations unchanged.
+        // Capture DSV4 deltas after queuing the normal FA/fused graph.
         if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 &&
             lctx.cparams.mtp_op_type == MTP_OP_NONE &&
             lctx.kv_self.ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_PER_STEP &&
@@ -9032,8 +9023,7 @@ int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
         return kv.ckpt.selected_spec_mode;
     }
 
-    // DSV4 resolves to direct per-step state recovery when available.  AUTO
-    // alone may fall back to the fixed GPU or CPU snapshot modes.
+    // DSV4 AUTO may fall back to GPU/CPU snapshots, explicit modes do not.
     if (is_dsv4) {
         int resolved = mode;
         if (resolved == LLAMA_SPEC_CKPT_AUTO) {
@@ -10427,9 +10417,7 @@ struct llama_data_read_file : llama_data_read {
     }
 };
 
-// Refuse public state I/O when private per-position state is not part of the
-// format.  Speculative DSV4 rollback uses a separate internal checkpoint and
-// never routes through these public sequence-state serialization functions.
+// Public state I/O excludes private DSV4 state, speculation uses an internal checkpoint.
 static bool llama_state_io_supported(const struct llama_context * ctx, const char * func) {
     if (ctx->model.arch == LLM_ARCH_OPENPANGU || ctx->model.arch == LLM_ARCH_DEEPSEEK4) {
         const char * arch = ctx->model.arch == LLM_ARCH_OPENPANGU ? "openPangu" : "DeepSeek4";

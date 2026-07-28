@@ -209,8 +209,7 @@ struct common_ngram_mod;
 struct common_params_speculative {
     common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE; // type of speculative decoding
 
-    // Speculative checkpoint strategy.  The recurrent spelling remains a
-    // command-line compatibility alias, but the shared layer is generic.
+    // Generic speculative checkpoint mode, recurrent spelling is a compatibility alias.
     int spec_ckpt_mode = LLAMA_SPEC_CKPT_AUTO;
 
     std::string devices;

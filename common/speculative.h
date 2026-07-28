@@ -28,8 +28,6 @@ struct common_speculative_checkpoint {
     llama_pos n_past = 0;
     llama_token sampled = LLAMA_TOKEN_NULL;
     common_sampler * sampler = nullptr;
-    int64_t cycle_start_us = 0;
-    int64_t save_us = 0;
 
     void clear();
 };
@@ -188,13 +186,12 @@ bool common_speculative_checkpoint_restore(
 bool common_speculative_commit(
         common_speculative * spec,
         llama_context * ctx,
-    common_sampler * sampler_dst,
-    llama_seq_id seq_id,
-    llama_token sampled_before,
-    const std::vector<llama_token> & ids,
-    const std::vector<llama_token> & proposals,
-    int n_draft,
-    llama_pos pos_base,
+        common_sampler * sampler_dst,
+        llama_seq_id seq_id,
+        llama_token sampled_before,
+        const std::vector<llama_token> & ids,
+        int n_draft,
+        llama_pos pos_base,
         const std::vector<int32_t> & accepted_output_indices,
         bool no_bonus_token = false);
 

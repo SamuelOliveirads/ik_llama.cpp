@@ -2782,9 +2782,7 @@ bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN &) {
     model.hc_head_fn    = create_tensor_from_meta(ctx_output, pick_tensor_name({"hc_head_fn.weight", "output_hc_fn.weight"}), hc_head_flags);
     model.hc_head_scale = create_tensor_from_meta(ctx_output, pick_tensor_name({"hc_head_scale.weight", "output_hc_scale.weight"}), hc_head_flags);
 
-    // A standalone DeepSeek-V4 companion declares the full block count but
-    // contains only the predictor block. Identify it from the tensor contract,
-    // not from its filename, and create only the available block.
+    // Standalone companions declare the full block count but contain only predictor tensors.
     if (is_standalone_mtp) {
         const int i = mtp_layer;
         ggml_context * ctx_split = ctx_for_layer_split(i);

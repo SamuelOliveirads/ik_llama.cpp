@@ -14,7 +14,5 @@ bool llama_dsv4_spec_ckpt_save(llama_context * ctx, bool use_gpu);
 bool llama_dsv4_spec_ckpt_capture_rows(llama_context * ctx);
 enum llama_spec_ckpt_restore_result llama_dsv4_spec_ckpt_restore(llama_context * ctx, bool use_gpu, int accepted_step);
 void llama_dsv4_spec_ckpt_discard(llama_context * ctx);
-bool llama_dsv4_spec_ckpt_gpu_active(const llama_context * ctx);
 ggml_tensor * llama_dsv4_spec_ckpt_delta(llama_context * ctx, ggml_tensor * state_tensor);
 void llama_dsv4_spec_ckpt_record_plan(llama_context * ctx);
-uint64_t llama_dsv4_state_fingerprint(const llama_context * ctx);

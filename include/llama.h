@@ -705,7 +705,7 @@ extern "C" {
     // Returns true if the model is a Gemma 4 MTP assistant (external frozen-KV speculative drafter)
     LLAMA_API bool llama_model_is_gemma4_mtp_assistant(const struct llama_model * model);
 
-    // Returns true if the model is a standalone DeepSeek-V4 MTP companion.
+    // Returns whether the model is a standalone DeepSeek-V4 MTP companion.
     LLAMA_API bool llama_model_is_deepseek4_mtp_assistant(const struct llama_model * model);
 
     LLAMA_API bool llama_is_gemma4_mtp_file(const char * path);

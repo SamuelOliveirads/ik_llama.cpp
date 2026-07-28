@@ -12,7 +12,6 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <stdexcept>
@@ -23,63 +22,9 @@ static bool dsv4_cache_type_supported(ggml_type type) {
     return type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_Q8_0;
 }
 
-static bool dsv4_plan_trace_enabled() {
-    static const bool enabled = std::getenv("LLAMA_DSV4_PLAN_TRACE") != nullptr;
-    return enabled;
-}
-
-static bool dsv4_checkpoint_trace_enabled() {
-    static const bool enabled = std::getenv("LLAMA_MTP_TRACE") != nullptr;
-    return enabled;
-}
-
-// CSA/LID state uses an eight-row physical ring.  Per-step capture currently
-// reads the persisted physical rows after the graph completes, so windows that
-// wrap the ring cannot be restored without graph-intermediate snapshots.
+// Per-step capture is limited to the eight-row CSA/LID ring.
+// TODO: Expand to a larger number
 static constexpr int DSV4_PER_STEP_MAX_STATE_ROWS = 8;
-
-static void dsv4_trace_plan(const char * name,
-        const llama_context::dsv4_runtime::comp_plan & plan,
-        const llama_batch & batch) {
-    if (!dsv4_plan_trace_enabled() || batch.n_tokens <= 1 || batch.n_tokens > 9) {
-        return;
-    }
-
-    LLAMA_LOG_INFO("DSV4_PLAN name=%s tokens=%d n_stream=%lld n_kv=%lld visible=",
-            name, batch.n_tokens, (long long) plan.n_stream, (long long) plan.n_kv);
-    for (size_t i = 0; i < plan.n_visible.size(); ++i) {
-        LLAMA_LOG_INFO("%s%d", i == 0 ? "[" : ",", plan.n_visible[i]);
-    }
-    LLAMA_LOG_INFO("] state_pos=");
-    for (size_t i = 0; i < plan.state_pos.size(); ++i) {
-        LLAMA_LOG_INFO("%s%d", i == 0 ? "[" : ",", plan.state_pos[i]);
-    }
-    LLAMA_LOG_INFO("] write_pos=");
-    for (size_t i = 0; i < plan.state_write_pos.size(); ++i) {
-        LLAMA_LOG_INFO("%s%d", i == 0 ? "[" : ",", plan.state_write_pos[i]);
-    }
-    LLAMA_LOG_INFO("] read=");
-    for (size_t i = 0; i < plan.state_read_idxs.size(); ++i) {
-        LLAMA_LOG_INFO("%s%d", i == 0 ? "[" : ",", plan.state_read_idxs[i]);
-    }
-    LLAMA_LOG_INFO("] write_idx=");
-    for (size_t i = 0; i < plan.state_write_idxs.size(); ++i) {
-        LLAMA_LOG_INFO("%s%lld", i == 0 ? "[" : ",", (long long) plan.state_write_idxs[i]);
-    }
-    LLAMA_LOG_INFO("] persist_src=");
-    for (size_t i = 0; i < plan.state_persist_src_idxs.size(); ++i) {
-        LLAMA_LOG_INFO("%s%d", i == 0 ? "[" : ",", plan.state_persist_src_idxs[i]);
-    }
-    LLAMA_LOG_INFO("] persist_dst=");
-    for (size_t i = 0; i < plan.state_persist_dst_idxs.size(); ++i) {
-        LLAMA_LOG_INFO("%s%d", i == 0 ? "[" : ",", plan.state_persist_dst_idxs[i]);
-    }
-    LLAMA_LOG_INFO("] pos=");
-    for (int32_t i = 0; i < batch.n_tokens; ++i) {
-        LLAMA_LOG_INFO("%s%d", i == 0 ? "[" : ",", batch.pos[i]);
-    }
-    LLAMA_LOG_INFO("]\n");
-}
 
 static bool dsv4_validate_cache_type(ggml_type type, int64_t width, const char * name) {
     if (!dsv4_cache_type_supported(type)) {
@@ -506,25 +451,6 @@ static bool dsv4_build_raw_context(
                 raw.read_dst_idxs.push_back(pad);
             }
         }
-    }
-
-    if (dsv4_plan_trace_enabled() && batch.n_tokens > 1 && batch.n_tokens <= 8) {
-        LLAMA_LOG_INFO("DSV4_RAW tokens=%d n_kv=%lld graph_streams=%lld write_src_n=%zu write_dst_n=%zu read_n=%zu write_counts=",
-                batch.n_tokens, (long long) raw.n_kv, (long long) raw.graph_n_stream,
-                raw.write_src_idxs.size(), raw.write_dst_idxs.size(), raw.read_dst_idxs.size());
-        for (size_t i = 0; i < raw.write_counts.size(); ++i) {
-            LLAMA_LOG_INFO("%s%d", i == 0 ? "[" : ",", raw.write_counts[i]);
-        }
-        LLAMA_LOG_INFO("] read_counts=");
-        for (size_t i = 0; i < raw.read_counts.size(); ++i) {
-            LLAMA_LOG_INFO("%s%d", i == 0 ? "[" : ",", raw.read_counts[i]);
-        }
-        LLAMA_LOG_INFO("] read_head=");
-        const size_t n_read = std::min<size_t>(raw.read_dst_idxs.size(), 16);
-        for (size_t i = 0; i < n_read; ++i) {
-            LLAMA_LOG_INFO("%s%d", i == 0 ? "[" : ",", raw.read_dst_idxs[i]);
-        }
-        LLAMA_LOG_INFO("]\n");
     }
 
     return true;
@@ -1127,24 +1053,6 @@ void llama_reset_dsv4_state(llama_context * ctx, int32_t seq_id) {
     for (ggml_tensor * tensor : ctx->dsv4.cache.lid_state_score) clear_tensor(tensor);
 }
 
-static std::vector<ggml_tensor *> dsv4_checkpoint_tensors(const llama_context & ctx) {
-    std::vector<ggml_tensor *> tensors;
-    const auto append = [&tensors](const std::vector<ggml_tensor *> & group) {
-        tensors.insert(tensors.end(), group.begin(), group.end());
-    };
-
-    append(ctx.dsv4.cache.csa_k);
-    append(ctx.dsv4.cache.hca_k);
-    append(ctx.dsv4.cache.lid_k);
-    append(ctx.dsv4.cache.csa_state_kv);
-    append(ctx.dsv4.cache.csa_state_score);
-    append(ctx.dsv4.cache.hca_state_kv);
-    append(ctx.dsv4.cache.hca_state_score);
-    append(ctx.dsv4.cache.lid_state_kv);
-    append(ctx.dsv4.cache.lid_state_score);
-    return tensors;
-}
-
 static std::vector<ggml_tensor *> dsv4_state_tensors(const llama_context & ctx) {
     std::vector<ggml_tensor *> tensors;
     const auto append = [&tensors](const std::vector<ggml_tensor *> & group) {
@@ -1274,9 +1182,6 @@ static bool dsv4_per_step_alloc(llama_context & ctx, int max_tokens) {
 
 static bool dsv4_per_step_copy_base(llama_context & ctx, bool restore) {
     auto & ckpt = ctx.kv_self.ckpt;
-    if (dsv4_checkpoint_trace_enabled()) {
-        LLAMA_LOG_INFO("%s: DSV4 per-step base %s begin\n", __func__, restore ? "restore" : "save");
-    }
     if (!ckpt.dsv4_per_step_allocated || ckpt.dsv4_per_step_state.size() != ckpt.dsv4_per_step_state_shadow.size()) {
         return false;
     }
@@ -1300,9 +1205,6 @@ static bool dsv4_per_step_copy_base(llama_context & ctx, bool restore) {
     }
     for (ggml_backend_t backend : backends) {
         ggml_backend_synchronize(backend);
-    }
-    if (dsv4_checkpoint_trace_enabled()) {
-        LLAMA_LOG_INFO("%s: DSV4 per-step base %s end\n", __func__, restore ? "restore" : "save");
     }
     return true;
 }
@@ -1493,9 +1395,7 @@ bool llama_dsv4_spec_ckpt_prepare(llama_context * ctx, int mode, int max_tokens)
         return dsv4_per_step_alloc(*ctx, max_tokens);
     }
     if (mode == LLAMA_SPEC_CKPT_GPU_FALLBACK) {
-        // Fallback restores the pre-batch state and then replays the accepted
-        // prefix.  The replay reconstructs position-addressed compressed K,
-        // so retaining the full 226 MiB private cache is unnecessary.
+        // Fallback restores compressor state and replays accepted tokens.
         return dsv4_spec_ckpt_alloc_gpu(*ctx, dsv4_state_tensors(*ctx));
     }
     return true;
@@ -1537,7 +1437,6 @@ bool llama_dsv4_spec_ckpt_save(llama_context * ctx, bool use_gpu) {
 
     auto & saved = ctx->kv_self.ckpt.dsv4_state_data;
     saved.clear();
-    size_t total_bytes = 0;
     for (ggml_tensor * tensor : tensors) {
         if (tensor == nullptr) {
             saved.emplace_back();
@@ -1547,12 +1446,6 @@ bool llama_dsv4_spec_ckpt_save(llama_context * ctx, bool use_gpu) {
         const size_t nbytes = ggml_nbytes(tensor);
         saved.emplace_back(nbytes);
         ggml_backend_tensor_get(tensor, saved.back().data(), 0, nbytes);
-        total_bytes += nbytes;
-    }
-
-    if (dsv4_checkpoint_trace_enabled()) {
-        LLAMA_LOG_INFO("%s: DSV4 CPU fallback state snapshot = %8.2f MiB (state-only)\n",
-                __func__, total_bytes / (1024.0 * 1024.0));
     }
 
     return true;
@@ -1591,9 +1484,7 @@ static enum llama_spec_ckpt_restore_result dsv4_per_step_restore_rows(
             if (src_idxs[row] > accepted_step) {
                 continue;
             }
-            // Every row at or before the accepted boundary must map to a
-            // valid persistent state-ring row.  Treating a malformed mapping
-            // as an omitted row silently leaves stale CSA/HCA/LID state.
+            // Reject invalid mappings instead of leaving stale compressor state.
             if (src_idxs[row] < 0 || dst_idxs[row] < 0 ||
                 (uint64_t) dst_idxs[row] >= (uint64_t) state->ne[1]) {
                 LLAMA_LOG_ERROR("%s: invalid visible DSV4 state row src=%d dst=%d accepted_step=%d state_rows=%lld\n",
@@ -1680,14 +1571,6 @@ enum llama_spec_ckpt_restore_result llama_dsv4_spec_ckpt_restore(llama_context *
         for (ggml_backend_t backend : backends) {
             ggml_backend_synchronize(backend);
         }
-        LLAMA_LOG_DEBUG("%s: direct restore accepted_step=%d state_visibility=validated\n", __func__, accepted_step);
-        if (dsv4_checkpoint_trace_enabled()) {
-            LLAMA_LOG_INFO("MTP_TRACE restore_visibility accepted_step=%d state_visibility=validated csa_rows=%zu hca_rows=%zu lid_rows=%zu\n",
-                    accepted_step,
-                    ckpt.dsv4_per_step_csa_src.size(),
-                    ckpt.dsv4_per_step_hca_src.size(),
-                    ckpt.dsv4_per_step_lid_src.size());
-        }
         return LLAMA_SPEC_CKPT_RESTORE_DIRECT;
     }
 
@@ -1768,33 +1651,6 @@ void llama_dsv4_spec_ckpt_discard(llama_context * ctx) {
     }
 }
 
-bool llama_dsv4_spec_ckpt_gpu_active(const llama_context * ctx) {
-    return ctx != nullptr && ctx->model.arch == LLM_ARCH_DEEPSEEK4 &&
-        ctx->kv_self.ckpt.dsv4_shadow_saved;
-}
-
-uint64_t llama_dsv4_state_fingerprint(const llama_context * ctx) {
-    if (ctx == nullptr || ctx->model.arch != LLM_ARCH_DEEPSEEK4) {
-        return 0;
-    }
-
-    llama_synchronize(const_cast<llama_context *>(ctx));
-    uint64_t hash = 1469598103934665603ull;
-    for (ggml_tensor * tensor : dsv4_checkpoint_tensors(*ctx)) {
-        if (tensor == nullptr) {
-            continue;
-        }
-
-        std::vector<uint8_t> data(ggml_nbytes(tensor));
-        ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
-        for (uint8_t byte : data) {
-            hash ^= byte;
-            hash *= 1099511628211ull;
-        }
-    }
-    return hash;
-}
-
 bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & batch, bool set_tensors, bool reserve_plan) {
     if (lctx.model.arch != LLM_ARCH_DEEPSEEK4) {
         return true;
@@ -1804,11 +1660,7 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
         return false;
     }
 
-    // A standalone DSV4 companion contains only the predictor block.  Its
-    // absolute layer index is retained for tensor lookup, but that block has
-    // compression ratio zero and never executes CSA/HCA/LID.  Keep the
-    // planner inputs empty so the companion does not allocate the target's
-    // private compressed-cache oracle or validate a non-existent state ring.
+    // Standalone companions contain only the predictor block, skip target state planning.
     const bool is_dsv4_mtp = lctx.model.mtp &&
         lctx.cparams.mtp_op_type != MTP_OP_NONE &&
         lctx.model.hparams.nextn_predict_layers > 0 &&
@@ -1864,9 +1716,6 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
     lctx.dsv4.hca_ctx = dsv4_build_comp_context(batch, cache_n_stream, lctx.dsv4.hca_plan.n_kv);
     lctx.dsv4.lid_ctx = dsv4_build_comp_context(batch, cache_n_stream, lctx.dsv4.lid_plan.n_kv);
 
-    dsv4_trace_plan("csa", lctx.dsv4.csa_plan, batch);
-    dsv4_trace_plan("hca", lctx.dsv4.hca_plan, batch);
-    dsv4_trace_plan("lid", lctx.dsv4.lid_plan, batch);
     //auto tim2 = ggml_time_us();
     //fprintf(stderr, "%s: %ld us to buils plans\n", __func__, tim2-tim1);
 

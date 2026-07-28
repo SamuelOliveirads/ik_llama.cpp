@@ -141,8 +141,7 @@ struct llama_kv_cache {
         int64_t per_step_conv_dim = 0;
         int32_t per_step_d_conv = 0;
 
-        // DSV4 per-step checkpoints keep one pre-window compressor-state
-        // shadow and device-local rows for each verification token.
+        // DSV4 per-step compressor-state base and per-row deltas.
         std::vector<ggml_tensor *> dsv4_per_step_state;
         std::vector<ggml_tensor *> dsv4_per_step_state_shadow;
         std::vector<ggml_tensor *> dsv4_per_step_delta;
@@ -167,10 +166,7 @@ struct llama_kv_cache {
         // Serialised sequence state for CPU mode
         std::vector<uint8_t> cpu_state_data;
 
-        // DSV4 keeps architecture-private compressed-cache tensors outside
-        // kv_self.  The preferred speculative checkpoint stores these tensors
-        // in backend-local shadow buffers; this CPU copy remains as a fallback
-        // when a compatible shadow buffer cannot be allocated.
+        // Private DSV4 state snapshot used by GPU/CPU fallback modes.
         std::vector<std::vector<uint8_t>> dsv4_state_data;
         std::vector<ggml_tensor *> dsv4_state_shadow;
         std::vector<struct ggml_context *> dsv4_shadow_ctxs;

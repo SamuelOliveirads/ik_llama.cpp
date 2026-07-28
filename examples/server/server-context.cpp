@@ -4209,8 +4209,6 @@ void server_context::speculative_decoding_accept() {
             }
         }
 
-        const llama_tokens proposals = slot.drafted;
-
         slot.i_batch_dft.clear();
         slot.drafted.clear();
 
@@ -4247,7 +4245,6 @@ void server_context::speculative_decoding_accept() {
             slot.id,
             sampled_before,
             ids,
-            proposals,
             n_draft,
             spec_pos_base,
             accepted_output_indices,
@@ -4849,8 +4846,7 @@ void server_context::update_slots() {
     if (llama_model_has_recurrent(model) || llama_model_is_openpangu(model) || target_is_dsv4) {
         const int ckpt_mode = params_base.speculative.spec_ckpt_mode;
 
-        // A failed checkpoint must never leave speculative rows in the target
-        // batch: a rejection would otherwise mutate state with no rollback.
+        // Remove draft rows if checkpoint setup fails, otherwise rejection is unsafe.
         auto make_root_only = [&](server_slot & slot) {
             if (slot.i_batch_dft.empty()) {
                 return;
@@ -4885,9 +4881,7 @@ void server_context::update_slots() {
             }
             batch.n_tokens = write;
 
-            // Draft rows are normally the only speculative rows in a DSV4
-            // batch, but prompt/root rows from other slots may still follow
-            // them. Keep every surviving slot index valid after compaction.
+            // Remap all surviving slots after compacting the combined batch.
             for (auto & other_slot : slots) {
                 if (other_slot.i_batch >= 0 && other_slot.i_batch < old_n_tokens) {
                     other_slot.i_batch = remap[other_slot.i_batch];

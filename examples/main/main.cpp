@@ -3,12 +3,9 @@
 #include "chat.h"
 #include "console.h"
 #include "llama.h"
-#include <array>
 #include <cassert>
-#include <algorithm>
 #include <cinttypes>
 #include <cmath>
-#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -43,295 +40,6 @@ static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
-
-static bool main_mtp_trace_enabled() {
-    static const bool enabled = std::getenv("LLAMA_MTP_TRACE") != nullptr;
-    return enabled;
-}
-
-static void main_mtp_trace_emitted(const char * mode, const std::vector<llama_token> & ids) {
-    if (!main_mtp_trace_enabled()) {
-        return;
-    }
-
-    fprintf(stderr, "MTP_TRACE emitted mode=%s ids=[", mode);
-    for (size_t i = 0; i < ids.size(); ++i) {
-        fprintf(stderr, "%s%d", i == 0 ? "" : ",", (int) ids[i]);
-    }
-    fprintf(stderr, "]\n");
-}
-
-static bool main_dsv4_logit_compare_enabled() {
-    static const bool enabled = std::getenv("LLAMA_DSV4_COMPARE_LOGITS") != nullptr;
-    return enabled;
-}
-
-static bool main_dsv4_target_compare_enabled() {
-    static const bool enabled = std::getenv("LLAMA_DSV4_TARGET_COMPARE_POS") != nullptr;
-    return enabled;
-}
-
-static bool main_dsv4_parse_target_compare_draft(std::vector<llama_token> & draft) {
-    draft.clear();
-    const char * text = std::getenv("LLAMA_DSV4_TARGET_COMPARE_DRAFT");
-    if (text == nullptr || *text == '\0') {
-        return false;
-    }
-
-    while (*text != '\0') {
-        char * end = nullptr;
-        const long value = std::strtol(text, &end, 10);
-        if (end == text) {
-            return false;
-        }
-        draft.push_back((llama_token) value);
-        text = end;
-        if (*text == ',') {
-            ++text;
-        } else if (*text != '\0') {
-            return false;
-        }
-    }
-    return !draft.empty();
-}
-
-// Target-only control for one frozen tuple.  The caller invokes this after it
-// has sampled the first input token but before decoding it, so restoring the
-// checkpoint leaves the normal target-only generation path unchanged.
-static void main_dsv4_compare_target_only_tuple(
-        llama_context * ctx,
-        llama_pos n_past,
-        llama_token sampled_before) {
-    static bool ran = false;
-    if (ran || !main_dsv4_target_compare_enabled()) {
-        return;
-    }
-
-    const char * pos_text = std::getenv("LLAMA_DSV4_TARGET_COMPARE_POS");
-    char * pos_end = nullptr;
-    const long requested_pos = pos_text != nullptr ? std::strtol(pos_text, &pos_end, 10) : -1;
-    if (pos_end == pos_text || requested_pos != n_past) {
-        return;
-    }
-
-    std::vector<llama_token> draft;
-    if (!main_dsv4_parse_target_compare_draft(draft)) {
-        fprintf(stderr, "DSV4_TARGET_COMPARE invalid draft tuple\n");
-        ran = true;
-        return;
-    }
-
-    const int n_vocab = llama_n_vocab(llama_get_model(ctx));
-    const int n_rows = (int) draft.size() + 1;
-    if (n_vocab <= 0 || llama_spec_ckpt_init(ctx, LLAMA_SPEC_CKPT_CPU, n_rows) == LLAMA_SPEC_CKPT_NONE ||
-            !llama_spec_ckpt_save(ctx, 0)) {
-        fprintf(stderr, "DSV4_TARGET_COMPARE checkpoint_save_failed pos=%d\n", (int) n_past);
-        llama_spec_ckpt_discard(ctx);
-        ran = true;
-        return;
-    }
-
-    llama_batch batch = llama_batch_init(n_rows, 0, 1);
-    common_batch_add(batch, sampled_before, n_past, { 0 }, true);
-    for (size_t i = 0; i < draft.size(); ++i) {
-        common_batch_add(batch, draft[i], n_past + 1 + (llama_pos) i, { 0 }, true);
-    }
-
-    std::vector<std::vector<float>> batch_logits((size_t) n_rows, std::vector<float>((size_t) n_vocab));
-    std::vector<std::vector<float>> sequential_logits((size_t) n_rows, std::vector<float>((size_t) n_vocab));
-    if (llama_decode(ctx, batch) != 0) {
-        fprintf(stderr, "DSV4_TARGET_COMPARE batch_decode_failed pos=%d\n", (int) n_past);
-        llama_batch_free(batch);
-        llama_spec_ckpt_discard(ctx);
-        ran = true;
-        return;
-    }
-    for (int i = 0; i < n_rows; ++i) {
-        float * logits = llama_get_logits_ith(ctx, i);
-        if (logits == nullptr) {
-            fprintf(stderr, "DSV4_TARGET_COMPARE batch_logits_unavailable row=%d\n", i);
-            llama_batch_free(batch);
-            llama_spec_ckpt_discard(ctx);
-            ran = true;
-            return;
-        }
-        std::copy(logits, logits + n_vocab, batch_logits[(size_t) i].begin());
-    }
-
-    if (!llama_spec_ckpt_restore(ctx, 0, n_past, 0)) {
-        fprintf(stderr, "DSV4_TARGET_COMPARE checkpoint_restore_failed\n");
-        llama_batch_free(batch);
-        llama_spec_ckpt_discard(ctx);
-        ran = true;
-        return;
-    }
-
-    bool sequential_ok = true;
-    for (int i = 0; i < n_rows; ++i) {
-        llama_batch one = llama_batch_init(1, 0, 1);
-        common_batch_add(one, batch.token[i], batch.pos[i], { 0 }, true);
-        if (llama_decode(ctx, one) != 0) {
-            sequential_ok = false;
-            llama_batch_free(one);
-            break;
-        }
-        float * logits = llama_get_logits_ith(ctx, 0);
-        if (logits == nullptr) {
-            sequential_ok = false;
-            llama_batch_free(one);
-            break;
-        }
-        std::copy(logits, logits + n_vocab, sequential_logits[(size_t) i].begin());
-        llama_batch_free(one);
-    }
-
-    // Restore the pre-tuple state.  The normal target-only caller will now
-    // decode sampled_before exactly once on the next loop iteration.
-    const bool restored = llama_spec_ckpt_restore(ctx, 0, n_past, 0);
-    llama_spec_ckpt_discard(ctx);
-    llama_batch_free(batch);
-    ran = true;
-    if (!restored || !sequential_ok) {
-        fprintf(stderr, "DSV4_TARGET_COMPARE restore_or_sequential_failed pos=%d\n", (int) n_past);
-        return;
-    }
-
-    auto top1 = [](const std::vector<float> & logits) {
-        return (int) std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
-    };
-    for (int row = 0; row < n_rows; ++row) {
-        float max_abs = 0.0f;
-        for (int i = 0; i < n_vocab; ++i) {
-            max_abs = std::max(max_abs, std::fabs(batch_logits[(size_t) row][(size_t) i] - sequential_logits[(size_t) row][(size_t) i]));
-        }
-        fprintf(stderr, "DSV4_TARGET_COMPARE row=%d pos=%d token=%d max_abs=%.9g batch_top=%d sequential_top=%d\n",
-                row, (int) (n_past + row), (int) (row == 0 ? sampled_before : draft[(size_t) row - 1]),
-                max_abs, top1(batch_logits[(size_t) row]), top1(sequential_logits[(size_t) row]));
-    }
-}
-
-// Diagnostic for the DSV4 batch/state-plan boundary.  The target batch is
-// decoded once, the same rows are decoded sequentially from the speculative
-// checkpoint, and the original batch is decoded again before sampling.  The
-// final re-decode is intentional: llama_spec_ckpt_restore restores model
-// state, but not the public logits buffer used by the sampler.
-static void main_dsv4_compare_batch_logits(
-        llama_context * ctx,
-        llama_batch   & verify_batch,
-        llama_pos       n_past,
-        size_t          n_rows) {
-    const int n_vocab = llama_n_vocab(llama_get_model(ctx));
-    if (n_vocab <= 0 || n_rows == 0) {
-        return;
-    }
-
-    n_rows = std::min(n_rows, (size_t) verify_batch.n_tokens);
-    std::vector<std::vector<float>> batch_logits(n_rows, std::vector<float>((size_t) n_vocab));
-    std::vector<std::vector<float>> replay_logits(n_rows, std::vector<float>((size_t) n_vocab));
-    std::vector<std::vector<float>> sequential_logits(n_rows, std::vector<float>((size_t) n_vocab));
-
-    for (size_t row = 0; row < n_rows; ++row) {
-        float * logits = llama_get_logits_ith(ctx, (int32_t) row);
-        if (logits == nullptr) {
-            fprintf(stderr, "DSV4_LOGIT_COMPARE unavailable row=%zu\n", row);
-            return;
-        }
-        std::copy(logits, logits + n_vocab, batch_logits[row].begin());
-    }
-
-    if (!llama_spec_ckpt_restore(ctx, 0, n_past, 0)) {
-        fprintf(stderr, "DSV4_LOGIT_COMPARE checkpoint_restore_failed stage=sequential\n");
-        return;
-    }
-
-    bool sequential_ok = true;
-    for (size_t row = 0; row < n_rows; ++row) {
-        llama_batch one = llama_batch_init(1, 0, 1);
-        common_batch_add(one, verify_batch.token[row], verify_batch.pos[row], { 0 }, true);
-        if (llama_decode(ctx, one) != 0) {
-            sequential_ok = false;
-            llama_batch_free(one);
-            fprintf(stderr, "DSV4_LOGIT_COMPARE sequential_decode_failed row=%zu\n", row);
-            break;
-        }
-
-        float * logits = llama_get_logits_ith(ctx, 0);
-        if (logits == nullptr) {
-            sequential_ok = false;
-            llama_batch_free(one);
-            fprintf(stderr, "DSV4_LOGIT_COMPARE sequential_logits_unavailable row=%zu\n", row);
-            break;
-        }
-        std::copy(logits, logits + n_vocab, sequential_logits[row].begin());
-        llama_batch_free(one);
-    }
-
-    if (!llama_spec_ckpt_restore(ctx, 0, n_past, 0)) {
-        fprintf(stderr, "DSV4_LOGIT_COMPARE checkpoint_restore_failed stage=batch_replay\n");
-        return;
-    }
-
-    // Restore the normal post-verify state and logits buffer before returning
-    // to the existing sampler/commit path.
-    if (llama_decode(ctx, verify_batch) != 0) {
-        fprintf(stderr, "DSV4_LOGIT_COMPARE batch_redecode_failed\n");
-        return;
-    }
-
-    for (size_t row = 0; row < n_rows; ++row) {
-        float * logits = llama_get_logits_ith(ctx, (int32_t) row);
-        if (logits == nullptr) {
-            fprintf(stderr, "DSV4_LOGIT_COMPARE replay_logits_unavailable row=%zu\n", row);
-            return;
-        }
-        std::copy(logits, logits + n_vocab, replay_logits[row].begin());
-    }
-
-    if (!sequential_ok) {
-        return;
-    }
-
-    auto top3 = [](const std::vector<float> & logits) {
-        std::array<int, 3> ids = { -1, -1, -1 };
-        std::array<float, 3> values = { -INFINITY, -INFINITY, -INFINITY };
-        for (int i = 0; i < (int) logits.size(); ++i) {
-            for (int k = 0; k < 3; ++k) {
-                if (logits[(size_t) i] > values[(size_t) k]) {
-                    for (int j = 2; j > k; --j) {
-                        ids[(size_t) j] = ids[(size_t) (j - 1)];
-                        values[(size_t) j] = values[(size_t) (j - 1)];
-                    }
-                    ids[(size_t) k] = i;
-                    values[(size_t) k] = logits[(size_t) i];
-                    break;
-                }
-            }
-        }
-        return std::pair<std::array<int, 3>, std::array<float, 3>>(ids, values);
-    };
-
-    for (size_t row = 0; row < n_rows; ++row) {
-        float max_abs = 0.0f;
-        float replay_max_abs = 0.0f;
-        for (int i = 0; i < n_vocab; ++i) {
-            max_abs = std::max(max_abs, std::fabs(batch_logits[row][(size_t) i] - sequential_logits[row][(size_t) i]));
-            replay_max_abs = std::max(replay_max_abs, std::fabs(batch_logits[row][(size_t) i] - replay_logits[row][(size_t) i]));
-        }
-        const auto batch_top = top3(batch_logits[row]);
-        const auto sequential_top = top3(sequential_logits[row]);
-        const bool top1_match = batch_top.first[0] == sequential_top.first[0];
-        fprintf(stderr,
-                "DSV4_LOGIT_COMPARE row=%zu pos=%d token=%d max_abs=%.9g "
-                "checkpoint_replay_max_abs=%.9g "
-                "top1_match=%d "
-                "batch_top=[%d:%.7g,%d:%.7g,%d:%.7g] "
-                "sequential_top=[%d:%.7g,%d:%.7g,%d:%.7g]\n",
-                row, (int) verify_batch.pos[row], (int) verify_batch.token[row], max_abs, replay_max_abs,
-                top1_match ? 1 : 0,
-                batch_top.first[0], batch_top.second[0], batch_top.first[1], batch_top.second[1], batch_top.first[2], batch_top.second[2],
-                sequential_top.first[0], sequential_top.second[0], sequential_top.first[1], sequential_top.second[1], sequential_top.first[2], sequential_top.second[2]);
-    }
-}
 
 static bool file_exists(const std::string & path) {
     std::ifstream f(path.c_str());
@@ -1312,16 +1020,6 @@ int main(int argc, char ** argv) {
                             return 1;
                         }
 
-                        if (main_dsv4_logit_compare_enabled() && target_is_dsv4 && draft.size() >= 2) {
-                            const common_speculative_checkpoint * checkpoint = common_speculative_get_checkpoint(spec);
-                            if (checkpoint != nullptr && checkpoint->valid) {
-                                main_dsv4_compare_batch_logits(ctx, verify_batch, n_past,
-                                        (size_t) verify_batch.n_tokens);
-                            } else {
-                                fprintf(stderr, "DSV4_LOGIT_COMPARE skipped checkpoint_unavailable\n");
-                            }
-                        }
-
                         std::vector<llama_token> ids;
                         try {
                             ids = common_sampler_sample_and_accept_n(ctx_sampling, ctx, verify_indices, draft);
@@ -1343,7 +1041,6 @@ int main(int argc, char ** argv) {
                             0,
                             sampled_before,
                             ids,
-                            draft,
                             (int) draft.size(),
                             n_past + 1,
                             accepted_output_indices,
@@ -1399,10 +1096,6 @@ int main(int argc, char ** argv) {
                     const llama_token id = common_sampler_sample_legacy(ctx_sampling, ctx, ctx_guidance);
                     common_sampler_accept(ctx_sampling, ctx, id, /* apply_grammar= */ true);
 
-                    if (std::strcmp(llama_model_arch_string(model), "deepseek4") == 0) {
-                        main_dsv4_compare_target_only_tuple(ctx, n_past, id);
-                    }
-
                     LOG("last: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, ctx_sampling->prev).c_str());
 
                     embd.push_back(id);
@@ -1445,7 +1138,6 @@ int main(int argc, char ** argv) {
         emitted_hit_eog = false;
 
         if (emitted_generated && !emitted.empty()) {
-            main_mtp_trace_emitted(spec != nullptr ? "mtp" : "target", emitted);
             std::string generated_text = output_ss.str();
             std::vector<llama_token> emitted_visible;
             emitted_visible.reserve(emitted.size());

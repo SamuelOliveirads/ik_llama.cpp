@@ -1660,11 +1660,7 @@ void llm_load_hparams(
         case LLM_ARCH_GLM_DSA:
             {
                 ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
-                // A standalone MTP assistant appends its predictor block after the
-                // base blocks, so n_layer - nextn_predict_layers is its first MTP
-                // block.  Base DSV4 GGUFs may omit nextn_predict_layers entirely;
-                // in that form n_layer is the block count and the last valid probe
-                // block is n_layer - 1 (not n_layer).
+                // Probe the first appended predictor block, or n_layer - 1 for base GGUFs.
                 const uint32_t dsv4_probe_offset = std::max<uint32_t>(1, hparams.nextn_predict_layers);
                 const uint32_t dsv4_probe_layer = hparams.n_layer > dsv4_probe_offset
                     ? hparams.n_layer - dsv4_probe_offset
@@ -1775,10 +1771,7 @@ void llm_load_hparams(
                             hparams.dsv4_hc_mult = (uint32_t) (wo_a_0->ne[1] / hparams.n_embd);
                         }
                     }
-                    // Base DSV4 GGUFs do not carry the companion's
-                    // embedding_length_out metadata.  The target still
-                    // exports the hyper-connection state consumed by the
-                    // standalone MTP predictor, whose width is n_embd * hc.
+                    // Base GGUFs lack companion output width, derive it from target HC width.
                     if (hparams.n_embd_out == hparams.n_embd && hparams.dsv4_hc_mult > 1) {
                         hparams.n_embd_out = hparams.n_embd * hparams.dsv4_hc_mult;
                     }
