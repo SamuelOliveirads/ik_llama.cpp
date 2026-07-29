@@ -1072,30 +1072,44 @@ static std::vector<ggml_tensor *> dsv4_state_tensors(const llama_context & ctx) 
     return tensors;
 }
 
-static void dsv4_per_step_release(llama_context & ctx) {
-    auto & ckpt = ctx.kv_self.ckpt;
-    for (ggml_context * shadow_ctx : ckpt.dsv4_per_step_shadow_ctxs) {
+void llama_kv_cache::gpu_checkpoint::release_dsv4_per_step() {
+    for (ggml_context * shadow_ctx : dsv4_per_step_shadow_ctxs) {
         ggml_free(shadow_ctx);
     }
-    for (ggml_backend_buffer_t buffer : ckpt.dsv4_per_step_shadow_bufs) {
+    for (ggml_backend_buffer_t buffer : dsv4_per_step_shadow_bufs) {
         ggml_backend_buffer_free(buffer);
     }
-    ckpt.dsv4_per_step_shadow_ctxs.clear();
-    ckpt.dsv4_per_step_shadow_bufs.clear();
-    ckpt.dsv4_per_step_state.clear();
-    ckpt.dsv4_per_step_state_shadow.clear();
-    ckpt.dsv4_per_step_delta.clear();
-    ckpt.dsv4_per_step_csa_src.clear();
-    ckpt.dsv4_per_step_csa_dst.clear();
-    ckpt.dsv4_per_step_hca_src.clear();
-    ckpt.dsv4_per_step_hca_dst.clear();
-    ckpt.dsv4_per_step_lid_src.clear();
-    ckpt.dsv4_per_step_lid_dst.clear();
-    ckpt.dsv4_per_step_allocated = false;
-    ckpt.dsv4_per_step_saved = false;
-    ckpt.dsv4_per_step_max_tokens = 0;
-    ckpt.dsv4_per_step_base_bytes = 0;
-    ckpt.dsv4_per_step_delta_bytes = 0;
+    dsv4_per_step_shadow_ctxs.clear();
+    dsv4_per_step_shadow_bufs.clear();
+    dsv4_per_step_state.clear();
+    dsv4_per_step_state_shadow.clear();
+    dsv4_per_step_delta.clear();
+    dsv4_per_step_csa_src.clear();
+    dsv4_per_step_csa_dst.clear();
+    dsv4_per_step_hca_src.clear();
+    dsv4_per_step_hca_dst.clear();
+    dsv4_per_step_lid_src.clear();
+    dsv4_per_step_lid_dst.clear();
+    dsv4_per_step_allocated = false;
+    dsv4_per_step_saved = false;
+    dsv4_per_step_max_tokens = 0;
+    dsv4_per_step_base_bytes = 0;
+    dsv4_per_step_delta_bytes = 0;
+}
+
+void llama_kv_cache::gpu_checkpoint::release_dsv4_snapshot() {
+    for (ggml_context * shadow_ctx : dsv4_shadow_ctxs) {
+        ggml_free(shadow_ctx);
+    }
+    for (ggml_backend_buffer_t buffer : dsv4_shadow_bufs) {
+        ggml_backend_buffer_free(buffer);
+    }
+    dsv4_shadow_ctxs.clear();
+    dsv4_shadow_bufs.clear();
+    dsv4_state_data.clear();
+    dsv4_state_shadow.clear();
+    dsv4_shadow_allocated = false;
+    dsv4_shadow_saved = false;
 }
 
 static bool dsv4_per_step_alloc(llama_context & ctx, int max_tokens) {
@@ -1113,7 +1127,7 @@ static bool dsv4_per_step_alloc(llama_context & ctx, int max_tokens) {
         return true;
     }
 
-    dsv4_per_step_release(ctx);
+    ctx.kv_self.ckpt.release_dsv4_per_step();
     ckpt.dsv4_per_step_state = states;
     ckpt.dsv4_per_step_state_shadow.assign(states.size(), nullptr);
     ckpt.dsv4_per_step_delta.assign(states.size(), nullptr);
@@ -1126,7 +1140,7 @@ static bool dsv4_per_step_alloc(llama_context & ctx, int max_tokens) {
     for (size_t i = 0; i < states.size(); ++i) {
         ggml_tensor * source = states[i];
         if (source == nullptr || source->buffer == nullptr) {
-            dsv4_per_step_release(ctx);
+            ctx.kv_self.ckpt.release_dsv4_per_step();
             return false;
         }
         entries_by_buft[ggml_backend_buffer_get_type(source->buffer)].push_back({ i, source });
@@ -1142,7 +1156,7 @@ static bool dsv4_per_step_alloc(llama_context & ctx, int max_tokens) {
         };
         ggml_context * graph_ctx = ggml_init(params);
         if (graph_ctx == nullptr) {
-            dsv4_per_step_release(ctx);
+            ctx.kv_self.ckpt.release_dsv4_per_step();
             return false;
         }
 
@@ -1163,7 +1177,7 @@ static bool dsv4_per_step_alloc(llama_context & ctx, int max_tokens) {
         ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(graph_ctx, buft);
         if (buffer == nullptr) {
             ggml_free(graph_ctx);
-            dsv4_per_step_release(ctx);
+        ctx.kv_self.ckpt.release_dsv4_per_step();
             return false;
         }
         ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
@@ -1294,16 +1308,7 @@ static bool dsv4_spec_ckpt_alloc_gpu(
     };
     std::map<ggml_backend_buffer_type_t, std::vector<tensor_entry>> entries_by_buft;
     const auto release_partial = [&]() {
-        for (ggml_context * shadow_ctx : ckpt.dsv4_shadow_ctxs) {
-            ggml_free(shadow_ctx);
-        }
-        for (ggml_backend_buffer_t buffer : ckpt.dsv4_shadow_bufs) {
-            ggml_backend_buffer_free(buffer);
-        }
-        ckpt.dsv4_shadow_ctxs.clear();
-        ckpt.dsv4_shadow_bufs.clear();
-        ckpt.dsv4_state_shadow.clear();
-        ckpt.dsv4_shadow_allocated = false;
+        ckpt.release_dsv4_snapshot();
     };
 
     for (size_t i = 0; i < tensors.size(); ++i) {
@@ -1395,7 +1400,6 @@ bool llama_dsv4_spec_ckpt_prepare(llama_context * ctx, int mode, int max_tokens)
         return dsv4_per_step_alloc(*ctx, max_tokens);
     }
     if (mode == LLAMA_SPEC_CKPT_GPU_FALLBACK) {
-        // Fallback restores compressor state and replays accepted tokens.
         return dsv4_spec_ckpt_alloc_gpu(*ctx, dsv4_state_tensors(*ctx));
     }
     return true;
@@ -1715,7 +1719,6 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
     lctx.dsv4.csa_ctx = dsv4_build_comp_context(batch, cache_n_stream, lctx.dsv4.csa_plan.n_kv);
     lctx.dsv4.hca_ctx = dsv4_build_comp_context(batch, cache_n_stream, lctx.dsv4.hca_plan.n_kv);
     lctx.dsv4.lid_ctx = dsv4_build_comp_context(batch, cache_n_stream, lctx.dsv4.lid_plan.n_kv);
-
     //auto tim2 = ggml_time_us();
     //fprintf(stderr, "%s: %ld us to buils plans\n", __func__, tim2-tim1);
 

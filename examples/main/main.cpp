@@ -1042,8 +1042,7 @@ int main(int argc, char ** argv) {
                             ids,
                             (int) draft.size(),
                             n_past + 1,
-                            accepted_output_indices,
-                            false)) {
+                            accepted_output_indices)) {
                             llama_batch_free(verify_batch);
                             LOG_TEE("%s: speculative checkpoint restore/commit failed\n", __func__);
                             return 1;

@@ -2027,6 +2027,15 @@ bool common_speculative_finalize_startup(
         const llama_model * model) {
     auto & params = params_base.speculative;
 
+    if (params.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) &&
+        model != nullptr &&
+        llama_model_is_deepseek4(model) &&
+        llama_model_n_nextn_layer(model) > 1) {
+        LOG_ERR("%s: DeepSeek-V4 MTP supports exactly one NextN predictor layer, got %d.\n",
+                __func__, llama_model_n_nextn_layer(model));
+        return false;
+    }
+
     if (!params.needs_dft_model()) {
         params.clear_dft();
     }
@@ -2034,6 +2043,15 @@ bool common_speculative_finalize_startup(
     if (params.has_dft()) {
         LLAMA_LOG_INFO("\n\n==================================loading DRAFT model==================================\n\n");
         if (!common_speculative_load_draft_model(params, params_base)) {
+            return false;
+        }
+
+        if (params.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) &&
+            params.model_dft != nullptr &&
+            llama_model_is_deepseek4(params.model_dft) &&
+            llama_model_n_nextn_layer(params.model_dft) != 1) {
+            LOG_ERR("%s: DeepSeek-V4 MTP draft requires exactly one NextN predictor layer, got %d.\n",
+                    __func__, llama_model_n_nextn_layer(params.model_dft));
             return false;
         }
     }
@@ -2443,8 +2461,7 @@ bool common_speculative_commit(
         const std::vector<llama_token> & ids,
         int n_draft,
         llama_pos pos_base,
-        const std::vector<int32_t> & accepted_output_indices,
-        bool no_bonus_token) {
+        const std::vector<int32_t> & accepted_output_indices) {
     GGML_ASSERT(spec != nullptr);
     GGML_ASSERT(!ids.empty());
 
@@ -2453,7 +2470,7 @@ bool common_speculative_commit(
         ? spec->curr_impl->type
         : COMMON_SPECULATIVE_TYPE_NONE;
 
-    const int n_accepted = no_bonus_token ? (int) ids.size() : (int) ids.size() - 1;
+    const int n_accepted = (int) ids.size() - 1;
     const bool any_rejected = n_accepted < n_draft;
     std::vector<float> mtp_hidden_state_pre;
 

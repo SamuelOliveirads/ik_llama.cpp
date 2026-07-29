@@ -4247,8 +4247,7 @@ void server_context::speculative_decoding_accept() {
             ids,
             n_draft,
             spec_pos_base,
-            accepted_output_indices,
-            false)) {
+            accepted_output_indices)) {
             LOG_ERROR("speculative checkpoint restore/commit failed, releasing slot", {
                 {"id_slot", slot.id},
                 {"id_task", slot.id_task},
@@ -4879,18 +4878,6 @@ void server_context::update_slots() {
                 remap[read] = write++;
             }
             batch.n_tokens = write;
-
-            // Remap all surviving slots after compacting the combined batch.
-            for (auto & other_slot : slots) {
-                if (other_slot.i_batch >= 0 && other_slot.i_batch < old_n_tokens) {
-                    other_slot.i_batch = remap[other_slot.i_batch];
-                }
-                for (int32_t & index : other_slot.i_batch_dft) {
-                    if (index >= 0 && index < old_n_tokens) {
-                        index = remap[index];
-                    }
-                }
-            }
 
             if (root_index >= 0 && root_index < old_n_tokens) {
                 slot.i_batch = remap[root_index];

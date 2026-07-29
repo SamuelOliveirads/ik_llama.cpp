@@ -185,41 +185,12 @@ struct llama_kv_cache {
         bool shadow_conv_only = false;
         bool saved     = false;
 
-        void release() {
-            for (struct ggml_context * ctx : dsv4_per_step_shadow_ctxs) {
-                ggml_free(ctx);
-            }
-            dsv4_per_step_shadow_ctxs.clear();
-            for (ggml_backend_buffer_t buf : dsv4_per_step_shadow_bufs) {
-                ggml_backend_buffer_free(buf);
-            }
-            dsv4_per_step_shadow_bufs.clear();
-            dsv4_per_step_state.clear();
-            dsv4_per_step_state_shadow.clear();
-            dsv4_per_step_delta.clear();
-            dsv4_per_step_csa_dst.clear();
-            dsv4_per_step_hca_dst.clear();
-            dsv4_per_step_lid_dst.clear();
-            dsv4_per_step_csa_src.clear();
-            dsv4_per_step_hca_src.clear();
-            dsv4_per_step_lid_src.clear();
-            dsv4_per_step_allocated = false;
-            dsv4_per_step_saved = false;
-            dsv4_per_step_max_tokens = 0;
-            dsv4_per_step_base_bytes = 0;
-            dsv4_per_step_delta_bytes = 0;
+        void release_dsv4_per_step();
+        void release_dsv4_snapshot();
 
-            for (struct ggml_context * ctx : dsv4_shadow_ctxs) {
-                ggml_free(ctx);
-            }
-            dsv4_shadow_ctxs.clear();
-            for (ggml_backend_buffer_t buf : dsv4_shadow_bufs) {
-                ggml_backend_buffer_free(buf);
-            }
-            dsv4_shadow_bufs.clear();
-            dsv4_state_shadow.clear();
-            dsv4_shadow_allocated = false;
-            dsv4_shadow_saved = false;
+        void release() {
+            release_dsv4_per_step();
+            release_dsv4_snapshot();
 
             for (struct ggml_context * ctx : shadow_ctxs) {
                 ggml_free(ctx);

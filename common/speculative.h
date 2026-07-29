@@ -194,8 +194,7 @@ bool common_speculative_commit(
         const std::vector<llama_token> & ids,
         int n_draft,
         llama_pos pos_base,
-        const std::vector<int32_t> & accepted_output_indices,
-        bool no_bonus_token = false);
+        const std::vector<int32_t> & accepted_output_indices);
 
 bool common_speculative_has_sequence_hidden(const common_speculative * spec, llama_seq_id seq_id);
 

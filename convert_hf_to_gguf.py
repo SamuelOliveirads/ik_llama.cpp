@@ -708,6 +708,7 @@ class Model:
             # ref: https://huggingface.co/deepseek-ai/DeepSeek-V3
             res = "deepseek-v3"
         if chkhsh == "b4b8ca1f9769494fbd956ebc4c249de6131fb277a4a3345a7a92c7dd7a55808d":
+            # ref: https://huggingface.co/ddh0/DeepSeek-V4-Flash-GGUF
             res = "joyai-llm"
         if chkhsh == "d5f1dd6f980fec569fb218a81a7658ac45fc56b38c5a0adeb1c232fbe04ef5ec":
             # ref: https://huggingface.co/ByteDance-Seed/Seed-Coder-8B-Base
@@ -4641,32 +4642,58 @@ class DeepseekV4Model(DeepseekV2Model):
     def _mtp_source_selection(self) -> tuple[set[str], list[str]]:
         index_name = "model.safetensors.index.json" if self.is_safetensors else "pytorch_model.bin.index.json"
         index_path = self.dir_model / index_name
-        if not index_path.is_file():
-            return set(), list(self.part_names)
+        def is_mtp_tensor(name: str) -> bool:
+            return (
+                name in {"embed.weight", "norm.weight", "head.weight", "head.scale"}
+                or name.startswith("mtp.0.")
+            )
 
-        with open(index_path, "r", encoding="utf-8") as f:
-            index: dict[str, Any] = json.load(f)
-        weight_map = index.get("weight_map")
-        if not isinstance(weight_map, dict):
-            raise ValueError(f"Can't load 'weight_map' from {index_name!r}")
+        if index_path.is_file():
+            with open(index_path, "r", encoding="utf-8") as f:
+                index: dict[str, Any] = json.load(f)
+            weight_map = index.get("weight_map")
+            if not isinstance(weight_map, dict):
+                raise ValueError(f"Can't load 'weight_map' from {index_name!r}")
 
-        selected = {
-            name for name in weight_map
-            if name in {"embed.weight", "norm.weight", "head.weight", "head.scale"}
-            or name.startswith("mtp.0.")
-        }
+            selected = {name for name in weight_map if is_mtp_tensor(name)}
+            parts = sorted({str(weight_map[name]) for name in selected})
+            missing_parts = [name for name in parts if not (self.dir_model / name).is_file()]
+            if missing_parts:
+                raise FileNotFoundError(
+                    "DeepSeek-V4 MTP conversion requires missing index-derived shard(s): "
+                    + ", ".join(missing_parts)
+                )
+        else:
+            selected = set()
+            parts = []
+            for part_name in self.part_names:
+                if self.is_safetensors:
+                    from safetensors import safe_open
+                    with safe_open(self.dir_model / part_name, framework="pt", device="cpu") as model_part:
+                        part_selected = {name for name in model_part.keys() if is_mtp_tensor(name)}
+                else:
+                    model_part = torch.load(
+                        str(self.dir_model / part_name),
+                        map_location="cpu",
+                        mmap=True,
+                        weights_only=True,
+                    )
+                    part_selected = {name for name in model_part if is_mtp_tensor(name)}
+
+                if part_selected:
+                    selected.update(part_selected)
+                    parts.append(part_name)
+
         required_roots = {"embed.weight", "norm.weight", "head.weight"}
         missing_roots = required_roots - selected
         if missing_roots:
-            raise ValueError(f"DeepSeek-V4 MTP index is missing root tensor(s): {sorted(missing_roots)}")
-
-        parts = sorted({str(weight_map[name]) for name in selected})
-        missing_parts = [name for name in parts if not (self.dir_model / name).is_file()]
-        if missing_parts:
-            raise FileNotFoundError(
-                "DeepSeek-V4 MTP conversion requires missing index-derived shard(s): "
-                + ", ".join(missing_parts)
+            source = index_name if index_path.is_file() else "model shards"
+            raise ValueError(
+                f"DeepSeek-V4 MTP conversion is missing root tensor(s) in {source}: {sorted(missing_roots)}"
             )
+        if not selected:
+            raise ValueError("DeepSeek-V4 MTP conversion found no standalone MTP tensors in the model shards")
+
         self._mtp_expected_scales = {
             self._map_mtp_source_name(name).removesuffix(".scale") + ".weight"
             for name in selected if name.endswith(".scale")
