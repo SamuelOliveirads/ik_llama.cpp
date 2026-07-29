@@ -54,6 +54,13 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"suffix",        COMMON_SPECULATIVE_TYPE_SUFFIX}
 };
 
+bool common_speculative_needs_checkpoint(const llama_model * model) {
+    return model != nullptr &&
+        (llama_model_has_recurrent(model) ||
+         llama_model_is_openpangu(model) ||
+         llama_model_is_deepseek4(model));
+}
+
 void common_speculative_checkpoint::clear() {
     valid = false;
     mode = LLAMA_SPEC_CKPT_NONE;
@@ -1338,10 +1345,7 @@ common_speculative * common_speculative_init(
     }
 
     const llama_model * target_model = llama_get_model(ctx_tgt);
-    const bool target_is_dsv4 = target_model != nullptr &&
-        std::strcmp(llama_model_arch_string(target_model), "deepseek4") == 0;
-    if (!configs.empty() && (llama_model_has_recurrent(target_model) ||
-                             llama_model_is_openpangu(target_model) || target_is_dsv4)) {
+    if (!configs.empty() && common_speculative_needs_checkpoint(target_model)) {
         const int ckpt_tokens = std::max(1, params.get_max_stage_n_max() + 1);
         const int actual_mode = llama_spec_ckpt_init(ctx_tgt, params.spec_ckpt_mode, ckpt_tokens);
         if (actual_mode == LLAMA_SPEC_CKPT_NONE) {
@@ -2037,7 +2041,8 @@ bool common_speculative_finalize_startup(
     params_base.has_mtp = params.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     const bool has_external_mtp = params_base.has_mtp && params.model_dft &&
         (llama_model_is_gemma4_mtp_assistant(params.model_dft) ||
-         llama_model_is_deepseek4_mtp_assistant(params.model_dft));
+         (llama_model_is_deepseek4(params.model_dft) &&
+          llama_model_n_nextn_layer(params.model_dft) == 1));
 
     params_base.has_mtp = common_speculative_prepare_mtp_runtime(
         params,
@@ -2382,6 +2387,7 @@ bool common_speculative_checkpoint_restore(
                 for (int j = 0; j < re_batch.n_tokens; ++j) {
                     re_batch.logits[j] = true;
                 }
+                llama_set_embeddings(ctx, true);
             }
 
             const int ret = llama_decode(ctx, re_batch);

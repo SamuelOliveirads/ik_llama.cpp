@@ -984,8 +984,7 @@ int main(int argc, char ** argv) {
 
                 const int min_usable_draft = params.speculative.get_min_usable_stage_n_min();
                 if ((int) draft.size() >= min_usable_draft && (!draft.empty() || n_predict_budget > 1)) {
-                    const bool target_is_dsv4 = std::strcmp(llama_model_arch_string(model), "deepseek4") == 0;
-                    if (llama_model_has_recurrent(model) || llama_model_is_openpangu(model) || target_is_dsv4) {
+                    if (common_speculative_needs_checkpoint(model)) {
                         if (!common_speculative_before_draft(
                             spec,
                             model,

@@ -7,6 +7,8 @@
 
 struct common_speculative;
 
+bool common_speculative_needs_checkpoint(const llama_model * model);
+
 enum common_speculative_init_status {
     COMMON_SPECULATIVE_INIT_SKIPPED,
     COMMON_SPECULATIVE_INIT_READY,

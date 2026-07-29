@@ -281,7 +281,7 @@ bool server_context::load_model(const gpt_params& params_) {
 void server_context::init() {
     const int32_t n_ctx_slot = n_ctx / params_base.n_parallel;
 
-    if (!system_prompt.empty() && std::strcmp(llama_model_arch_string(model), "deepseek4") == 0) {
+    if (!system_prompt.empty() && llama_model_is_deepseek4(model)) {
         throw std::runtime_error("DeepSeek4 server system prompts are unsupported because seq_cp does not copy private cache state");
     }
 
@@ -2081,7 +2081,7 @@ void server_context::system_prompt_update() {
 }
 
 bool server_context::system_prompt_set(const std::string& sys_prompt) {
-    if (!sys_prompt.empty() && model != nullptr && std::strcmp(llama_model_arch_string(model), "deepseek4") == 0) {
+    if (!sys_prompt.empty() && llama_model_is_deepseek4(model)) {
         LOG_ERROR("DeepSeek4 server system prompts are unsupported because seq_cp does not copy private cache state", {});
         return false;
     }
@@ -4842,8 +4842,7 @@ void server_context::update_slots() {
     // make sure we're in the right embedding mode
     llama_set_embeddings(ctx, batch_type == 1);
 
-    const bool target_is_dsv4 = std::strcmp(llama_model_arch_string(model), "deepseek4") == 0;
-    if (llama_model_has_recurrent(model) || llama_model_is_openpangu(model) || target_is_dsv4) {
+    if (common_speculative_needs_checkpoint(model)) {
         const int ckpt_mode = params_base.speculative.spec_ckpt_mode;
 
         // Remove draft rows if checkpoint setup fails, otherwise rejection is unsafe.

@@ -774,7 +774,6 @@ llama_context::~llama_context() {
     if (dflash.kv.cache_sched != nullptr) {
         ggml_backend_sched_free(dflash.kv.cache_sched);
     }
-    // Release checkpoint buffers while scheduler and backends are still alive.
     kv_self.ckpt.release();
     free_dflash_kv_cache_tensors();
     free_dsv4_cache_tensors();
@@ -6209,25 +6208,22 @@ static int llama_decode_internal(
                                                       lctx.model.arch == LLM_ARCH_GEMMA4_ASSISTANT ||
                                                       lctx.model.arch == LLM_ARCH_DEEPSEEK4);
             if (cparams.embeddings || has_mtp) {
-                // Prefer raw MTP output over a pooled output when both are present.
-                if (use_raw_mtp_embd) {
-                    for (int i = gf->n_nodes - 1; i >= 0; --i) {
-                        if (strcmp(gf->nodes[i]->name, "result_mtp_embd") == 0) {
-                            embd = gf->nodes[i];
-                            break;
-                        }
+                for (int i = gf->n_nodes - 1; i >= 0; --i) {
+                    if (use_raw_mtp_embd && strcmp(gf->nodes[i]->name, "result_mtp_embd") == 0) {
+                        // MTP recurrent state can be wider/different than the logits head hidden state.
+                        embd = gf->nodes[i];
+                        break;
                     }
-                }
-                if (!embd) {
-                    for (int i = gf->n_nodes - 1; i >= 0; --i) {
-                        if (strcmp(gf->nodes[i]->name, "result_embd_pooled") == 0) {
-                            embd = gf->nodes[i];
-                            break;
-                        }
-                        if (strcmp(gf->nodes[i]->name, "result_norm") == 0) {
-                            embd = gf->nodes[i];
-                            break;
-                        }
+                    if (strcmp(gf->nodes[i]->name, "result_embd_pooled") == 0) {
+                        embd = gf->nodes[i];
+                        break;
+                    }
+                    // Strictly speaking we should use if (!use_raw_mtp_embd && strcmp(gf->nodes[i]->name, "result_norm") == 0)
+                    // as Gemma4 MTP is supposed to be using embeddings before rms_norm.
+                    // I don't see any significant difference between this and what we had before, so not making the change (yet).
+                    if (strcmp(gf->nodes[i]->name, "result_norm") == 0) {
+                        embd = gf->nodes[i];
+                        break;
                     }
                 }
             }
@@ -6255,7 +6251,7 @@ static int llama_decode_internal(
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
         llama_graph_compute(lctx, gf, n_threads);
 
-        // Capture DSV4 deltas after queuing the normal FA/fused graph.
+        // Capture DSV4 state after target graph execution.
         if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 &&
             lctx.cparams.mtp_op_type == MTP_OP_NONE &&
             lctx.kv_self.ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_PER_STEP &&
@@ -6323,9 +6319,9 @@ static int llama_decode_internal(
                 float * logits_out = lctx.logits + n_outputs_prev*n_vocab;
                 const int32_t n_outputs_new = lctx.n_outputs;
 
-                        if (n_outputs_new) {
-                            GGML_ASSERT( n_outputs_prev + n_outputs_new <= n_outputs);
-                            GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_vocab <= (int64_t) lctx.logits_size);
+                    if (n_outputs_new) {
+                        GGML_ASSERT( n_outputs_prev + n_outputs_new <= n_outputs);
+                        GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_vocab <= (int64_t) lctx.logits_size);
 
                     if (res->ne[1] == n_tokens && n_outputs_new < n_tokens) {
                         int32_t i_out = 0;
@@ -6340,13 +6336,6 @@ static int llama_decode_internal(
                             ggml_backend_tensor_get_async(backend_res, res, logits_out, (n_tokens - 1)*n_vocab*sizeof(float), n_vocab*sizeof(float));
                         }
                         } else {
-                            if ((size_t) n_outputs_new*n_vocab*sizeof(float) > ggml_nbytes(res)) {
-                                LLAMA_LOG_ERROR("%s: logits read exceeds tensor '%s': ne=[%lld,%lld,%lld,%lld], nbytes=%zu, requested=%zu\n",
-                                        __func__, res->name, (long long) res->ne[0], (long long) res->ne[1],
-                                        (long long) res->ne[2], (long long) res->ne[3], ggml_nbytes(res),
-                                        (size_t) n_outputs_new*n_vocab*sizeof(float));
-                                return GGML_STATUS_FAILED;
-                            }
                             ggml_backend_tensor_get_async(backend_res, res, logits_out, 0, n_outputs_new*n_vocab*sizeof(float));
                         }
                 }
@@ -6377,14 +6366,6 @@ static int llama_decode_internal(
                         if (n_outputs_new_embd) {
                             GGML_ASSERT( n_outputs_prev_embd + n_outputs_new_embd <= n_outputs_embd);
                             GGML_ASSERT((n_outputs_prev_embd + n_outputs_new_embd)*n_embd_output <= (int64_t) lctx.embd_size);
-                            if ((size_t) n_outputs_new_embd*n_embd_output*sizeof(float) > ggml_nbytes(embd)) {
-                                LLAMA_LOG_ERROR("%s: embedding read exceeds tensor '%s': ne=[%lld,%lld,%lld,%lld], nbytes=%zu, requested=%zu, width=%u, rows=%d\n",
-                                        __func__, embd->name, (long long) embd->ne[0], (long long) embd->ne[1],
-                                        (long long) embd->ne[2], (long long) embd->ne[3], ggml_nbytes(embd),
-                                        (size_t) n_outputs_new_embd*n_embd_output*sizeof(float), n_embd_output,
-                                        n_outputs_new_embd);
-                                return GGML_STATUS_FAILED;
-                            }
                             ggml_backend_tensor_get_async(backend_embd, embd, embd_out, 0, n_outputs_new_embd*n_embd_output*sizeof(float));
                         }
                     } break;
@@ -9023,45 +9004,26 @@ int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
         return kv.ckpt.selected_spec_mode;
     }
 
-    // DSV4 AUTO may fall back to GPU/CPU snapshots, explicit modes do not.
-    if (is_dsv4) {
-        int resolved = mode;
-        if (resolved == LLAMA_SPEC_CKPT_AUTO) {
-            resolved = LLAMA_SPEC_CKPT_PER_STEP;
-        }
-
-        if (resolved == LLAMA_SPEC_CKPT_PER_STEP && !llama_dsv4_spec_ckpt_prepare(ctx, resolved, max_tokens)) {
-            if (mode == LLAMA_SPEC_CKPT_PER_STEP) {
-                LLAMA_LOG_ERROR("%s: failed to prepare DSV4 per-step checkpoint storage for max_tokens=%d\n",
-                        __func__, max_tokens);
-                return (int)LLAMA_SPEC_CKPT_NONE;
-            }
-            LLAMA_LOG_WARN("%s: auto DSV4 per-step storage unavailable; falling back to gpu-fallback\n", __func__);
-            resolved = LLAMA_SPEC_CKPT_GPU_FALLBACK;
-        }
-        if (resolved == LLAMA_SPEC_CKPT_GPU_FALLBACK && !llama_dsv4_spec_ckpt_prepare(ctx, resolved, max_tokens)) {
-            if (mode == LLAMA_SPEC_CKPT_GPU_FALLBACK) {
-                LLAMA_LOG_ERROR("%s: failed to prepare DSV4 gpu-fallback checkpoint storage\n", __func__);
-                return (int)LLAMA_SPEC_CKPT_NONE;
-            }
-            LLAMA_LOG_WARN("%s: auto DSV4 GPU checkpoint unavailable; falling back to cpu\n", __func__);
-            resolved = LLAMA_SPEC_CKPT_CPU;
-        }
-        if (resolved != LLAMA_SPEC_CKPT_PER_STEP && resolved != LLAMA_SPEC_CKPT_GPU_FALLBACK && resolved != LLAMA_SPEC_CKPT_CPU) {
-            LLAMA_LOG_ERROR("%s: unsupported DSV4 checkpoint mode %d\n", __func__, resolved);
-            return (int)LLAMA_SPEC_CKPT_NONE;
-        }
-
-        kv.ckpt.fixed_spec_mode = resolved;
-        kv.ckpt.fixed_max_tokens = resolved == LLAMA_SPEC_CKPT_PER_STEP ? max_tokens : 0;
-        kv.ckpt.selected_spec_mode = resolved;
-        LLAMA_LOG_INFO("%s: fixed DSV4 checkpoint mode = %s\n",
-                __func__, llama_spec_ckpt_mode_name(resolved));
-        return resolved;
+    if (is_dsv4 && mode != LLAMA_SPEC_CKPT_AUTO &&
+        mode != LLAMA_SPEC_CKPT_PER_STEP && mode != LLAMA_SPEC_CKPT_GPU_FALLBACK &&
+        mode != LLAMA_SPEC_CKPT_CPU) {
+        LLAMA_LOG_ERROR("%s: unsupported DSV4 checkpoint mode %d\n", __func__, mode);
+        return (int)LLAMA_SPEC_CKPT_NONE;
     }
 
     int requested = mode;
     int resolved = LLAMA_SPEC_CKPT_NONE;
+
+    const auto prepare_per_step = [&]() {
+        return is_dsv4
+            ? llama_dsv4_spec_ckpt_prepare(ctx, LLAMA_SPEC_CKPT_PER_STEP, max_tokens)
+            : spec_ckpt_try_per_step(kv, ctx->model, max_tokens);
+    };
+    const auto prepare_gpu_fallback = [&]() {
+        return is_dsv4
+            ? llama_dsv4_spec_ckpt_prepare(ctx, LLAMA_SPEC_CKPT_GPU_FALLBACK, max_tokens)
+            : kv.checkpoint_alloc_shadows();
+    };
 
     // prefer PER_STEP → GPU_FALLBACK → CPU
     if (requested == LLAMA_SPEC_CKPT_AUTO) {
@@ -9069,7 +9031,7 @@ int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
     }
 
     if (requested == LLAMA_SPEC_CKPT_PER_STEP) {
-        if (spec_ckpt_try_per_step(kv, ctx->model, max_tokens)) {
+        if (prepare_per_step()) {
             resolved = LLAMA_SPEC_CKPT_PER_STEP;
         } else if (mode == LLAMA_SPEC_CKPT_PER_STEP) {
             LLAMA_LOG_ERROR("%s: failed to preallocate per-step checkpoint buffers for max_tokens=%d; --spec-ckpt-mode=%s requires startup allocation\n",
@@ -9083,7 +9045,7 @@ int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
     }
 
     if (resolved == LLAMA_SPEC_CKPT_NONE && requested == LLAMA_SPEC_CKPT_GPU_FALLBACK) {
-        if (kv.checkpoint_alloc_shadows()) {
+        if (prepare_gpu_fallback()) {
             resolved = LLAMA_SPEC_CKPT_GPU_FALLBACK;
         } else if (mode == LLAMA_SPEC_CKPT_GPU_FALLBACK) {
             LLAMA_LOG_ERROR("%s: failed to preallocate gpu-fallback checkpoint shadows at startup; --spec-ckpt-mode=%s requires startup allocation\n",
@@ -9100,7 +9062,7 @@ int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
         resolved = LLAMA_SPEC_CKPT_CPU;
     }
 
-    if (resolved == LLAMA_SPEC_CKPT_CPU) {
+    if (resolved == LLAMA_SPEC_CKPT_CPU && !is_dsv4) {
         const size_t cpu_reserve = llama_spec_ckpt_cpu_state_reserve(ctx, 0);
         kv.ckpt.cpu_state_data.clear();
         kv.ckpt.cpu_state_data.reserve(cpu_reserve);
@@ -9112,8 +9074,8 @@ int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
     kv.ckpt.fixed_max_tokens = resolved == LLAMA_SPEC_CKPT_PER_STEP ? max_tokens : 0;
     kv.ckpt.selected_spec_mode = resolved;
 
-    LLAMA_LOG_INFO("%s: fixed recurrent checkpoint mode = %s%s\n",
-            __func__, llama_spec_ckpt_mode_name(resolved),
+    LLAMA_LOG_INFO("%s: fixed %s checkpoint mode = %s%s\n",
+            __func__, is_dsv4 ? "DSV4" : "recurrent", llama_spec_ckpt_mode_name(resolved),
             resolved == LLAMA_SPEC_CKPT_PER_STEP ? (std::string(" (max_tokens=") + std::to_string(max_tokens) + ")").c_str() : "");
 
     return resolved;

@@ -2176,18 +2176,16 @@ bool llama_model_has_recurrent(const llama_model * model) {
     return llm_arch_is_hybrid(model->arch) || llm_arch_is_recurrent(model->arch);
 }
 
+bool llama_model_is_deepseek4(const llama_model * model) {
+    return model && model->arch == LLM_ARCH_DEEPSEEK4;
+}
+
 bool llama_model_is_openpangu(const llama_model * model) {
     return model && model->arch == LLM_ARCH_OPENPANGU;
 }
 
 bool llama_model_is_gemma4_mtp_assistant(const llama_model * model) {
     return model && (model->arch == LLM_ARCH_GEMMA4_MTP || model->arch == LLM_ARCH_GEMMA4_ASSISTANT);
-}
-
-bool llama_model_is_deepseek4_mtp_assistant(const llama_model * model) {
-    return model && model->arch == LLM_ARCH_DEEPSEEK4 &&
-        model->hparams.nextn_predict_layers == 1 &&
-        model->hparams.n_embd_out > model->hparams.n_embd;
 }
 
 bool llama_is_gemma4_mtp_file(const char * path) {
