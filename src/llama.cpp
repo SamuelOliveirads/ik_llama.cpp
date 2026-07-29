@@ -6208,22 +6208,25 @@ static int llama_decode_internal(
                                                       lctx.model.arch == LLM_ARCH_GEMMA4_ASSISTANT ||
                                                       lctx.model.arch == LLM_ARCH_DEEPSEEK4);
             if (cparams.embeddings || has_mtp) {
-                for (int i = gf->n_nodes - 1; i >= 0; --i) {
-                    if (use_raw_mtp_embd && strcmp(gf->nodes[i]->name, "result_mtp_embd") == 0) {
-                        // MTP recurrent state can be wider/different than the logits head hidden state.
-                        embd = gf->nodes[i];
-                        break;
+                // Prefer raw MTP output over a pooled output when both are present.
+                if (use_raw_mtp_embd) {
+                    for (int i = gf->n_nodes - 1; i >= 0; --i) {
+                        if (strcmp(gf->nodes[i]->name, "result_mtp_embd") == 0) {
+                            embd = gf->nodes[i];
+                            break;
+                        }
                     }
-                    if (strcmp(gf->nodes[i]->name, "result_embd_pooled") == 0) {
-                        embd = gf->nodes[i];
-                        break;
-                    }
-                    // Strictly speaking we should use if (!use_raw_mtp_embd && strcmp(gf->nodes[i]->name, "result_norm") == 0)
-                    // as Gemma4 MTP is supposed to be using embeddings before rms_norm.
-                    // I don't see any significant difference between this and what we had before, so not making the change (yet).
-                    if (strcmp(gf->nodes[i]->name, "result_norm") == 0) {
-                        embd = gf->nodes[i];
-                        break;
+                }
+                if (!embd) {
+                    for (int i = gf->n_nodes - 1; i >= 0; --i) {
+                        if (strcmp(gf->nodes[i]->name, "result_embd_pooled") == 0) {
+                            embd = gf->nodes[i];
+                            break;
+                        }
+                        if (strcmp(gf->nodes[i]->name, "result_norm") == 0) {
+                            embd = gf->nodes[i];
+                            break;
+                        }
                     }
                 }
             }
