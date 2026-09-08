@@ -38,7 +38,8 @@ options:
   -nkvo, --no-kv-offload <0|1>        (default: 0)
   -fa, --flash-attn <0|1>             (default: 0)
   -mmp, --mmap <0|1>                  (default: 1)
-  --numa <distribute|isolate|numactl> (default: disabled)
+  --numa <distribute|isolate|numactl|mirror> (default: disabled)
+  --mirror-kv                         mirror eligible CPU K/V cache buffers when --numa mirror is active
   -embd, --embeddings <0|1>           (default: 0)
   -ts, --tensor-split <ts0/ts1/..>    (default: 0)
   -r, --repetitions <n>               (default: 5)

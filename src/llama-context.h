@@ -148,6 +148,18 @@ struct llama_kv_cache {
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
 
+    struct numa_mirror_allocation {
+        void * data = nullptr;
+        size_t size = 0;
+        int node = -1;
+    };
+    std::vector<struct numa_mirror_allocation> numa_mirror_allocations;
+    std::vector<struct ggml_tensor *> numa_mirror_tensors;
+    bool numa_mirror_ready = false;
+
+    void clear_numa_mirror();
+    void release_numa_mirror();
+
     size_t total_size() const {
         size_t size = 0;
         for (ggml_backend_buffer_t buf : bufs) {
@@ -587,6 +599,17 @@ struct llama_context {
 
             struct ggml_context * cache_ctx = nullptr;
             std::vector<ggml_backend_buffer_t> cache_bufs;
+            // NUMA mirror ownership for DSV4's separate cache context. These
+            // are intentionally kept with the specialized storage so they
+            // are released before cache_bufs/cache_ctx.
+            struct numa_mirror_allocation {
+                void * data = nullptr;
+                size_t size = 0;
+                int node = -1;
+            };
+            std::vector<numa_mirror_allocation> numa_mirror_allocations;
+            std::vector<struct ggml_tensor *> numa_mirror_tensors;
+            bool numa_mirror_ready = false;
             uint32_t n_stream = 1;
         };
 

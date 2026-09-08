@@ -53,6 +53,7 @@ struct llama_cparams {
     int  min_experts;
     float thresh_experts;
     bool mtp;
+    bool numa_mirror_kv = false;
     int  worst_graph_tokens;
 
     enum ggml_type reduce_type;

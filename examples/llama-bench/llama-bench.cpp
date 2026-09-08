@@ -257,6 +257,7 @@ struct cmd_params {
     std::vector<bool> embeddings;
     std::vector<llama_model_tensor_buft_override> buft_overrides;
     ggml_numa_strategy numa;
+    bool mirror_kv = false;
     std::string cuda_params;
     int reps;
     bool verbose;
@@ -306,6 +307,7 @@ static const cmd_params cmd_params_defaults = {
     /* embeddings           */ {false},
     /* buft_overrides       */ {},
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
+    /* mirror_kv            */ false,
     /* cuda_params          */ {},
     /* reps                 */ 5,
     /* verbose              */ false,
@@ -358,6 +360,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -gr, --graph-reuse <0|1>            (default: %s)\n", join(cmd_params_defaults.reuse, ",").c_str());
     printf("  -mmp, --mmap <0|1>                  (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
     printf("  --numa <distribute|isolate|numactl|mirror> (default: disabled)\n");
+    printf("  --mirror-kv                         mirror eligible CPU K/V cache buffers when --numa mirror is active\n");
     printf("  -embd, --embeddings <0|1>           (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>    (default: 0)\n");
     printf("  -r, --repetitions <n>               (default: %d)\n", cmd_params_defaults.reps);
@@ -696,6 +699,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 else if (value == "mirror")                     { params.numa = GGML_NUMA_STRATEGY_MIRROR; }
                 else { invalid_param = true; break; }
             }
+        } else if (arg == "--mirror-kv") {
+            params.mirror_kv = true;
         } else if (arg == "-fa" || arg == "--flash-attn") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -994,6 +999,7 @@ struct cmd_params_instance {
     bool fit = false;
     int  fit_margin = 0;
     const llama_model_tensor_buft_override* buft_overrides;
+    bool mirror_kv = false;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1064,6 +1070,7 @@ struct cmd_params_instance {
         cparams.embeddings = embeddings;
         cparams.cuda_params = (void *)cuda_params.data();
         cparams.scheduler_async = sas;
+        cparams.numa_mirror_kv = mirror_kv;
 
         return cparams;
     }
@@ -1136,6 +1143,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .git_margin   = */ params.fit_margin,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
             };
+            instance.mirror_kv = params.mirror_kv;
             instances.push_back(instance);
         }
 
@@ -1183,6 +1191,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .git_margin   = */ params.fit_margin,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
             };
+            instance.mirror_kv = params.mirror_kv;
             instances.push_back(instance);
         }
 
@@ -1230,6 +1239,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .git_margin   = */ params.fit_margin,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
             };
+            instance.mirror_kv = params.mirror_kv;
             instances.push_back(instance);
         }
 
@@ -1277,6 +1287,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .git_margin   = */ params.fit_margin,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
             };
+            instance.mirror_kv = params.mirror_kv;
             instances.push_back(instance);
         }
     }

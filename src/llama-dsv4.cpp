@@ -899,6 +899,7 @@ bool llama_context::ensure_dsv4_cache_tensors() {
         return true;
     }
 
+    llama_dsv4_release_numa_mirror(this);
     free_dsv4_cache_tensors();
 
     ggml_init_params params = {
@@ -972,6 +973,10 @@ bool llama_context::ensure_dsv4_cache_tensors() {
                 free_dsv4_cache_tensors();
                 return false;
             }
+        } else if (ratio != 0) {
+            LLAMA_LOG_ERROR("%s: unsupported DSV4 compression ratio %u at layer %d\n", __func__, ratio, il);
+            free_dsv4_cache_tensors();
+            return false;
         }
     }
 
@@ -1032,6 +1037,44 @@ void llama_context::free_dsv4_cache_tensors() {
     }
 }
 
+void llama_dsv4_clear_numa_mirror(llama_context * ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+    for (const auto & allocation : ctx->dsv4.cache.numa_mirror_allocations) {
+        if (allocation.data != nullptr && allocation.size > 0 && allocation.node >= 0) {
+            memset(allocation.data, 0, allocation.size);
+        }
+    }
+}
+
+void llama_dsv4_release_numa_mirror(llama_context * ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+    auto & cache = ctx->dsv4.cache;
+    for (ggml_tensor * tensor : cache.numa_mirror_tensors) {
+        ggml_numa_tensor_clear_mirror(tensor);
+    }
+    for (const auto & allocation : cache.numa_mirror_allocations) {
+        if (allocation.data != nullptr && allocation.size > 0 && allocation.node >= 0) {
+            ggml_numa_free(allocation.data, allocation.size, allocation.node);
+        }
+    }
+    cache.numa_mirror_tensors.clear();
+    cache.numa_mirror_allocations.clear();
+    cache.numa_mirror_ready = false;
+}
+
+void llama_dsv4_sync_numa_mirror(llama_context * ctx) {
+    if (ctx == nullptr || !ctx->dsv4.cache.numa_mirror_ready) {
+        return;
+    }
+    for (ggml_tensor * tensor : ctx->dsv4.cache.numa_mirror_tensors) {
+        ggml_numa_tensor_replicate(tensor);
+    }
+}
+
 void llama_reset_dsv4_state(llama_context * ctx, int32_t seq_id) {
     if (ctx == nullptr) {
         return;
@@ -1047,6 +1090,7 @@ void llama_reset_dsv4_state(llama_context * ctx, int32_t seq_id) {
         for (ggml_backend_buffer_t buf : ctx->dsv4.cache.cache_bufs) {
             ggml_backend_buffer_clear(buf, 0);
         }
+        llama_dsv4_clear_numa_mirror(ctx);
         return;
     }
 
@@ -1073,6 +1117,11 @@ void llama_reset_dsv4_state(llama_context * ctx, int32_t seq_id) {
     for (ggml_tensor * tensor : ctx->dsv4.cache.hca_state_score) clear_tensor(tensor);
     for (ggml_tensor * tensor : ctx->dsv4.cache.lid_state_kv) clear_tensor(tensor);
     for (ggml_tensor * tensor : ctx->dsv4.cache.lid_state_score) clear_tensor(tensor);
+
+    // Stream-scoped reset writes the primary buffers through the backend.
+    // Publish the resulting state to every attached replica before another
+    // worker can consume the stream.
+    llama_dsv4_sync_numa_mirror(ctx);
 }
 
 static std::vector<ggml_tensor *> dsv4_state_tensors(const llama_context & ctx) {
@@ -1402,6 +1451,8 @@ static bool dsv4_spec_ckpt_copy_gpu(
         return false;
     }
 
+    const bool sync_for_mirror = restore && ctx.dsv4.cache.numa_mirror_ready;
+
     for (size_t i = 0; i < tensors.size(); ++i) {
         ggml_tensor * tensor = tensors[i];
         ggml_tensor * shadow = ckpt.dsv4_state_shadow[i];
@@ -1417,6 +1468,17 @@ static bool dsv4_spec_ckpt_copy_gpu(
             ggml_backend_tensor_copy_async(backend, backend, shadow, tensor);
         } else {
             ggml_backend_tensor_copy_async(backend, backend, tensor, shadow);
+        }
+    }
+    if (sync_for_mirror) {
+        // The caller may immediately republish NUMA mirrors on a restore
+        // failure path. Complete each backend once, rather than once per
+        // state tensor. Save and device-only restore paths retain async
+        // behavior.
+        for (ggml_backend_t backend : ctx.backends) {
+            if (backend != nullptr) {
+                ggml_backend_synchronize(backend);
+            }
         }
     }
     return true;
@@ -1555,6 +1617,14 @@ enum llama_spec_ckpt_restore_result llama_dsv4_spec_ckpt_restore(llama_context *
     if (ctx == nullptr || ctx->model.arch != LLM_ARCH_DEEPSEEK4) {
         return LLAMA_SPEC_CKPT_RESTORE_FAILED;
     }
+
+    // Every restore branch may write the primary specialized cache before a
+    // later validation or backend operation fails.  Republish on all exits so
+    // an aborted speculative path can never leave a stale NUMA replica.
+    struct scoped_mirror_sync {
+        llama_context * ctx;
+        ~scoped_mirror_sync() { llama_dsv4_sync_numa_mirror(ctx); }
+    } mirror_sync { ctx };
 
     auto & ckpt = ctx->kv_self.ckpt;
     if (ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_PER_STEP) {

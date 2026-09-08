@@ -871,7 +871,9 @@ llama_context::~llama_context() {
         ggml_backend_sched_free(dflash.kv.cache_sched);
     }
     kv_self.ckpt.release();
+    kv_self.release_numa_mirror();
     free_dflash_kv_cache_tensors();
+    llama_dsv4_release_numa_mirror(this);
     free_dsv4_cache_tensors();
     ggml_backend_sched_free(sched);
 
@@ -1167,6 +1169,725 @@ static bool llama_mtp_tail_uses_layer_cache(const llama_model & model) {
         (model.arch == LLM_ARCH_GLM_DSA ||
          model.arch == LLM_ARCH_QWEN35MOE ||
          model.arch == LLM_ARCH_STEP35);
+}
+
+void llama_kv_cache::clear_numa_mirror() {
+    for (const auto & allocation : numa_mirror_allocations) {
+        if (allocation.data != nullptr && allocation.size > 0 && allocation.node >= 0) {
+            memset(allocation.data, 0, allocation.size);
+        }
+    }
+}
+
+void llama_kv_cache::release_numa_mirror() {
+    for (ggml_tensor * tensor : numa_mirror_tensors) {
+        ggml_numa_tensor_clear_mirror(tensor);
+    }
+    for (const auto & allocation : numa_mirror_allocations) {
+        ggml_numa_free(allocation.data, allocation.size, allocation.node);
+    }
+    numa_mirror_tensors.clear();
+    numa_mirror_allocations.clear();
+    numa_mirror_ready = false;
+}
+
+static void llama_kv_cache_sync_numa_mirror(llama_kv_cache &cache) {
+  if (!cache.numa_mirror_ready) {
+    return;
+  }
+  for (ggml_tensor *tensor : cache.k_l) {
+    ggml_numa_tensor_replicate(tensor);
+  }
+  for (ggml_tensor *tensor : cache.v_l) {
+    ggml_numa_tensor_replicate(tensor);
+  }
+}
+
+struct llama_kv_cache_mirror_sync_guard {
+  llama_kv_cache &cache;
+  llama_context * ctx = nullptr;
+
+  ~llama_kv_cache_mirror_sync_guard() {
+    llama_kv_cache_sync_numa_mirror(cache);
+    if (ctx != nullptr) {
+      llama_dsv4_sync_numa_mirror(ctx);
+    }
+  }
+};
+
+static bool llama_kv_cache_init_numa_mirror(llama_context & lctx) {
+  llama_kv_cache &cache = lctx.kv_self;
+  const llama_model &model = lctx.model;
+  if (!lctx.cparams.numa_mirror_kv) {
+    return true;
+  }
+  enum class kv_mirror_status { active, inactive, rejected };
+  enum class kv_mirror_topology { standard, qwen35moe, qwen4exp, dsv4 };
+  enum class kv_mirror_buffer_class { invalid, host, device, mixed };
+  struct kv_mirror_capability {
+    kv_mirror_status status = kv_mirror_status::rejected;
+    kv_mirror_topology topology = kv_mirror_topology::standard;
+    kv_mirror_buffer_class buffers = kv_mirror_buffer_class::invalid;
+    const char * reason = "unclassified cache layout";
+    bool warning = false;
+    size_t n_active_layers = 0;
+    std::vector<ggml_backend_buffer_t> realized_buffers;
+  };
+
+  auto classify_kv_mirror = [&]() -> kv_mirror_capability {
+    kv_mirror_capability result;
+    const bool is_dsv4 = model.arch == LLM_ARCH_DEEPSEEK4;
+    result.topology = is_dsv4 ? kv_mirror_topology::dsv4 :
+        model.arch == LLM_ARCH_QWEN35MOE ? kv_mirror_topology::qwen35moe :
+        model.arch == LLM_ARCH_QWEN4EXP ? kv_mirror_topology::qwen4exp :
+        kv_mirror_topology::standard;
+    auto inactive = [&](const char * reason, bool warning = false) {
+      result.status = kv_mirror_status::inactive;
+      result.reason = reason;
+      result.warning = warning;
+      return result;
+    };
+    auto rejected = [&](const char * reason) {
+      result.status = kv_mirror_status::rejected;
+      result.reason = reason;
+      return result;
+    };
+
+    try {
+      if (!ggml_numa_mirror_active()) {
+        return inactive("NUMA weight mirror is not active");
+      }
+      if (model.mtp || lctx.cparams.mtp_op_type != MTP_OP_NONE || lctx.cparams.mtp) {
+        return inactive("MTP cache mirroring is unsupported");
+      }
+      if (is_dsv4 && !lctx.ensure_dsv4_cache_tensors()) {
+        return rejected("failed to materialize DSV4 cache before admission");
+      }
+
+      bool invalid_buffer = false;
+      auto add_buffer = [&](ggml_backend_buffer_t buffer) {
+        if (!buffer || ggml_backend_buffer_get_size(buffer) == 0 ||
+            !ggml_backend_buffer_get_base(buffer)) {
+          invalid_buffer = true;
+          return;
+        }
+        if (std::find(result.realized_buffers.begin(), result.realized_buffers.end(), buffer) ==
+            result.realized_buffers.end()) {
+          result.realized_buffers.push_back(buffer);
+        }
+      };
+      for (ggml_backend_buffer_t buffer : cache.bufs) {
+        add_buffer(buffer);
+      }
+      if (is_dsv4) {
+        for (ggml_backend_buffer_t buffer : lctx.dsv4.cache.cache_bufs) {
+          add_buffer(buffer);
+        }
+      }
+      if (result.realized_buffers.empty() || invalid_buffer) {
+        return rejected("cache has null, empty, or unrealized buffers");
+      }
+
+      bool has_host = false;
+      bool has_device = false;
+      bool unsupported_host_type = false;
+      for (ggml_backend_buffer_t buffer : result.realized_buffers) {
+        const bool host = ggml_backend_buffer_is_host(buffer);
+        has_host |= host;
+        has_device |= !host;
+        if (is_dsv4) {
+          const bool cpu_type = ggml_backend_buffer_get_type(buffer) == ggml_backend_cpu_buffer_type();
+          if (host != cpu_type) {
+            return rejected("DSV4 cache buffer has unsupported ownership");
+          }
+        } else if (host && ggml_backend_buffer_get_type(buffer) != ggml_backend_cpu_buffer_type()) {
+          unsupported_host_type = true;
+        }
+      }
+      if (has_host && has_device) {
+        return rejected("cache buffers have mixed host and device ownership");
+      }
+      result.buffers = has_host ? kv_mirror_buffer_class::host : kv_mirror_buffer_class::device;
+
+      auto validate_context = [&](ggml_context * context) {
+        if (!context) {
+          return true;
+        }
+        for (ggml_tensor * tensor = ggml_get_first_tensor(context); tensor;
+             tensor = ggml_get_next_tensor(context, tensor)) {
+          if (!tensor->buffer || !tensor->data ||
+              std::find(result.realized_buffers.begin(), result.realized_buffers.end(), tensor->buffer) ==
+                  result.realized_buffers.end()) {
+            return false;
+          }
+          if (result.buffers == kv_mirror_buffer_class::device) {
+            continue;
+          }
+          const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(tensor->buffer);
+          const uintptr_t data = (uintptr_t) tensor->data;
+          const size_t buffer_size = ggml_backend_buffer_get_size(tensor->buffer);
+          if (data < base || data - base > buffer_size) {
+            return false;
+          }
+          const size_t offset = (size_t) (data - base);
+          if (ggml_backend_buffer_get_alloc_size(tensor->buffer, tensor) > buffer_size - offset) {
+            return false;
+          }
+        }
+        return true;
+      };
+      for (ggml_context * context : cache.ctxs) {
+        if (!validate_context(context)) {
+          return rejected("cache tensor is outside its realized buffer inventory");
+        }
+      }
+      if (is_dsv4 && !validate_context(lctx.dsv4.cache.cache_ctx)) {
+        return rejected("DSV4 tensor is outside its realized buffer inventory");
+      }
+      if (unsupported_host_type) {
+        return inactive("CPU cache buffer type is unsupported for KV mirroring", true);
+      }
+      if (result.buffers == kv_mirror_buffer_class::device) {
+        result.reason = "all cache buffers are device-resident";
+        result.status = kv_mirror_status::inactive;
+        return result;
+      }
+    } catch (const std::exception &) {
+      return rejected("exception while classifying cache");
+    } catch (...) {
+      return rejected("unknown exception while classifying cache");
+    }
+    if (ggml_numa_node_count() < 2) {
+      return rejected("NUMA mirror requires at least two nodes");
+    }
+
+    if (is_dsv4) {
+      if (model.mtp || model.hparams.nextn_predict_layers >= model.hparams.n_layer ||
+          cache.k_l.size() != model.hparams.n_layer || !cache.v_l.empty() ||
+          cache.s_l.size() != model.hparams.n_layer || !cache.kr_l.empty() ||
+          !cache.kp_l.empty() || !cache.replicated_k_l.empty()) {
+        return rejected("DSV4 cache topology is incomplete");
+      }
+      const size_t layers = model.hparams.n_layer;
+      result.n_active_layers = layers;
+      if (layers > model.hparams.dsv4_compress_ratios.size() ||
+          lctx.dsv4.cache.csa_k.size() != layers || lctx.dsv4.cache.hca_k.size() != layers ||
+          lctx.dsv4.cache.lid_k.size() != layers || lctx.dsv4.cache.csa_state_kv.size() != layers ||
+          lctx.dsv4.cache.csa_state_score.size() != layers || lctx.dsv4.cache.hca_state_kv.size() != layers ||
+          lctx.dsv4.cache.hca_state_score.size() != layers || lctx.dsv4.cache.lid_state_kv.size() != layers ||
+          lctx.dsv4.cache.lid_state_score.size() != layers) {
+        return rejected("DSV4 specialized cache topology is incomplete");
+      }
+      for (size_t il = 0; il < layers; ++il) {
+        const uint32_t ratio = model.hparams.dsv4_compress_ratios[il];
+        if (ratio != 0 && ratio != llama_context::dsv4_runtime::CSA_RATIO &&
+            ratio != llama_context::dsv4_runtime::HCA_RATIO) {
+          return rejected("DSV4 compression topology is unsupported");
+        }
+        const bool csa = ratio == llama_context::dsv4_runtime::CSA_RATIO;
+        const bool hca = ratio == llama_context::dsv4_runtime::HCA_RATIO;
+        if ((lctx.dsv4.cache.csa_k[il] != nullptr) != csa ||
+            (lctx.dsv4.cache.lid_k[il] != nullptr) != csa ||
+            (lctx.dsv4.cache.csa_state_kv[il] != nullptr) != csa ||
+            (lctx.dsv4.cache.csa_state_score[il] != nullptr) != csa ||
+            (lctx.dsv4.cache.lid_state_kv[il] != nullptr) != csa ||
+            (lctx.dsv4.cache.lid_state_score[il] != nullptr) != csa ||
+            (lctx.dsv4.cache.hca_k[il] != nullptr) != hca ||
+            (lctx.dsv4.cache.hca_state_kv[il] != nullptr) != hca ||
+            (lctx.dsv4.cache.hca_state_score[il] != nullptr) != hca) {
+          return rejected("DSV4 compression topology does not match metadata");
+        }
+        if (!cache.k_l[il] || cache.s_l[il]) {
+          return rejected("DSV4 raw K topology is malformed");
+        }
+      }
+      result.status = kv_mirror_status::active;
+      return result;
+    }
+
+    bool has_state = false;
+    for (ggml_tensor * tensor : cache.s_l) has_state |= tensor != nullptr;
+    bool has_indexer = false;
+    for (ggml_tensor * tensor : cache.kr_l) has_indexer |= tensor != nullptr;
+    for (ggml_tensor * tensor : cache.kp_l) has_indexer |= tensor != nullptr;
+    const bool qwen35moe = result.topology == kv_mirror_topology::qwen35moe;
+    const bool qwen4exp = result.topology == kv_mirror_topology::qwen4exp;
+    if (cache.recurrent || model.is_mla_model() || (!qwen4exp && has_indexer) ||
+        !cache.replicated_k_l.empty()) {
+      return inactive("CPU cache architecture is unsupported for KV mirroring", true);
+    }
+    if (model.hparams.nextn_predict_layers >= model.hparams.n_layer) {
+      return inactive("CPU cache architecture is unsupported for KV mirroring", true);
+    }
+    result.n_active_layers = model.hparams.n_layer - model.hparams.nextn_predict_layers;
+    if (result.n_active_layers == 0 || cache.k_l.size() != result.n_active_layers ||
+        cache.v_l.size() != result.n_active_layers || cache.s_l.size() != result.n_active_layers ||
+        (qwen4exp && (cache.kr_l.size() != result.n_active_layers ||
+                      cache.kp_l.size() != result.n_active_layers))) {
+      return rejected("CPU cache tensor arrays are incomplete");
+    }
+    if (cache.hybrid && !qwen35moe && !qwen4exp) {
+      return inactive("CPU cache architecture is unsupported for KV mirroring", true);
+    }
+    bool has_recurrent_layer = false;
+    bool has_attention_layer = false;
+    bool has_mirrorable_pair = false;
+    for (size_t il = 0; il < result.n_active_layers; ++il) {
+      ggml_tensor * k = cache.k_l[il];
+      ggml_tensor * v = cache.v_l[il];
+      ggml_tensor * s = cache.s_l[il];
+      if (qwen35moe || qwen4exp) {
+        const bool recurrent = model.hparams.is_recurrent((uint32_t) il);
+        if (recurrent) {
+          has_recurrent_layer = true;
+          if (!s || k || v || (qwen4exp && (cache.kr_l[il] || cache.kp_l[il]))) {
+            return rejected("recurrent cache layer has invalid ownership");
+          }
+        } else {
+          has_attention_layer = true;
+          if (!k || !v || s) {
+            return rejected("attention cache layer lacks a complete K/V pair");
+          }
+          if (qwen4exp) {
+            const bool qsa = model.hparams.is_qsa((uint32_t) il);
+            if ((qsa && (!cache.kr_l[il] || !cache.kp_l[il])) ||
+                (!qsa && (cache.kr_l[il] || cache.kp_l[il]))) {
+              return rejected("Qwen4EXP indexer topology is malformed");
+            }
+          }
+          has_mirrorable_pair = true;
+        }
+      } else {
+        if (s) return rejected("standard cache contains recurrent state");
+        if (model.hparams.has_kv((uint32_t) il)) {
+          if (!k || !v) return rejected("standard cache lacks a complete K/V pair");
+          has_mirrorable_pair = true;
+        } else if (k || v) {
+          return rejected("standard non-K/V layer is not paired-null");
+        }
+      }
+    }
+    if ((qwen35moe || qwen4exp) &&
+        (!cache.hybrid || !has_recurrent_layer || !has_attention_layer)) {
+      return rejected("hybrid cache lacks both recurrent and attention layers");
+    }
+    if (!qwen35moe && !qwen4exp && (has_state || !has_mirrorable_pair)) {
+      return rejected("standard cache has no mirrorable K/V pair");
+    }
+    result.status = kv_mirror_status::active;
+    return result;
+  };
+
+  const kv_mirror_capability capability = classify_kv_mirror();
+  if (capability.status == kv_mirror_status::inactive) {
+    if (capability.warning) {
+      LLAMA_LOG_WARN("%s: --mirror-kv inactive: %s\n", __func__, capability.reason);
+    } else {
+      LLAMA_LOG_INFO("%s: --mirror-kv inactive: %s\n", __func__, capability.reason);
+    }
+    return true;
+  }
+  if (capability.status == kv_mirror_status::rejected) {
+    LLAMA_LOG_ERROR("%s: --mirror-kv rejected: %s\n", __func__, capability.reason);
+    return false;
+  }
+
+  if (capability.topology == kv_mirror_topology::dsv4) {
+    if (cache.numa_mirror_ready || lctx.dsv4.cache.numa_mirror_ready) {
+      return cache.numa_mirror_ready && lctx.dsv4.cache.numa_mirror_ready;
+    }
+    const int n_nodes = ggml_numa_node_count();
+    const auto & all_buffers = capability.realized_buffers;
+
+    struct pending_buffer {
+      ggml_backend_buffer_t old_buf = nullptr;
+      ggml_backend_buffer_t new_buf = nullptr;
+      void * primary = nullptr;
+      size_t size = 0;
+      bool specialized = false;
+    };
+    struct pending_tensor { ggml_tensor * tensor; ggml_backend_buffer_t new_buf; void * data; bool specialized; };
+    struct pending_mirror { ggml_tensor * tensor; std::vector<void *> node_data; bool specialized; };
+    std::vector<pending_buffer> pending_buffers;
+    std::vector<pending_tensor> pending_tensors;
+    std::vector<pending_mirror> pending_mirrors;
+    std::vector<ggml_tensor *> attached;
+    std::vector<llama_kv_cache::numa_mirror_allocation> raw_allocations;
+    std::vector<llama_context::dsv4_runtime::storage::numa_mirror_allocation> dsv4_allocations;
+    size_t context_tensor_count = 0;
+    auto count_context = [&](ggml_context * ctx) {
+      if (!ctx) return;
+      for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+        ++context_tensor_count;
+      }
+    };
+    for (ggml_context * ctx : cache.ctxs) count_context(ctx);
+    count_context(lctx.dsv4.cache.cache_ctx);
+    size_t raw_mirror_count = 0;
+    for (ggml_tensor * tensor : cache.k_l) raw_mirror_count += tensor != nullptr;
+    size_t dsv4_mirror_count = 0;
+    auto count_mirrors = [&](const std::vector<ggml_tensor *> & v) {
+      for (ggml_tensor * tensor : v) dsv4_mirror_count += tensor != nullptr;
+    };
+    count_mirrors(lctx.dsv4.cache.csa_k);
+    count_mirrors(lctx.dsv4.cache.hca_k);
+    count_mirrors(lctx.dsv4.cache.lid_k);
+    count_mirrors(lctx.dsv4.cache.csa_state_kv);
+    count_mirrors(lctx.dsv4.cache.csa_state_score);
+    count_mirrors(lctx.dsv4.cache.hca_state_kv);
+    count_mirrors(lctx.dsv4.cache.hca_state_score);
+    count_mirrors(lctx.dsv4.cache.lid_state_kv);
+    count_mirrors(lctx.dsv4.cache.lid_state_score);
+    auto cleanup = [&]() {
+      for (ggml_tensor * tensor : attached) ggml_numa_tensor_clear_mirror(tensor);
+      for (const auto & a : raw_allocations) ggml_numa_free(a.data, a.size, a.node);
+      for (const auto & a : dsv4_allocations) ggml_numa_free(a.data, a.size, a.node);
+      for (const auto & b : pending_buffers) if (b.new_buf) ggml_backend_buffer_free(b.new_buf);
+    };
+    auto fail_dsv4 = [&](const char * msg) {
+      LLAMA_LOG_ERROR("%s: %s\n", __func__, msg);
+      cleanup();
+      return false;
+    };
+    auto is_specialized_buffer = [&](ggml_backend_buffer_t buf) {
+      return std::find(lctx.dsv4.cache.cache_bufs.begin(), lctx.dsv4.cache.cache_bufs.end(), buf) !=
+             lctx.dsv4.cache.cache_bufs.end();
+    };
+    auto find_buffer = [&](ggml_backend_buffer_t old_buf) -> pending_buffer * {
+      for (auto & b : pending_buffers) if (b.old_buf == old_buf) return &b;
+      return nullptr;
+    };
+    auto collect = [&](ggml_context * ctx, bool specialized) -> bool {
+      if (!ctx) return true;
+      for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+        pending_buffer * b = find_buffer(tensor->buffer);
+        if (!b || !tensor->data || tensor->extra) return false;
+        const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(b->old_buf);
+        const uintptr_t data = (uintptr_t) tensor->data;
+        if (data < base || data - base > b->size) return false;
+        const size_t offset = (size_t) (data - base);
+        const size_t alloc_size = ggml_backend_buffer_get_alloc_size(b->old_buf, tensor);
+        if (alloc_size > b->size - offset) return false;
+        pending_tensors.push_back({ tensor, b->new_buf, (char *) b->primary + offset, specialized });
+      }
+      return true;
+    };
+    try {
+      pending_buffers.reserve(all_buffers.size());
+      pending_tensors.reserve(context_tensor_count);
+      pending_mirrors.reserve(raw_mirror_count + dsv4_mirror_count);
+      attached.reserve(raw_mirror_count + dsv4_mirror_count);
+      raw_allocations.reserve(cache.bufs.size() + raw_mirror_count * (size_t) (n_nodes - 1));
+      dsv4_allocations.reserve(lctx.dsv4.cache.cache_bufs.size() + dsv4_mirror_count * (size_t) (n_nodes - 1));
+      cache.numa_mirror_tensors.reserve(cache.numa_mirror_tensors.size() + raw_mirror_count);
+      lctx.dsv4.cache.numa_mirror_tensors.reserve(lctx.dsv4.cache.numa_mirror_tensors.size() + dsv4_mirror_count);
+      cache.numa_mirror_allocations.reserve(raw_allocations.capacity());
+      lctx.dsv4.cache.numa_mirror_allocations.reserve(dsv4_allocations.capacity());
+      for (ggml_backend_buffer_t old_buf : all_buffers) {
+        const size_t size = ggml_backend_buffer_get_size(old_buf);
+        void * primary = nullptr;
+        if (!ggml_numa_alloc(&primary, size, 0)) return fail_dsv4("failed to allocate DSV4 primary on NUMA node 0");
+        const bool specialized = is_specialized_buffer(old_buf);
+        if (specialized) dsv4_allocations.push_back({ primary, size, 0 });
+        else raw_allocations.push_back({ primary, size, 0 });
+        memcpy(primary, ggml_backend_buffer_get_base(old_buf), size);
+        ggml_backend_buffer_t new_buf = ggml_backend_cpu_buffer_from_ptr(primary, size);
+        if (!new_buf) return fail_dsv4("failed to wrap DSV4 primary buffer");
+        ggml_backend_buffer_set_usage(new_buf, ggml_backend_buffer_get_usage(old_buf));
+        pending_buffers.push_back({ old_buf, new_buf, primary, size, specialized });
+      }
+      if (!collect(cache.ctxs.empty() ? nullptr : cache.ctxs[0], false)) return fail_dsv4("raw K tensor is outside its realized buffer");
+      // Raw cache contexts may be split across several contexts.
+      for (size_t ic = 1; ic < cache.ctxs.size(); ++ic) if (!collect(cache.ctxs[ic], false)) return fail_dsv4("raw K tensor is outside its realized buffer");
+      if (!collect(lctx.dsv4.cache.cache_ctx, true)) return fail_dsv4("specialized tensor is outside its realized buffer");
+      auto prepare_mirror = [&](ggml_tensor * tensor, bool specialized) -> bool {
+        if (!tensor || tensor->data_numa) return false;
+        pending_tensor * p = nullptr;
+        for (auto & item : pending_tensors) if (item.tensor == tensor) { p = &item; break; }
+        if (!p || p->specialized != specialized || ggml_nbytes(tensor) == 0) return false;
+        pending_mirror mirror { tensor, std::vector<void *>((size_t) n_nodes, nullptr), specialized };
+        mirror.node_data[0] = p->data;
+        for (int node = 1; node < n_nodes; ++node) {
+          if (!ggml_numa_mirror_node_available(node) || !ggml_numa_alloc(&mirror.node_data[node], ggml_nbytes(tensor), node)) return false;
+          memcpy(mirror.node_data[node], p->data, ggml_nbytes(tensor));
+          if (specialized) dsv4_allocations.push_back({ mirror.node_data[node], ggml_nbytes(tensor), node });
+          else raw_allocations.push_back({ mirror.node_data[node], ggml_nbytes(tensor), node });
+        }
+        pending_mirrors.push_back(std::move(mirror));
+        return true;
+      };
+      auto mirror_vector = [&](const std::vector<ggml_tensor *> & v, bool specialized) -> bool {
+        for (ggml_tensor * tensor : v) if (tensor && !prepare_mirror(tensor, specialized)) return false;
+        return true;
+      };
+      if (!mirror_vector(cache.k_l, false) ||
+          !mirror_vector(lctx.dsv4.cache.csa_k, true) ||
+          !mirror_vector(lctx.dsv4.cache.hca_k, true) ||
+          !mirror_vector(lctx.dsv4.cache.lid_k, true) ||
+          !mirror_vector(lctx.dsv4.cache.csa_state_kv, true) ||
+          !mirror_vector(lctx.dsv4.cache.csa_state_score, true) ||
+          !mirror_vector(lctx.dsv4.cache.hca_state_kv, true) ||
+          !mirror_vector(lctx.dsv4.cache.hca_state_score, true) ||
+          !mirror_vector(lctx.dsv4.cache.lid_state_kv, true) ||
+          !mirror_vector(lctx.dsv4.cache.lid_state_score, true)) {
+        return fail_dsv4("DSV4 cache tensor is not eligible for a complete mirror");
+      }
+      for (auto & mirror : pending_mirrors) {
+        if (!ggml_numa_tensor_set_mirror(mirror.tensor, mirror.node_data.data())) return fail_dsv4("failed to attach DSV4 NUMA mirror");
+        attached.push_back(mirror.tensor);
+      }
+      // All lookups below are guaranteed before any live pointer is changed.
+      // Publication therefore cannot fail through a missing mapping.
+      for (ggml_backend_buffer_t old_buf : cache.bufs) {
+        if (!find_buffer(old_buf)) return fail_dsv4("raw buffer mapping disappeared before publication");
+      }
+      for (ggml_backend_buffer_t old_buf : lctx.dsv4.cache.cache_bufs) {
+        if (!find_buffer(old_buf)) return fail_dsv4("specialized buffer mapping disappeared before publication");
+      }
+      for (const auto & p : pending_tensors) { p.tensor->buffer = p.new_buf; p.tensor->data = p.data; }
+      for (size_t i = 0; i < cache.bufs.size(); ++i) {
+        pending_buffer * b = find_buffer(cache.bufs[i]);
+        cache.bufs[i] = b->new_buf;
+      }
+      for (size_t i = 0; i < lctx.dsv4.cache.cache_bufs.size(); ++i) {
+        pending_buffer * b = find_buffer(lctx.dsv4.cache.cache_bufs[i]);
+        lctx.dsv4.cache.cache_bufs[i] = b->new_buf;
+      }
+      for (const auto & b : pending_buffers) ggml_backend_buffer_free(b.old_buf);
+      for (const auto & mirror : pending_mirrors) {
+        if (mirror.specialized) lctx.dsv4.cache.numa_mirror_tensors.push_back(mirror.tensor);
+        else cache.numa_mirror_tensors.push_back(mirror.tensor);
+      }
+      cache.numa_mirror_allocations = std::move(raw_allocations);
+      lctx.dsv4.cache.numa_mirror_allocations = std::move(dsv4_allocations);
+      cache.numa_mirror_ready = lctx.dsv4.cache.numa_mirror_ready = true;
+      LLAMA_LOG_INFO("%s: mirrored DSV4 raw/specialized cache working set (%zu tensors)\n", __func__, pending_mirrors.size());
+      return true;
+    } catch (const std::exception & e) {
+      LLAMA_LOG_ERROR("%s: exception while preparing DSV4 NUMA mirror: %s\n", __func__, e.what());
+      cleanup();
+      return false;
+    }
+  }
+
+  const int n_nodes = ggml_numa_node_count();
+
+  struct pending_buffer {
+    ggml_backend_buffer_t old_buf = nullptr;
+    ggml_backend_buffer_t new_buf = nullptr;
+    void *primary = nullptr;
+    size_t size = 0;
+  };
+  struct pending_tensor {
+    ggml_tensor *tensor = nullptr;
+    ggml_backend_buffer_t new_buf = nullptr;
+    void *data = nullptr;
+  };
+  struct pending_mirror {
+    ggml_tensor *tensor = nullptr;
+    std::vector<void *> node_data;
+  };
+
+  std::vector<pending_buffer> pending_buffers;
+  std::vector<pending_tensor> pending_tensors;
+  std::vector<pending_mirror> pending_mirrors;
+  std::vector<ggml_tensor *> attached_tensors;
+  std::vector<llama_kv_cache::numa_mirror_allocation> pending_allocations;
+
+  size_t tensor_count = 0;
+  size_t mirror_count = 0;
+  for (ggml_context *ctx : cache.ctxs) {
+    for (ggml_tensor *tensor = ggml_get_first_tensor(ctx); tensor;
+         tensor = ggml_get_next_tensor(ctx, tensor)) {
+      ++tensor_count;
+    }
+  }
+  for (ggml_tensor *tensor : cache.k_l) {
+    mirror_count += tensor != nullptr;
+  }
+  for (ggml_tensor *tensor : cache.v_l) {
+    mirror_count += tensor != nullptr;
+  }
+  auto cleanup_pending = [&]() {
+    for (ggml_tensor *tensor : attached_tensors) {
+      ggml_numa_tensor_clear_mirror(tensor);
+    }
+    for (const auto &allocation : pending_allocations) {
+      ggml_numa_free(allocation.data, allocation.size, allocation.node);
+    }
+    for (const auto &buffer : pending_buffers) {
+      ggml_backend_buffer_free(buffer.new_buf);
+    }
+  };
+  auto fail = [&](const char *message) {
+    LLAMA_LOG_ERROR("%s: %s\n", __func__, message);
+    cleanup_pending();
+    return false;
+  };
+
+  try {
+    pending_buffers.reserve(cache.bufs.size());
+    pending_tensors.reserve(tensor_count);
+    pending_mirrors.reserve(mirror_count);
+    attached_tensors.reserve(mirror_count);
+    pending_allocations.reserve(cache.bufs.size() +
+                                mirror_count * (size_t)(n_nodes - 1));
+    cache.numa_mirror_tensors.reserve(cache.numa_mirror_tensors.size() +
+                                      mirror_count);
+
+    // CPU backend buffers are malloc-backed and cannot reliably be made strict
+    // node-local with mbind after the fact. Prepare complete node-local primary
+    // buffers and every replica before changing any live tensor or buffer.
+    for (ggml_backend_buffer_t old_buf : cache.bufs) {
+      if (ggml_backend_buffer_get_type(old_buf) !=
+              ggml_backend_cpu_buffer_type() ||
+          !ggml_backend_buffer_is_host(old_buf)) {
+        return fail("KV buffer is not an eligible CPU buffer; refusing generic "
+                    "fallback");
+      }
+      const size_t size = ggml_backend_buffer_get_size(old_buf);
+      void *primary = nullptr;
+      if (!ggml_numa_alloc(&primary, size, 0)) {
+        return fail("failed to allocate primary KV buffer on NUMA node 0");
+      }
+      pending_allocations.push_back({primary, size, 0});
+      memcpy(primary, ggml_backend_buffer_get_base(old_buf), size);
+      ggml_backend_buffer_t new_buf =
+          ggml_backend_cpu_buffer_from_ptr(primary, size);
+      if (!new_buf) {
+        return fail("failed to create non-owning CPU buffer wrapper");
+      }
+      pending_buffers.push_back({old_buf, new_buf, primary, size});
+      ggml_backend_buffer_set_usage(new_buf,
+                                    ggml_backend_buffer_get_usage(old_buf));
+    }
+
+    auto find_pending_buffer =
+        [&](ggml_backend_buffer_t old_buf) -> pending_buffer * {
+      for (auto &buffer : pending_buffers) {
+        if (buffer.old_buf == old_buf) {
+          return &buffer;
+        }
+      }
+      return nullptr;
+    };
+    for (ggml_context *ctx : cache.ctxs) {
+      for (ggml_tensor *tensor = ggml_get_first_tensor(ctx); tensor;
+           tensor = ggml_get_next_tensor(ctx, tensor)) {
+        pending_buffer *buffer = find_pending_buffer(tensor->buffer);
+        if (!buffer || !tensor->data) {
+          return fail("cache tensor does not belong to a prepared buffer");
+        }
+        const uintptr_t base =
+            (uintptr_t)ggml_backend_buffer_get_base(buffer->old_buf);
+        const uintptr_t data = (uintptr_t)tensor->data;
+        if (data < base || data - base > buffer->size) {
+          return fail("cache tensor lies outside its source buffer");
+        }
+        const size_t offset = (size_t)(data - base);
+        const size_t alloc_size =
+            ggml_backend_buffer_get_alloc_size(buffer->old_buf, tensor);
+        if (alloc_size > buffer->size - offset) {
+          return fail("cache tensor allocation lies outside its source buffer");
+        }
+        pending_tensors.push_back(
+            {tensor, buffer->new_buf, (char *)buffer->primary + offset});
+      }
+    }
+
+    auto find_pending_tensor = [&](ggml_tensor *tensor) -> pending_tensor * {
+      for (auto &pending : pending_tensors) {
+        if (pending.tensor == tensor) {
+          return &pending;
+        }
+      }
+      return nullptr;
+    };
+    auto prepare_mirror = [&](ggml_tensor *tensor) -> bool {
+      if (!tensor) {
+        return true;
+      }
+      pending_tensor *pending = find_pending_tensor(tensor);
+      if (!pending || tensor->extra != nullptr || tensor->buffer == nullptr ||
+          tensor->data == nullptr) {
+        return false;
+      }
+      const size_t size = ggml_nbytes(tensor);
+      if (size == 0) {
+        return false;
+      }
+      pending_mirror mirror;
+      mirror.tensor = tensor;
+      mirror.node_data.resize((size_t)n_nodes, nullptr);
+      mirror.node_data[0] = pending->data;
+      for (int node = 1; node < n_nodes; ++node) {
+        if (!ggml_numa_mirror_node_available(node) ||
+            !ggml_numa_alloc(&mirror.node_data[node], size, node)) {
+          return false;
+        }
+        memcpy(mirror.node_data[node], pending->data, size);
+        pending_allocations.push_back({mirror.node_data[node], size, node});
+      }
+      pending_mirrors.push_back(std::move(mirror));
+      return true;
+    };
+
+    for (ggml_tensor *tensor : cache.k_l) {
+      if (!prepare_mirror(tensor)) {
+        return fail("cache K tensor is not eligible for a complete mirror");
+      }
+    }
+    for (ggml_tensor *tensor : cache.v_l) {
+      if (!prepare_mirror(tensor)) {
+        return fail("cache V tensor is not eligible for a complete mirror");
+      }
+    }
+
+    if (pending_mirrors.empty()) {
+      return fail("no standard K/V tensors were available to mirror");
+    }
+    for (auto &mirror : pending_mirrors) {
+      if (!ggml_numa_tensor_set_mirror(mirror.tensor,
+                                       mirror.node_data.data())) {
+        return fail("failed to attach NUMA replicas to cache tensor");
+      }
+      attached_tensors.push_back(mirror.tensor);
+    }
+
+    // Publication is the only point at which live cache metadata changes.
+    for (const auto &pending : pending_tensors) {
+      pending.tensor->buffer = pending.new_buf;
+      pending.tensor->data = pending.data;
+    }
+    for (size_t ib = 0; ib < cache.bufs.size(); ++ib) {
+      cache.bufs[ib] = pending_buffers[ib].new_buf;
+      ggml_backend_buffer_free(pending_buffers[ib].old_buf);
+    }
+    for (const auto &mirror : pending_mirrors) {
+      cache.numa_mirror_tensors.push_back(mirror.tensor);
+    }
+    cache.numa_mirror_allocations = std::move(pending_allocations);
+
+    cache.numa_mirror_ready = true;
+    size_t bytes = 0;
+    for (ggml_tensor *tensor : cache.numa_mirror_tensors) {
+      bytes += ggml_nbytes(tensor);
+    }
+    LLAMA_LOG_INFO(
+        "%s: mirrored %zu CPU K/V tensors, %zu MiB per additional NUMA node\n",
+        __func__, cache.numa_mirror_tensors.size(), bytes / MiB);
+    return true;
+  } catch (const std::exception &e) {
+    LLAMA_LOG_ERROR("%s: exception while preparing NUMA K/V mirror: %s\n",
+                    __func__, e.what());
+    cleanup_pending();
+    return false;
+  } catch (...) {
+    LLAMA_LOG_ERROR("%s: unknown exception while preparing NUMA K/V mirror\n",
+                    __func__);
+    cleanup_pending();
+    return false;
+  }
 }
 
 static bool llama_kv_cache_init(
@@ -2344,6 +3065,7 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     for (auto & buf : cache.bufs) {
         ggml_backend_buffer_clear(buf, 0);
     }
+    cache.clear_numa_mirror();
 }
 
 static bool llama_kv_cache_seq_rm(
@@ -6827,6 +7549,15 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING == 1
         tim1 = ggml_time_us();
 #endif
+        // Qwen4EXP prepares its PLE row indices in host state before graph
+        // execution. An aborted graph must not commit those history updates.
+        // otherwise a later state restore can observe a different recurrent
+        // history even when s_l and the serialized KV state are identical.
+        std::map<llama_seq_id, llama_context::ple_history> ple_hist_before_decode;
+        if (lctx.model.arch == LLM_ARCH_QWEN4EXP) {
+            ple_hist_before_decode = lctx.ple_hist;
+        }
+
         //fprintf(stderr, "%s: setting inputs\n", __func__);
         llama_set_inputs(lctx, u_batch);
 #if IK_PRINT_TIMING == 1
@@ -6839,6 +7570,9 @@ static int llama_decode_internal(
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
         const enum ggml_status status = llama_graph_compute(lctx, gf, n_threads);
         if (status != GGML_STATUS_SUCCESS) {
+            if (lctx.model.arch == LLM_ARCH_QWEN4EXP) {
+                lctx.ple_hist = std::move(ple_hist_before_decode);
+            }
             return status;
         }
 
@@ -7572,6 +8306,8 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
                 return status;
             }
 
+            llama_kv_cache_sync_numa_mirror(lctx.kv_self);
+
             need_reserve = true;
         }
 
@@ -7993,6 +8729,7 @@ struct llama_context_params llama_context_default_params() {
         /*.scheduler_async             =*/ false,
         /*.mtp                         =*/ false,
         /*.mtp_op_type                 =*/ MTP_OP_NONE,
+        /*.numa_mirror_kv              =*/ false,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.offload_policy              =*/ nullptr,
@@ -8689,6 +9426,7 @@ struct llama_context * llama_init_from_model(
     cparams.thresh_experts   = params.thresh_experts;
     cparams.cuda_params      = params.cuda_params;
     cparams.mtp              = params.mtp;
+    cparams.numa_mirror_kv   = params.numa_mirror_kv;
     cparams.worst_graph_tokens = params.worst_case_tokens;
 
     cparams.reduce_type      = params.type_reduce;
@@ -9186,6 +9924,15 @@ struct llama_context * llama_init_from_model(
             }
 
             if (!llama_prepare_model_for_context(*ctx)) {
+                llama_free(ctx);
+                return nullptr;
+            }
+
+            // Prepare/repack and publish model weights before allocating the
+            // strict NUMA-local K/V replicas.  The cache initializer creates
+            // ordinary K/V buffers only. Deferring its mirror avoids competing
+            // node-0 placement while the model mirror is being published.
+            if (!llama_kv_cache_init_numa_mirror(*ctx)) {
                 llama_free(ctx);
                 return nullptr;
             }
@@ -9806,6 +10553,9 @@ int32_t llama_get_kv_cache_used_cells(const struct llama_context * ctx) {
 
 void llama_kv_cache_clear(struct llama_context * ctx) {
     llama_kv_cache_clear(ctx->kv_self);
+    // Clearing the raw QSA indexer cache also invalidates its derived pooled
+    // block keys. Force the next graph to rebuild the complete pooling window.
+    ctx->qsa_pooled_stale = !ctx->kv_self.kp_l.empty();
     llama_reset_dsv4_state(ctx);
 }
 
@@ -11079,6 +11829,11 @@ struct llama_data_read {
         }
 
         const bool openpangu_partial = llama_kv_has_openpangu_partial_state(kv_self, ctx->model.arch, flags);
+
+        // State restore writes directly through the backend and can fail at any
+        // later validation or read. Keep the primary and all NUMA replicas
+        // coherent on every exit after the first possible cache write.
+        llama_kv_cache_mirror_sync_guard mirror_sync_guard { kv_self, ctx };
 
         // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
         for (uint32_t il = 0; il < n_layer; ++il) {

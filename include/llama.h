@@ -509,6 +509,7 @@ extern "C" {
         bool scheduler_async;   // if true, with split mode "graph" graph evaluation will be done using multiple threads
         bool mtp;   // Activate MTP if supported
         enum llama_mtp_op_type mtp_op_type;
+        bool numa_mirror_kv; // Mirror eligible CPU K/V cache buffers when NUMA weights mirror is active
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

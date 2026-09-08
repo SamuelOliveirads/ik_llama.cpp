@@ -2283,6 +2283,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         else { invalid_param = true; }
         return true;
     }
+    if (arg == "--mirror-kv") {
+        params.mirror_kv = true;
+        return true;
+    }
     if (arg == "-dev" || arg == "--device") {
         CHECK_ARG
         std::string value(argv[i]);
@@ -3320,9 +3324,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "  - distribute: spread execution evenly over all nodes\n"
                                                                         "  - isolate: only spawn threads on CPUs on the node that execution started on\n"
                                                                         "  - numactl: use the CPU map provided by numactl\n"
-                                                                        "  - mirror: pin workers by NUMA node for the weights-only mirror candidate\n"
+                                                                        "  - mirror: pin workers by NUMA node and mirror weights\n"
                                                                         "if run without this previously, it is recommended to drop the system page cache before using this\n"
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
+    options.push_back({ "*",           "       --mirror-kv",             "mirror eligible CPU K/V cache buffers when --numa mirror is active" });
     if (llama_supports_gpu_offload()) {
         options.push_back({ "*",           "-ngl,  --gpu-layers N",
                                                                         "number of layers to store in VRAM" });
@@ -4381,6 +4386,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.max_extra_alloc   = params.max_extra_alloc_MiB;
     cparams.mtp               = params.has_mtp || params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     cparams.mtp_op_type      = MTP_OP_NONE;
+    cparams.numa_mirror_kv    = params.mirror_kv;
 
     cparams.type_k = kv_cache_type_from_str(params.cache_type_k);
     cparams.type_v = kv_cache_type_from_str(params.cache_type_v);

@@ -299,9 +299,20 @@ static ggml_tensor * qwen4exp_qsa_mask(
             break;
         }
     }
+    const bool input_geometry_changed = inp && (
+            inp->cell_blk->ne[0]   != n_kv ||
+            inp->bias->ne[0]       != n_kv ||
+            inp->bias->ne[1]       != n_tokens ||
+            inp->win_blocks->ne[0] != n_win ||
+            inp->win_cells->ne[0]  != r*n_win ||
+            inp->win_pos->ne[0]    != GGML_MROPE_SECTIONS*n_win ||
+            inp->head_w->ne[0]     != n_idx_h ||
+            inp->head_w->ne[1]     != n_tokens);
     if (!inp) {
         lctx.inp_qsa.emplace_back();
         inp = &lctx.inp_qsa.back();
+    }
+    if (input_geometry_changed || !inp->cell_blk) {
         inp->ratio      = (int32_t) r;
         inp->cell_blk   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_kv);
         inp->bias       = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, n_tokens);
