@@ -192,7 +192,6 @@ backend:
                                   if run without this previously, it is recommended to drop the system page cache before using this
                                   see https://github.com/ggerganov/llama.cpp/issues/1437
          --mirror-kv              mirror eligible CPU attention-cache data when --numa mirror is active
-                                  MTP and device-resident caches remain inactive. Mixed or malformed CPU layouts fail
 
 model:
 

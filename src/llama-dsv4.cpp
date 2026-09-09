@@ -1118,9 +1118,6 @@ void llama_reset_dsv4_state(llama_context * ctx, int32_t seq_id) {
     for (ggml_tensor * tensor : ctx->dsv4.cache.lid_state_kv) clear_tensor(tensor);
     for (ggml_tensor * tensor : ctx->dsv4.cache.lid_state_score) clear_tensor(tensor);
 
-    // Stream-scoped reset writes the primary buffers through the backend.
-    // Publish the resulting state to every attached replica before another
-    // worker can consume the stream.
     llama_dsv4_sync_numa_mirror(ctx);
 }
 
@@ -1471,10 +1468,6 @@ static bool dsv4_spec_ckpt_copy_gpu(
         }
     }
     if (sync_for_mirror) {
-        // The caller may immediately republish NUMA mirrors on a restore
-        // failure path. Complete each backend once, rather than once per
-        // state tensor. Save and device-only restore paths retain async
-        // behavior.
         for (ggml_backend_t backend : ctx.backends) {
             if (backend != nullptr) {
                 ggml_backend_synchronize(backend);
@@ -1618,9 +1611,6 @@ enum llama_spec_ckpt_restore_result llama_dsv4_spec_ckpt_restore(llama_context *
         return LLAMA_SPEC_CKPT_RESTORE_FAILED;
     }
 
-    // Every restore branch may write the primary specialized cache before a
-    // later validation or backend operation fails.  Republish on all exits so
-    // an aborted speculative path can never leave a stale NUMA replica.
     struct scoped_mirror_sync {
         llama_context * ctx;
         ~scoped_mirror_sync() { llama_dsv4_sync_numa_mirror(ctx); }

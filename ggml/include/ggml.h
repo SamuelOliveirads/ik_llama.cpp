@@ -924,10 +924,10 @@ extern "C" {
     // accepts a UTF-8 path, even on Windows
     GGML_API FILE *  ggml_fopen(const char * fname, const char * mode);
 
-    GGML_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once
+    GGML_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
     GGML_API int     ggml_numa_node_count(void);
-    GGML_API bool    ggml_numa_mirror_active(void); // true when the weights component is effective on multiple nodes
+    GGML_API bool    ggml_numa_mirror_active(void); // true for an effective multi-node mirror policy
     GGML_API bool    ggml_numa_mirror_node_available(int node); // true when the inherited process mask includes this node
     GGML_API bool    ggml_numa_alloc(void ** ptr, size_t size, int node); // checked node-local allocation
     GGML_API void    ggml_numa_free(void * ptr, size_t size, int node);  // release one successful allocation

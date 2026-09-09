@@ -4969,10 +4969,8 @@ static bool ggml_numa_tensor_has_mirror(const struct ggml_tensor * tensor) {
     return false;
 }
 
-// Cache writes are normally GGML_OP_CPY operations targeting views into a K/V
-// tensor. Replicate the written view after the operation, rather than copying
-// the complete parent cache. This is deliberately kept in ggml so defrag and
-// K-shift copies receive the same first-slice coherence behavior.
+// Replicate the written view after the operation, so defrag and
+// K-shift copies receive the same first-slice coherence behavior
 void ggml_numa_tensor_replicate(const struct ggml_tensor * tensor) {
     if (!tensor || !ggml_numa_tensor_has_mirror(tensor)) {
         return;
@@ -4996,11 +4994,9 @@ void ggml_numa_tensor_replicate(const struct ggml_tensor * tensor) {
     }
 }
 
-// Publish only the rows written by GGML_OP_SET_ROWS.  Although SET_ROWS is
-// planned with one task, the graph executor invokes every worker for every
-// node. The operation itself partitions rows using params->ith/params->nth.
-// Mirror publication must use the same partition so each worker publishes only
-// after its own writes, without a full-cache copy or an extra barrier.
+// The GGML_OP_SET_ROWS partitions rows using params->ith/params->nth. Mirror
+// publication must use the same partition so each worker publishes only
+// after its own writes
 static void ggml_numa_tensor_replicate_set_rows(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * dst,
@@ -15933,8 +15929,7 @@ static bool ggml_compute_forward_concat_any_opt(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    // Source tensors may be NUMA-mirrored cache views. Resolve each source
-    // once for this worker. The helper preserves nested view offsets.
+    // Source tensors may be NUMA-mirrored cache views
     const char * src0_base = (const char *) ggml_numa_tensor_data(src0, params->numa_node);
     const char * src1_base = (const char *) ggml_numa_tensor_data(src1, params->numa_node);
 
@@ -16010,8 +16005,8 @@ static bool ggml_compute_forward_concat_any_opt(
 }
 
 static void ggml_compute_forward_concat_f32(
-        const struct ggml_compute_params * params,
-              struct ggml_tensor * dst) {
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst) {
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -20622,9 +20617,6 @@ static void ggml_compute_forward_set_rows(
             }
     }
 
-    // DSV4 and other cache builders use SET_ROWS for sparse cache updates.
-    // Publish only the indexed rows when the destination carries NUMA mirror
-    // metadata. Ordinary destinations take the fast no-op path.
     ggml_numa_tensor_replicate_set_rows(params, dst, src1, src0->ne[1],
                                         ggml_row_size(dst->type, dst->ne[0]));
 }
@@ -23407,9 +23399,6 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t rv2 = neq2/nev2;
     const int64_t rv3 = neq3/nev3;
 
-    // Mirrored K/V tensors are selected per CPU worker.  The helper also
-    // accounts for nested view offsets, which is required by the cache views
-    // passed to flash attention.
     const char * const k_base = (const char *) ggml_numa_tensor_data(k, params->numa_node);
     const char * const v_base = (const char *) ggml_numa_tensor_data(v, params->numa_node);
 
@@ -29544,8 +29533,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     }
     ggml_barrier(state->shared);
 #if defined(__gnu_linux__)
-    // Only affinity setup can fail before the first graph node. A later abort
-    // must still let every worker enter the node barrier before exiting.
     if (affinity_failed || atomic_load(&state->shared->ec) == GGML_STATUS_FAILED) {
         if (state->saved_affinity_valid && !restore_numa_thread_affinity(&state->saved_affinity)) {
             atomic_store(&state->shared->ec, GGML_STATUS_FAILED);

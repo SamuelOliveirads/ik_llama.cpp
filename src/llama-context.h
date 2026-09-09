@@ -599,9 +599,7 @@ struct llama_context {
 
             struct ggml_context * cache_ctx = nullptr;
             std::vector<ggml_backend_buffer_t> cache_bufs;
-            // NUMA mirror ownership for DSV4's separate cache context. These
-            // are intentionally kept with the specialized storage so they
-            // are released before cache_bufs/cache_ctx.
+
             struct numa_mirror_allocation {
                 void * data = nullptr;
                 size_t size = 0;

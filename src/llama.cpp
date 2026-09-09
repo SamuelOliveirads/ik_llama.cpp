@@ -1636,8 +1636,6 @@ static bool llama_kv_cache_init_numa_mirror(llama_context & lctx) {
         if (!ggml_numa_tensor_set_mirror(mirror.tensor, mirror.node_data.data())) return fail_dsv4("failed to attach DSV4 NUMA mirror");
         attached.push_back(mirror.tensor);
       }
-      // All lookups below are guaranteed before any live pointer is changed.
-      // Publication therefore cannot fail through a missing mapping.
       for (ggml_backend_buffer_t old_buf : cache.bufs) {
         if (!find_buffer(old_buf)) return fail_dsv4("raw buffer mapping disappeared before publication");
       }
@@ -1735,9 +1733,6 @@ static bool llama_kv_cache_init_numa_mirror(llama_context & lctx) {
     cache.numa_mirror_tensors.reserve(cache.numa_mirror_tensors.size() +
                                       mirror_count);
 
-    // CPU backend buffers are malloc-backed and cannot reliably be made strict
-    // node-local with mbind after the fact. Prepare complete node-local primary
-    // buffers and every replica before changing any live tensor or buffer.
     for (ggml_backend_buffer_t old_buf : cache.bufs) {
       if (ggml_backend_buffer_get_type(old_buf) !=
               ggml_backend_cpu_buffer_type() ||
@@ -7549,10 +7544,6 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING == 1
         tim1 = ggml_time_us();
 #endif
-        // Qwen4EXP prepares its PLE row indices in host state before graph
-        // execution. An aborted graph must not commit those history updates.
-        // otherwise a later state restore can observe a different recurrent
-        // history even when s_l and the serialized KV state are identical.
         std::map<llama_seq_id, llama_context::ple_history> ple_hist_before_decode;
         if (lctx.model.arch == LLM_ARCH_QWEN4EXP) {
             ple_hist_before_decode = lctx.ple_hist;
@@ -9928,10 +9919,6 @@ struct llama_context * llama_init_from_model(
                 return nullptr;
             }
 
-            // Prepare/repack and publish model weights before allocating the
-            // strict NUMA-local K/V replicas.  The cache initializer creates
-            // ordinary K/V buffers only. Deferring its mirror avoids competing
-            // node-0 placement while the model mirror is being published.
             if (!llama_kv_cache_init_numa_mirror(*ctx)) {
                 llama_free(ctx);
                 return nullptr;
@@ -10553,8 +10540,8 @@ int32_t llama_get_kv_cache_used_cells(const struct llama_context * ctx) {
 
 void llama_kv_cache_clear(struct llama_context * ctx) {
     llama_kv_cache_clear(ctx->kv_self);
-    // Clearing the raw QSA indexer cache also invalidates its derived pooled
-    // block keys. Force the next graph to rebuild the complete pooling window.
+    // Clearing the raw QSA indexer cache also invalidates
+    // its derived pooled block keys
     ctx->qsa_pooled_stale = !ctx->kv_self.kp_l.empty();
     llama_reset_dsv4_state(ctx);
 }
@@ -11830,9 +11817,6 @@ struct llama_data_read {
 
         const bool openpangu_partial = llama_kv_has_openpangu_partial_state(kv_self, ctx->model.arch, flags);
 
-        // State restore writes directly through the backend and can fail at any
-        // later validation or read. Keep the primary and all NUMA replicas
-        // coherent on every exit after the first possible cache write.
         llama_kv_cache_mirror_sync_guard mirror_sync_guard { kv_self, ctx };
 
         // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
