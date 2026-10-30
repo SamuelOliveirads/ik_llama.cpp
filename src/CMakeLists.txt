@@ -54,6 +54,8 @@ add_library(llama
             llama-build-context.cpp
             llama-moe-cache.h
             llama-moe-cache.cpp
+            llama-moe-ffn-prototype.h
+            llama-moe-ffn-prototype.cpp
             llama-model.h
             llama-model.cpp
             llama-reload-info.h
