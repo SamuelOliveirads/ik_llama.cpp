@@ -702,7 +702,7 @@ bool llama_moe_cache::copy(ggml_backend * backend, const ggml_tensor * src, ggml
 
 bool llama_moe_cache::resolve_and_pin(int32_t device, int32_t group_id, int32_t il, uint64_t owner_generation,
         const int32_t * ids, int32_t n_ids, ggml_cuda_moe_ffn_resolution * result) {
-    if (!ids || !result || n_ids <= 0 || n_ids > GGML_CUDA_MOE_FFN_MAX_SELECTED) return false;
+    if (!ids || !result || n_ids <= 0 || n_ids > GGML_MOE_FFN_MAX_SELECTED) return false;
     std::lock_guard<std::mutex> lock(pimpl->state_mutex);
     if (group_id < 0 || (size_t) group_id >= pimpl->groups.size() ||
             il < 0 || (size_t) il >= pimpl->layers.size()) return false;
@@ -750,7 +750,7 @@ bool llama_moe_cache::resolve_and_pin(int32_t device, int32_t group_id, int32_t 
 }
 
 bool llama_moe_cache::release_pins(const ggml_cuda_moe_ffn_pin_token * pins, int32_t n_pins) {
-    if (!pins || n_pins <= 0 || n_pins > GGML_CUDA_MOE_FFN_MAX_SELECTED) return false;
+    if (!pins || n_pins <= 0 || n_pins > GGML_MOE_FFN_MAX_SELECTED) return false;
     std::lock_guard<std::mutex> lock(pimpl->state_mutex);
     for (int32_t i = 0; i < n_pins; ++i) {
         const auto & token = pins[i];

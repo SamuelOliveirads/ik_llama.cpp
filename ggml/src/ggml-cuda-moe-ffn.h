@@ -2,9 +2,9 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-moe-ffn.h"
 
-enum { GGML_CUDA_MOE_FFN_MAX_SELECTED = 10 };
-enum { GGML_CUDA_MOE_FFN_MAX_FILL_PARTS = 3 };
+enum { GGML_CUDA_MOE_FFN_MAX_FILL_PARTS = GGML_MOE_FFN_PARTS };
 enum { GGML_CUDA_MOE_FFN_PHASE_SAMPLE_CAPACITY = 4096 };
 
 typedef struct ggml_cuda_moe_ffn_phase_sample {
@@ -50,8 +50,8 @@ typedef struct ggml_cuda_moe_ffn_pin_token {
 typedef struct ggml_cuda_moe_ffn_resolution {
     int32_t n_draws;
     int32_t n_pins;
-    int32_t draw_slots[GGML_CUDA_MOE_FFN_MAX_SELECTED];
-    ggml_cuda_moe_ffn_pin_token pins[GGML_CUDA_MOE_FFN_MAX_SELECTED];
+    int32_t draw_slots[GGML_MOE_FFN_MAX_SELECTED];
+    ggml_cuda_moe_ffn_pin_token pins[GGML_MOE_FFN_MAX_SELECTED];
 } ggml_cuda_moe_ffn_resolution;
 
 typedef bool (*ggml_cuda_moe_ffn_resolve_and_pin_fn)(void * context,
@@ -101,27 +101,9 @@ typedef struct ggml_cuda_moe_ffn_cpu_resource_stats {
 
 typedef struct ggml_cuda_moe_ffn_binding {
     uint64_t generation;
-    int32_t device;
-    int32_t n_experts;
-    int32_t n_slots;
-    int32_t n_experts_used;
-    int32_t n_embd;
-    int32_t n_ff;
-    enum ggml_type up_type;
-    enum ggml_type gate_type;
-    enum ggml_type down_type;
-    enum ggml_unary_op unary_op;
-    float limit;
-    const struct ggml_tensor * host_up;
-    const struct ggml_tensor * host_gate;
-    const struct ggml_tensor * host_down;
-    const struct ggml_tensor * cuda_up;
-    const struct ggml_tensor * cuda_gate;
-    const struct ggml_tensor * cuda_down;
+    struct ggml_moe_ffn_layout layout;
     const ggml_cuda_moe_ffn_cache_callbacks * cache_callbacks;
     void * cache_context;
-    int32_t cache_group;
-    int32_t cache_layer;
     int32_t cpu_resource_id;
     struct ggml_cgraph * cpu_graph;
     struct ggml_tensor * cpu_activations;

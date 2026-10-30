@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <string>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 static double get_rss_hwm_mib() {
@@ -421,14 +422,6 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-#ifdef GGML_USE_CUDA
-    if (use_moe_prototype && ggml_backend_cuda_get_device_count() != 2) {
-        fprintf(stderr, "%s: error: IK_LLAMA_MOE_HYBRID_PROTOTYPE requires exactly two visible CUDA devices\n", __func__);
-        llama_backend_free();
-        return 2;
-    }
-#endif
-
     sweep_vram_tracker vram_tracker;
     if (params.sweep_memory) {
         vram_tracker.start();
@@ -446,12 +439,17 @@ int main(int argc, char ** argv) {
     }
 
     llama_context_params ctx_params = common_context_params_to_llama(params);
+    if (use_moe_prototype && ctx_params.n_threads <= 0) {
+        fprintf(stderr, "%s: error: prototype CPU resource requires a positive context thread count\n", __func__);
+        llama_free_model(model);
+        llama_backend_free();
+        return 2;
+    }
 
     llama_moe_ffn_prototype_lifecycle prototype_lifecycle{};
     llama_moe_ffn_prototype_config prototype_config{};
     prototype_config.all_devices = true;
-    prototype_config.layer = 0; // Valid context-factory anchor; all-device discovery remains cache-driven.
-    prototype_config.cpu_threads = 12;
+    prototype_config.cpu_threads = ctx_params.n_threads;
     prototype_config.lifecycle = &prototype_lifecycle;
 
     llama_context * ctx = use_moe_prototype
@@ -464,25 +462,45 @@ int main(int argc, char ** argv) {
     }
 
     if (use_moe_prototype) {
-        if (!ctx->moe_ffn_prototype || !ctx->moe_ffn_prototype->valid() ||
-                ctx->moe_ffn_prototype->devices.size() != 2 ||
-                ctx->moe_ffn_prototype->layer_count() != 43) {
-            fprintf(stderr, "%s: error: prototype did not initialize both expected Qwen cache groups and 43 compatible layers\n", __func__);
+        int visible_devices = 0;
+#ifdef GGML_USE_CUDA
+        visible_devices = ggml_backend_cuda_get_device_count();
+#endif
+        const auto * prototype = ctx->moe_ffn_prototype.get();
+        bool valid = prototype && prototype->valid() && !prototype->devices.empty() && visible_devices > 0;
+        std::unordered_set<int32_t> owned_devices;
+        size_t groups = 0;
+        size_t bindings = 0;
+        if (prototype) {
+            for (const auto & device : prototype->devices) {
+                const bool device_owned = device.cuda_backend && device.cpu_resource_id > 0 &&
+                        device.device >= 0 && device.device < visible_devices &&
+                        owned_devices.insert(device.device).second && !device.groups.empty() &&
+                        !device.layer_bindings.empty();
+                valid = valid && device_owned;
+                groups += device.groups.size();
+                bindings += device.layer_bindings.size();
+                for (const auto & group : device.groups) {
+                    valid = valid && group.lease && group.snapshot.owner_backend == device.cuda_backend &&
+                            group.snapshot.device_group == device.device;
+                }
+                for (const auto & layer : device.layer_bindings) {
+                    valid = valid && layer.cuda_backend == device.cuda_backend &&
+                            layer.cpu_resource_id == device.cpu_resource_id &&
+                            layer.snapshot.owner_backend == device.cuda_backend &&
+                            layer.snapshot.device_group == device.device;
+                }
+            }
+        }
+        if (!valid || groups == 0 || bindings == 0 || bindings != prototype->layer_count()) {
+            fprintf(stderr, "%s: error: prototype failed discovered device/group/binding ownership validation\n", __func__);
             llama_free(ctx);
             llama_free_model(model);
             llama_backend_free();
             return 1;
         }
-        for (const auto & device : ctx->moe_ffn_prototype->devices) {
-            if (device.groups.size() != 1 || device.layer_bindings.empty()) {
-                fprintf(stderr, "%s: error: prototype device state lacks one group or compatible bindings\n", __func__);
-                llama_free(ctx);
-                llama_free_model(model);
-                llama_backend_free();
-                return 1;
-            }
-        }
-        LOG_TEE("f4c_prototype_activation enabled=1 devices=2 groups=2 compatible_layers=43 cpu_threads_per_device=12 seed_experts=0 split=layer\n");
+        LOG_TEE("f4c_prototype_activation enabled=1 visible_cuda_devices=%d owned_devices=%zu groups=%zu compatible_layers=%zu cpu_threads_per_device=%d seed_experts=0\n",
+                visible_devices, prototype->devices.size(), groups, bindings, prototype_config.cpu_threads);
     } else if (ctx->moe_ffn_prototype) {
         fprintf(stderr, "%s: error: ordinary context unexpectedly created prototype state\n", __func__);
         llama_free(ctx);

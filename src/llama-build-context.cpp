@@ -1720,27 +1720,30 @@ llm_expert_gating_func_type   gating_op,
     if (lctx.moe_ffn_prototype) {
         auto & proto = *lctx.moe_ffn_prototype;
         const auto * prototype_layer = proto.find_layer(il);
-        const bool prototype_shape = prototype_layer && n_tokens == 1 && !add_input &&
-                lctx.model.arch == LLM_ARCH_QWEN4EXP && lctx.model.hparams.n_layer == 48 &&
-                n_expert == 512 && n_expert_used == 10 && type_op == LLM_FFN_SILU &&
-                norm_w && !scale_w && std::abs(w_scale) <= 1e-7f &&
-                gating_op == LLM_EXPERT_GATING_FUNC_SOFTMAX && lctx.lora_adapters.empty() &&
-                gate_inp_b == nullptr && exp_probs_b == nullptr && up_exps_b == nullptr &&
-                gate_exps_b == nullptr && down_exps_b == nullptr && up_gate_exps == nullptr &&
-                up_gate_exps_b == nullptr && input_logits == nullptr && down_exps_s == nullptr &&
-                up_exps == prototype_layer->snapshot.host_up && gate_exps == prototype_layer->snapshot.host_gate &&
-                down_exps == prototype_layer->snapshot.host_down && up_exps && gate_exps && down_exps &&
-                up_exps->type == GGML_TYPE_IQ3_S && gate_exps->type == GGML_TYPE_IQ3_S &&
-                down_exps->type == GGML_TYPE_IQ4_NL &&
-                lctx.model.hadamard_rotation(up_exps) == nullptr &&
-                lctx.model.hadamard_rotation(gate_exps) == nullptr &&
-                lctx.model.hadamard_rotation(down_exps) == nullptr &&
-                cur->type == GGML_TYPE_F32 && cur->ne[0] == 2560 && cur->ne[1] == 1 &&
-                selected_experts && selected_experts->type == GGML_TYPE_I32 &&
-                weights->type == GGML_TYPE_F32 && weights->ne[0] == 1 &&
-                weights->ne[1] == n_expert_used && weights->ne[2] == 1;
-        if (prototype_shape) {
-            ggml_tensor * semantic = proto.build_node(ctx, lctx.sched, il, cur, selected_experts, weights);
+        if (prototype_layer) {
+            ggml_moe_ffn_layout layout = prototype_layer->layout;
+            layout.n_experts = n_expert > 0 && n_expert <= INT32_MAX ? (int32_t) n_expert : 0;
+            layout.n_experts_used = n_expert_used > 0 && n_expert_used <= INT32_MAX ? (int32_t) n_expert_used : 0;
+            layout.up = up_exps; layout.gate = gate_exps; layout.down = down_exps;
+            layout.activation = cur; layout.selected_ids = selected_experts; layout.route_weights = weights;
+            layout.graph_flags = 0;
+            if (n_tokens == 1 && !add_input) layout.graph_flags |= GGML_MOE_FFN_GRAPH_ONE_TOKEN;
+            if (lctx.lora_adapters.empty()) layout.graph_flags |= GGML_MOE_FFN_GRAPH_NO_LORA;
+            // `weights` above is the completed router output after all ordinary
+            // normalization/scaling. The semantic op applies it after the FFN,
+            // so reject the distinct pre-FFN weighting graph contract.
+            if (!weight_before_ffn) layout.graph_flags |= GGML_MOE_FFN_GRAPH_FINAL_ROUTE_WEIGHTS;
+            const float routed_limit = lctx.model.swiglu_limit(il, false);
+            if (type_op == LLM_FFN_SILU && std::isfinite(routed_limit) && routed_limit >= 0.0f)
+                layout.graph_flags |= GGML_MOE_FFN_GRAPH_SILU_LIMIT;
+            if (ggml_moe_ffn_expert_execution_inputs_supported(up_exps_b, gate_exps_b,
+                    down_exps_b, up_gate_exps, up_gate_exps_b, down_exps_s))
+                layout.graph_flags |= GGML_MOE_FFN_GRAPH_NO_EXPERT_EXECUTION_EXTRAS;
+            if ((!up_exps || !lctx.model.hadamard_rotation(up_exps)) &&
+                    (!gate_exps || !lctx.model.hadamard_rotation(gate_exps)) &&
+                    (!down_exps || !lctx.model.hadamard_rotation(down_exps)))
+                layout.graph_flags |= GGML_MOE_FFN_GRAPH_NO_HADAMARD;
+            ggml_tensor * semantic = proto.build_node(ctx, lctx.sched, layout);
             if (semantic) {
                 cb(semantic, "moe_ffn_prototype", il);
                 return semantic;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-moe-cache.h"
+#include "ggml-moe-ffn.h"
 
 #include <cstdint>
 #include <vector>
@@ -51,8 +52,7 @@ struct llama_moe_ffn_prototype_state {
         ggml_tensor * cpu_output = nullptr;
         int32_t binding_id = 0;
         int32_t cpu_resource_id = 0;
-        int32_t n_embd = 0;
-        int32_t n_ff = 0;
+        ggml_moe_ffn_layout layout{};
     };
 
     struct device_state {
@@ -60,6 +60,9 @@ struct llama_moe_ffn_prototype_state {
         ggml_backend * cpu_backend = nullptr;
         int32_t device = -1;
         int32_t cpu_resource_id = 0;
+        int32_t n_embd = 0;
+        int32_t n_ff = 0;
+        int32_t n_experts_used = 0;
         bool cpu_backend_transferred = false;
         std::vector<group_state> groups;
         std::vector<layer_binding> layer_bindings;
@@ -80,8 +83,8 @@ struct llama_moe_ffn_prototype_state {
     bool collect_device_stats(ggml_backend * backend, ggml_cuda_moe_ffn_stats & stats) const;
     bool collect_resource_stats(ggml_cuda_moe_ffn_cpu_resource_stats & stats) const;
     bool collect_device_resource_stats(ggml_backend * backend, ggml_cuda_moe_ffn_cpu_resource_stats & stats) const;
-    ggml_tensor * build_node(ggml_context * ctx, ggml_backend_sched_t sched, int32_t il,
-            ggml_tensor * activation, ggml_tensor * selected_ids, ggml_tensor * route_weights);
+    ggml_tensor * build_node(ggml_context * ctx, ggml_backend_sched_t sched,
+            const ggml_moe_ffn_layout & layout);
 };
 
 // Internal-only construction entry point used by the focused context fixture.
