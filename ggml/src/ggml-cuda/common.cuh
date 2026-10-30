@@ -914,6 +914,8 @@ struct ggml_tensor_extra_gpu {
 #endif
 
 struct ggml_cuda_graph;
+struct ggml_cuda_moe_ffn_binding_state;
+struct ggml_cuda_moe_ffn_cpu_resource_state;
 
 struct ggml_backend_cuda_context {
     int device;
@@ -944,6 +946,12 @@ struct ggml_backend_cuda_context {
     const void * model;
     void * copy_buffer = nullptr;
     size_t copy_size   = 0;
+
+    std::mutex moe_ffn_mutex;
+    std::unordered_map<int32_t, std::shared_ptr<ggml_cuda_moe_ffn_binding_state>> moe_ffn_bindings;
+    std::unordered_map<int32_t, std::shared_ptr<ggml_cuda_moe_ffn_cpu_resource_state>> moe_ffn_cpu_resources;
+    int32_t moe_ffn_next_binding_id = 1;
+    int32_t moe_ffn_next_cpu_resource_id = 1;
 
     explicit ggml_backend_cuda_context(int device, const void * model);
 

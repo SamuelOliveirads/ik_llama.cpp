@@ -227,3 +227,18 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 add_executable(test-moe-cache-shares test-moe-cache-shares.cpp)
 target_include_directories(test-moe-cache-shares PRIVATE ${PROJECT_SOURCE_DIR}/src)
 add_test(NAME test-moe-cache-shares COMMAND $<TARGET_FILE:test-moe-cache-shares>)
+
+if (GGML_CUDA)
+    add_executable(test-moe-hybrid-ffn test-moe-hybrid-ffn.cpp)
+    target_link_libraries(test-moe-hybrid-ffn PRIVATE common)
+    target_include_directories(test-moe-hybrid-ffn PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    add_test(NAME test-moe-hybrid-ffn COMMAND $<TARGET_FILE:test-moe-hybrid-ffn> --device 0)
+
+    add_executable(test-moe-hybrid-real test-moe-hybrid-real.cpp)
+    target_link_libraries(test-moe-hybrid-real PRIVATE common)
+    target_include_directories(test-moe-hybrid-real PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
+
+    add_executable(test-moe-hybrid-context test-moe-hybrid-context.cpp)
+    target_link_libraries(test-moe-hybrid-context PRIVATE common)
+    target_include_directories(test-moe-hybrid-context PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
+endif()

@@ -3,6 +3,7 @@
 #include "llama-cparams.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-moe-ffn-prototype.h"
 #include "llama-moe-cache.h"
 #include "llama-delta-net.h"
 
@@ -1714,6 +1715,37 @@ llm_expert_gating_func_type   gating_op,
 
     if (graph) {
         ggml_build_forward_expand(graph, weights);
+    }
+
+    if (lctx.moe_ffn_prototype) {
+        auto & proto = *lctx.moe_ffn_prototype;
+        const auto * prototype_layer = proto.find_layer(il);
+        const bool prototype_shape = prototype_layer && n_tokens == 1 && !add_input &&
+                lctx.model.arch == LLM_ARCH_QWEN4EXP && lctx.model.hparams.n_layer == 48 &&
+                n_expert == 512 && n_expert_used == 10 && type_op == LLM_FFN_SILU &&
+                norm_w && !scale_w && std::abs(w_scale) <= 1e-7f &&
+                gating_op == LLM_EXPERT_GATING_FUNC_SOFTMAX && lctx.lora_adapters.empty() &&
+                gate_inp_b == nullptr && exp_probs_b == nullptr && up_exps_b == nullptr &&
+                gate_exps_b == nullptr && down_exps_b == nullptr && up_gate_exps == nullptr &&
+                up_gate_exps_b == nullptr && input_logits == nullptr && down_exps_s == nullptr &&
+                up_exps == prototype_layer->snapshot.host_up && gate_exps == prototype_layer->snapshot.host_gate &&
+                down_exps == prototype_layer->snapshot.host_down && up_exps && gate_exps && down_exps &&
+                up_exps->type == GGML_TYPE_IQ3_S && gate_exps->type == GGML_TYPE_IQ3_S &&
+                down_exps->type == GGML_TYPE_IQ4_NL &&
+                lctx.model.hadamard_rotation(up_exps) == nullptr &&
+                lctx.model.hadamard_rotation(gate_exps) == nullptr &&
+                lctx.model.hadamard_rotation(down_exps) == nullptr &&
+                cur->type == GGML_TYPE_F32 && cur->ne[0] == 2560 && cur->ne[1] == 1 &&
+                selected_experts && selected_experts->type == GGML_TYPE_I32 &&
+                weights->type == GGML_TYPE_F32 && weights->ne[0] == 1 &&
+                weights->ne[1] == n_expert_used && weights->ne[2] == 1;
+        if (prototype_shape) {
+            ggml_tensor * semantic = proto.build_node(ctx, lctx.sched, il, cur, selected_experts, weights);
+            if (semantic) {
+                cb(semantic, "moe_ffn_prototype", il);
+                return semantic;
+            }
+        }
     }
 
     ggml_tensor * cache_ids = nullptr;

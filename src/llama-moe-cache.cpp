@@ -7,6 +7,8 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -14,11 +16,15 @@ namespace {
 
 struct moe_cache_lru {
     struct fill { int32_t expert; int32_t slot; };
+    enum class slot_state : uint8_t { FREE, COPYING, READY };
 
     int32_t n_expert = 0;
     int32_t n_slots = 0;
     std::vector<int32_t *> slot_map;
     std::vector<int32_t> key_of;
+    std::vector<uint64_t> slot_generation;
+    std::vector<uint32_t> pin_count;
+    std::vector<slot_state> state;
     std::vector<int32_t> prev;
     std::vector<int32_t> next;
     std::vector<uint32_t> seen;
@@ -32,6 +38,9 @@ struct moe_cache_lru {
         this->n_slots = n_slots;
         slot_map.assign(n_layer, nullptr);
         key_of.assign(n_slots, -1);
+        slot_generation.assign(n_slots, 0);
+        pin_count.assign(n_slots, 0);
+        state.assign(n_slots, slot_state::FREE);
         prev.resize(n_slots);
         next.resize(n_slots);
         for (int32_t s = 0; s < n_slots; ++s) {
@@ -51,6 +60,27 @@ struct moe_cache_lru {
         next[s] = -1;
         next[tail] = s;
         tail = s;
+    }
+
+    void unlink(int32_t s) {
+        if (head != s && prev[s] < 0 && next[s] < 0) return;
+        if (prev[s] >= 0) next[prev[s]] = next[s]; else head = next[s];
+        if (next[s] >= 0) prev[next[s]] = prev[s]; else tail = prev[s];
+        prev[s] = next[s] = -1;
+    }
+
+    void link_tail(int32_t s) {
+        prev[s] = tail;
+        next[s] = -1;
+        if (tail >= 0) next[tail] = s; else head = s;
+        tail = s;
+    }
+
+    uint64_t advance_generation(int32_t s) {
+        // Advance on assignment and on each pin epoch so a replayed release
+        // cannot decrement a later read of the same resident owner.
+        if (++slot_generation[s] == 0) ++slot_generation[s];
+        return slot_generation[s];
     }
 
     bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, size_t & n_eviction) {
@@ -87,6 +117,7 @@ struct moe_cache_lru {
                 ++n_eviction;
             }
             key_of[s] = il*n_expert + e;
+            advance_generation(s);
             slots[e] = s;
             touch(s);
             fills.push_back({ e, s });
@@ -136,11 +167,16 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> banks;
         size_t host_bytes = 0;
         int32_t n_slots = 0;
+        uint64_t generation = 0;
+        bool frozen = false;
         moe_cache_lru lru;
     };
     struct layer {
         int32_t group = -1;
         ggml_tensor * slot_map = nullptr;
+        ggml_tensor * host_up = nullptr;
+        ggml_tensor * host_gate = nullptr;
+        ggml_tensor * host_down = nullptr;
         std::vector<ggml_tensor *> experts;
     };
     struct binding {
@@ -167,6 +203,7 @@ struct llama_moe_cache::impl {
     size_t requested_size;
     mutable size_t large_batch_skips = 0;
     mutable size_t incompatible_layer_skips = 0;
+    mutable std::mutex state_mutex;
 
     impl(const llama_model & model, const std::vector<ggml_backend *> & backends,
             const std::vector<ggml_backend_buffer_type *> & bufts, size_t size)
@@ -292,6 +329,9 @@ struct llama_moe_cache::impl {
                 layer & l = layers[il];
                 l.group = (int32_t) (&g - groups.data());
                 l.experts = layer_experts(model.layers[il]);
+                l.host_up = model.layers[il].ffn_up_exps;
+                l.host_gate = model.layers[il].ffn_gate_exps;
+                l.host_down = model.layers[il].ffn_down_exps;
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     ggml_tensor * bank = g.banks[ip];
                     ggml_tensor * cached = ggml_view_3d(d.ctx.get(), bank, bank->ne[0], bank->ne[1], g.n_slots,
@@ -333,7 +373,11 @@ struct llama_moe_cache::impl {
         }
     }
 
-    ~impl() { log_stats(); }
+    ~impl() {
+        GGML_ASSERT(std::none_of(groups.begin(), groups.end(), [](const group & g) { return g.frozen; }) &&
+                "MoE cache destroyed while a frozen group lease is active");
+        log_stats();
+    }
 
     ggml_backend * backend(int32_t il) const {
         if (il < 0 || (size_t) il >= layers.size() || layers[il].group < 0) return nullptr;
@@ -341,12 +385,14 @@ struct llama_moe_cache::impl {
     }
 
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+        std::lock_guard<std::mutex> lock(state_mutex);
         if (il < 0 || (size_t) il >= layers.size() || layers[il].group < 0) {
             ++incompatible_layer_skips;
             return nullptr;
         }
         const layer & l = layers[il];
         const group & g = groups[l.group];
+        if (g.frozen) return nullptr;
         if (n_tokens <= 0 || n_tokens > max_batch) {
             ++large_batch_skips;
             return nullptr;
@@ -367,10 +413,12 @@ struct llama_moe_cache::impl {
             ggml_backend_sched_copy_phase phase) {
         auto it = layer_of.find(src);
         if (it == layer_of.end()) return false;
-        if (phase == GGML_BACKEND_SCHED_COPY_PHASE_QUERY) return true;
+        std::lock_guard<std::mutex> lock(state_mutex);
         const int32_t il = it->second;
         layer & l = layers[il];
         group & g = groups[l.group];
+        if (g.frozen) return false;
+        if (phase == GGML_BACKEND_SCHED_COPY_PHASE_QUERY) return true;
         const device & d = devices[g.device];
         GGML_ASSERT(backend == d.backend);
         const ggml_tensor * lookup = nullptr;
@@ -393,6 +441,7 @@ struct llama_moe_cache::impl {
         size_t n_hit = 0;
         size_t n_eviction = 0;
         if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, n_eviction)) GGML_ABORT("MoE cache slot count is smaller than the routed expert set");
+        if (++g.generation == 0) ++g.generation;
         size_t bytes = 0;
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const ggml_tensor * w = l.experts[ip];
@@ -414,6 +463,179 @@ struct llama_moe_cache::impl {
         st.evictions += n_eviction;
         st.bytes += bytes;
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+        return true;
+    }
+
+    bool freeze_group_for_layer(int32_t il, ggml_backend * expected_backend,
+            const std::vector<int32_t> & seed_experts, llama_moe_cache_frozen_layer & out) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        if (il < 0 || (size_t) il >= layers.size() || layers[il].group < 0) return false;
+        layer & l = layers[il];
+        group & g = groups[l.group];
+        device & d = devices[g.device];
+        if (g.frozen || d.backend != expected_backend || !expected_backend ||
+                l.host_up == nullptr || l.host_gate == nullptr || l.host_down == nullptr ||
+                l.experts.size() != g.banks.size()) return false;
+
+        const int32_t n_experts = g.lru.n_expert;
+        std::vector<uint8_t> seen(n_experts, 0);
+        size_t n_unique = 0;
+        for (const int32_t expert : seed_experts) {
+            if (expert < 0 || expert >= n_experts) return false;
+            if (!seen[expert]) { seen[expert] = 1; ++n_unique; }
+        }
+        if (n_unique > (size_t) g.n_slots) return false;
+        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+            if (!l.experts[ip] || !l.experts[ip]->data || !g.banks[ip]) return false;
+            auto it = bindings.find(l.experts[ip]);
+            if (it == bindings.end() || !it->second.cached) return false;
+        }
+
+        // This is invocation-local setup state. The ordinary cache uses the
+        // shared fills scratch, but a prior seed plan must never leak into an
+        // empty freeze of another layer in this group.
+        std::vector<moe_cache_lru::fill> seed_fills;
+        if (!seed_experts.empty()) {
+            size_t n_hit = 0;
+            size_t n_eviction = 0;
+            if (!g.lru.plan(il, seed_experts.data(), seed_experts.size(), seed_fills, n_hit, n_eviction)) return false;
+        }
+        size_t seed_bytes = 0;
+        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+            const ggml_tensor * weights = l.experts[ip];
+            ggml_tensor * bank = g.banks[ip];
+            const size_t expert_size = weights->nb[2];
+            for (size_t i = 0; i < seed_fills.size();) {
+                size_t n = 1;
+                while (i + n < seed_fills.size() && seed_fills[i+n].expert == seed_fills[i].expert + (int32_t)n &&
+                        seed_fills[i+n].slot == seed_fills[i].slot + (int32_t)n) ++n;
+                ggml_backend_tensor_set_async(d.backend, bank,
+                        (const uint8_t *) weights->data + seed_fills[i].expert * expert_size,
+                        seed_fills[i].slot * expert_size, n * expert_size);
+                seed_bytes += n * expert_size;
+                i += n;
+            }
+        }
+        if (!seed_fills.empty()) ggml_backend_synchronize(d.backend);
+
+        for (int32_t s = 0; s < g.lru.n_slots; ++s) {
+            g.lru.state[s] = g.lru.key_of[s] >= 0 ? moe_cache_lru::slot_state::READY : moe_cache_lru::slot_state::FREE;
+        }
+
+        if (++g.generation == 0) ++g.generation;
+        g.frozen = true;
+        out = {};
+        out.layer = il;
+        out.group = l.group;
+        out.device_group = g.device;
+        out.owner_backend = d.backend;
+        out.n_experts = n_experts;
+        out.n_slots = g.n_slots;
+        out.generation = g.generation;
+        out.seed_bytes = seed_bytes;
+        out.host_up = l.host_up;
+        out.host_gate = l.host_gate;
+        out.host_down = l.host_down;
+        auto bank_for = [&](const ggml_tensor * host) -> ggml_tensor * {
+            auto it = bindings.find(host);
+            return it == bindings.end() ? nullptr : g.banks[it->second.part];
+        };
+        auto cached_for = [&](const ggml_tensor * host) -> ggml_tensor * {
+            auto it = bindings.find(host);
+            return it == bindings.end() ? nullptr : it->second.cached;
+        };
+        out.bank_up = bank_for(out.host_up);
+        out.bank_gate = bank_for(out.host_gate);
+        out.bank_down = bank_for(out.host_down);
+        out.cached_up = cached_for(out.host_up);
+        out.cached_gate = cached_for(out.host_gate);
+        out.cached_down = cached_for(out.host_down);
+        out.group_layers = g.layers;
+        GGML_ASSERT(out.bank_up && out.bank_gate && out.bank_down && out.cached_up && out.cached_gate && out.cached_down);
+        return true;
+    }
+
+    bool frozen_snapshot_valid(const llama_moe_cache_frozen_layer & snapshot) const {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        if (snapshot.group < 0 || (size_t) snapshot.group >= groups.size()) return false;
+        const group & g = groups[snapshot.group];
+        if (!g.frozen || snapshot.generation != g.generation || snapshot.layer < 0 ||
+                (size_t) snapshot.layer >= layers.size() || layers[snapshot.layer].group != snapshot.group) return false;
+        const layer & l = layers[snapshot.layer];
+        auto same_view = [&](const ggml_tensor * host, ggml_tensor * cached, const ggml_tensor * bank) {
+            auto it = bindings.find(host);
+            return it != bindings.end() && it->second.layer == snapshot.layer &&
+                    it->second.cached == cached && g.banks[it->second.part] == bank;
+        };
+        return snapshot.host_up == l.host_up && snapshot.host_gate == l.host_gate && snapshot.host_down == l.host_down &&
+                same_view(l.host_up, snapshot.cached_up, snapshot.bank_up) &&
+                same_view(l.host_gate, snapshot.cached_gate, snapshot.bank_gate) &&
+                same_view(l.host_down, snapshot.cached_down, snapshot.bank_down);
+    }
+
+    bool frozen_layer_snapshot(const llama_moe_cache_frozen_layer & group_snapshot, int32_t il,
+            llama_moe_cache_frozen_layer & snapshot) const {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        if (group_snapshot.group < 0 || (size_t) group_snapshot.group >= groups.size() ||
+                il < 0 || (size_t) il >= layers.size()) return false;
+        const group & g = groups[group_snapshot.group];
+        if (!g.frozen || g.generation != group_snapshot.generation ||
+                group_snapshot.layer < 0 || (size_t) group_snapshot.layer >= layers.size() ||
+                layers[group_snapshot.layer].group != group_snapshot.group ||
+                layers[il].group != group_snapshot.group ||
+                std::find(g.layers.begin(), g.layers.end(), il) == g.layers.end()) return false;
+        const layer & anchor = layers[group_snapshot.layer];
+        const layer & l = layers[il];
+        auto matches = [&](const ggml_tensor * host, ggml_tensor * cached, const ggml_tensor * bank,
+                const ggml_tensor * expected_host) {
+            const auto it = bindings.find(expected_host);
+            return it != bindings.end() && it->second.layer == group_snapshot.layer &&
+                    it->second.cached == cached && g.banks[it->second.part] == bank && host == expected_host;
+        };
+        if (!matches(group_snapshot.host_up, group_snapshot.cached_up, group_snapshot.bank_up, anchor.host_up) ||
+                !matches(group_snapshot.host_gate, group_snapshot.cached_gate, group_snapshot.bank_gate, anchor.host_gate) ||
+                !matches(group_snapshot.host_down, group_snapshot.cached_down, group_snapshot.bank_down, anchor.host_down) ||
+                !l.host_up || !l.host_gate || !l.host_down || l.experts.size() != g.banks.size()) return false;
+        auto bank_for = [&](const ggml_tensor * host) -> const ggml_tensor * {
+            const auto it = bindings.find(host);
+            return it == bindings.end() ? nullptr : g.banks[it->second.part];
+        };
+        auto cached_for = [&](const ggml_tensor * host) -> ggml_tensor * {
+            const auto it = bindings.find(host);
+            return it == bindings.end() ? nullptr : it->second.cached;
+        };
+        snapshot = {};
+        snapshot.layer = il;
+        snapshot.group = group_snapshot.group;
+        snapshot.device_group = g.device;
+        snapshot.owner_backend = devices[g.device].backend;
+        snapshot.n_experts = g.lru.n_expert;
+        snapshot.n_slots = g.n_slots;
+        snapshot.generation = g.generation;
+        snapshot.host_up = l.host_up;
+        snapshot.host_gate = l.host_gate;
+        snapshot.host_down = l.host_down;
+        snapshot.bank_up = bank_for(l.host_up);
+        snapshot.bank_gate = bank_for(l.host_gate);
+        snapshot.bank_down = bank_for(l.host_down);
+        snapshot.cached_up = cached_for(l.host_up);
+        snapshot.cached_gate = cached_for(l.host_gate);
+        snapshot.cached_down = cached_for(l.host_down);
+        snapshot.group_layers = g.layers;
+        return snapshot.bank_up && snapshot.bank_gate && snapshot.bank_down &&
+                snapshot.cached_up && snapshot.cached_gate && snapshot.cached_down;
+    }
+
+    bool release_frozen_group(const llama_moe_cache_frozen_layer & snapshot) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        if (snapshot.group < 0 || (size_t) snapshot.group >= groups.size()) return false;
+        group & g = groups[snapshot.group];
+        if (!g.frozen || snapshot.generation != g.generation) return false;
+        for (int32_t s = 0; s < g.lru.n_slots; ++s) {
+            if (g.lru.pin_count[s] != 0 || g.lru.state[s] == moe_cache_lru::slot_state::COPYING) return false;
+        }
+        g.frozen = false;
+        if (++g.generation == 0) ++g.generation;
         return true;
     }
 
@@ -442,8 +664,287 @@ llama_moe_cache::llama_moe_cache(const llama_model & model,
         : pimpl(new impl(model, backends, bufts, size)) {}
 
 llama_moe_cache::~llama_moe_cache() = default;
+
+llama_moe_cache::frozen_lease::frozen_lease(frozen_lease && other) noexcept
+        : owner(other.owner), descriptor(std::move(other.descriptor)) {
+    other.owner = nullptr;
+    other.descriptor = {};
+}
+
+llama_moe_cache::frozen_lease & llama_moe_cache::frozen_lease::operator=(frozen_lease && other) noexcept {
+    if (this != &other) {
+        if (owner && !release()) GGML_ABORT("failed to release frozen MoE cache group during lease move assignment");
+        owner = other.owner;
+        descriptor = std::move(other.descriptor);
+        other.owner = nullptr;
+        other.descriptor = {};
+    }
+    return *this;
+}
+
+llama_moe_cache::frozen_lease::~frozen_lease() {
+    if (owner && !release()) GGML_ABORT("failed to release frozen MoE cache group during lease destruction");
+}
+
+bool llama_moe_cache::frozen_lease::release() {
+    if (!owner) return false;
+    if (!owner->release_frozen_group(descriptor)) return false;
+    owner = nullptr;
+    descriptor = {};
+    return true;
+}
+
 ggml_backend * llama_moe_cache::backend(int32_t il) const { return pimpl->backend(il); }
 ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const { return pimpl->get_slot_map(il, n_tokens, n_expert_used); }
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * t) const { return pimpl->get_experts(t); }
 bool llama_moe_cache::copy(ggml_backend * backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph,
         ggml_backend_sched_copy_phase phase) { return pimpl->copy(backend, src, dst, graph, phase); }
+
+bool llama_moe_cache::resolve_and_pin(int32_t device, int32_t group_id, int32_t il, uint64_t owner_generation,
+        const int32_t * ids, int32_t n_ids, ggml_cuda_moe_ffn_resolution * result) {
+    if (!ids || !result || n_ids <= 0 || n_ids > GGML_CUDA_MOE_FFN_MAX_SELECTED) return false;
+    std::lock_guard<std::mutex> lock(pimpl->state_mutex);
+    if (group_id < 0 || (size_t) group_id >= pimpl->groups.size() ||
+            il < 0 || (size_t) il >= pimpl->layers.size()) return false;
+    auto & g = pimpl->groups[group_id];
+    auto & l = pimpl->layers[il];
+    if (!g.frozen || g.generation != owner_generation || g.device != device ||
+            l.group != group_id || !g.lru.slot_map[il]) return false;
+
+    ggml_cuda_moe_ffn_resolution resolved{};
+    resolved.n_draws = n_ids;
+    for (int32_t i = 0; i < n_ids; ++i) {
+        const int32_t expert = ids[i];
+        if (expert < 0 || expert >= g.lru.n_expert) return false;
+        const int32_t slot = g.lru.slot_map[il][expert];
+        if (slot < -1 || slot >= g.lru.n_slots) return false;
+        resolved.draw_slots[i] = slot;
+        if (slot < 0) continue;
+        if (g.lru.state[slot] != moe_cache_lru::slot_state::READY ||
+                g.lru.key_of[slot] != il*g.lru.n_expert + expert ||
+                g.lru.slot_generation[slot] == 0 || g.lru.pin_count[slot] != 0) return false;
+        bool already_added = false;
+        for (int32_t p = 0; p < resolved.n_pins; ++p) {
+            already_added |= resolved.pins[p].slot == slot;
+        }
+        if (!already_added) {
+            auto & token = resolved.pins[resolved.n_pins++];
+            token.owner = this;
+            token.device = device;
+            token.group = group_id;
+            token.layer = il;
+            token.slot = slot;
+            token.key = il*g.lru.n_expert + expert;
+            token.owner_generation = owner_generation;
+        }
+    }
+
+    for (int32_t p = 0; p < resolved.n_pins; ++p) {
+        auto & token = resolved.pins[p];
+        token.generation = g.lru.advance_generation(token.slot);
+        ++g.lru.pin_count[token.slot];
+        g.lru.touch(token.slot);
+    }
+    *result = resolved;
+    return true;
+}
+
+bool llama_moe_cache::release_pins(const ggml_cuda_moe_ffn_pin_token * pins, int32_t n_pins) {
+    if (!pins || n_pins <= 0 || n_pins > GGML_CUDA_MOE_FFN_MAX_SELECTED) return false;
+    std::lock_guard<std::mutex> lock(pimpl->state_mutex);
+    for (int32_t i = 0; i < n_pins; ++i) {
+        const auto & token = pins[i];
+        if (token.owner != this || token.group < 0 || (size_t) token.group >= pimpl->groups.size() ||
+                token.layer < 0 || (size_t) token.layer >= pimpl->layers.size()) return false;
+        const auto & g = pimpl->groups[token.group];
+        const auto & l = pimpl->layers[token.layer];
+        if (!g.frozen || g.device != token.device || l.group != token.group ||
+                g.generation != token.owner_generation ||
+                token.key < 0 || token.key / g.lru.n_expert != token.layer ||
+                token.slot < 0 || token.slot >= g.lru.n_slots || !g.lru.slot_map[token.layer] ||
+                g.lru.state[token.slot] != moe_cache_lru::slot_state::READY ||
+                g.lru.key_of[token.slot] != token.key ||
+                g.lru.slot_generation[token.slot] != token.generation ||
+                g.lru.pin_count[token.slot] != 1 ||
+                g.lru.slot_map[token.layer][token.key % g.lru.n_expert] != token.slot) return false;
+        for (int32_t j = 0; j < i; ++j) {
+            if (pins[j].owner == token.owner && pins[j].group == token.group &&
+                    pins[j].slot == token.slot && pins[j].generation == token.generation) return false;
+        }
+    }
+    for (int32_t i = 0; i < n_pins; ++i) --pimpl->groups[pins[i].group].lru.pin_count[pins[i].slot];
+    return true;
+}
+
+bool llama_moe_cache::reserve_fill(int32_t device, int32_t group_id, int32_t il,
+        uint64_t owner_generation, int32_t expert, ggml_cuda_moe_ffn_fill_job * job) {
+    if (!job) return false;
+    std::lock_guard<std::mutex> lock(pimpl->state_mutex);
+    if (group_id < 0 || (size_t) group_id >= pimpl->groups.size() ||
+            il < 0 || (size_t) il >= pimpl->layers.size()) return false;
+    auto & g = pimpl->groups[group_id];
+    auto & l = pimpl->layers[il];
+    if (!g.frozen || g.generation != owner_generation || g.device != device ||
+            l.group != group_id || expert < 0 || expert >= g.lru.n_expert ||
+            !g.lru.slot_map[il] || l.experts.size() != GGML_CUDA_MOE_FFN_MAX_FILL_PARTS ||
+            g.banks.size() != l.experts.size() || g.lru.slot_map[il][expert] >= 0) return false;
+
+    const int64_t key64 = int64_t(il) * g.lru.n_expert + expert;
+    if (key64 < 0 || key64 > std::numeric_limits<int32_t>::max()) return false;
+    const int32_t key = (int32_t) key64;
+    for (int32_t s = 0; s < g.lru.n_slots; ++s) {
+        if (g.lru.state[s] == moe_cache_lru::slot_state::COPYING && g.lru.key_of[s] == key) return false;
+    }
+
+    int32_t slot = -1;
+    int32_t old_key = -1;
+    for (int32_t s = 0; s < g.lru.n_slots; ++s) {
+        if (g.lru.state[s] == moe_cache_lru::slot_state::FREE &&
+                g.lru.key_of[s] < 0 && g.lru.pin_count[s] == 0) { slot = s; break; }
+    }
+    if (slot < 0) {
+        for (int32_t s = g.lru.head; s >= 0; s = g.lru.next[s]) {
+            if (g.lru.state[s] != moe_cache_lru::slot_state::READY ||
+                    g.lru.key_of[s] < 0 || g.lru.pin_count[s] != 0) continue;
+            const int32_t resident_key = g.lru.key_of[s];
+            const int32_t resident_layer = resident_key / g.lru.n_expert;
+            const int32_t resident_expert = resident_key % g.lru.n_expert;
+            if (resident_layer < 0 || (size_t) resident_layer >= pimpl->layers.size() ||
+                    pimpl->layers[resident_layer].group != group_id ||
+                    !g.lru.slot_map[resident_layer] ||
+                    g.lru.slot_map[resident_layer][resident_expert] != s) return false;
+            slot = s;
+            old_key = resident_key;
+            break;
+        }
+    }
+    if (slot < 0) return false;
+
+    ggml_cuda_moe_ffn_fill_job pending{};
+    pending.owner = this;
+    pending.device = device;
+    pending.group = group_id;
+    pending.layer = il;
+    pending.slot = slot;
+    pending.key = key;
+    pending.owner_generation = owner_generation;
+    pending.n_parts = GGML_CUDA_MOE_FFN_MAX_FILL_PARTS;
+    const ggml_tensor * canonical_parts[GGML_CUDA_MOE_FFN_MAX_FILL_PARTS] = {
+        l.host_up, l.host_gate, l.host_down,
+    };
+    for (int32_t ip = 0; ip < pending.n_parts; ++ip) {
+        const ggml_tensor * weights = canonical_parts[ip];
+        const auto part = std::find(l.experts.begin(), l.experts.end(), weights);
+        if (!weights || part == l.experts.end()) return false;
+        const size_t bank_index = std::distance(l.experts.begin(), part);
+        ggml_tensor * bank = g.banks[bank_index];
+        if (!weights || !weights->data || !bank || !bank->data || weights->nb[2] == 0 ||
+                (size_t) expert > std::numeric_limits<size_t>::max() / weights->nb[2] ||
+                (size_t) slot > std::numeric_limits<size_t>::max() / weights->nb[2]) return false;
+        const size_t bytes = weights->nb[2];
+        const size_t source_offset = (size_t) expert * bytes;
+        const size_t destination_offset = (size_t) slot * bytes;
+        const size_t source_bytes = ggml_nbytes(weights);
+        const size_t bank_bytes = ggml_nbytes(bank);
+        if (source_offset > source_bytes || bytes > source_bytes - source_offset ||
+                destination_offset > bank_bytes || bytes > bank_bytes - destination_offset ||
+                pending.total_bytes > std::numeric_limits<size_t>::max() - bytes) return false;
+        pending.parts[ip] = { (const uint8_t *) weights->data + source_offset,
+                (uint8_t *) bank->data + destination_offset, bytes };
+        pending.total_bytes += bytes;
+    }
+    if (pending.total_bytes == 0) return false;
+
+    if (old_key >= 0) {
+        const int32_t old_layer = old_key / g.lru.n_expert;
+        const int32_t old_expert = old_key % g.lru.n_expert;
+        g.lru.slot_map[old_layer][old_expert] = -1;
+    }
+    pending.generation = g.lru.advance_generation(slot);
+    g.lru.key_of[slot] = key;
+    g.lru.state[slot] = moe_cache_lru::slot_state::COPYING;
+    g.lru.unlink(slot);
+    *job = pending;
+    return true;
+}
+
+bool llama_moe_cache::finish_fill(const ggml_cuda_moe_ffn_fill_job * job, bool copied) {
+    if (!job || job->owner != this || job->n_parts != GGML_CUDA_MOE_FFN_MAX_FILL_PARTS) return false;
+    std::lock_guard<std::mutex> lock(pimpl->state_mutex);
+    if (job->group < 0 || (size_t) job->group >= pimpl->groups.size() ||
+            job->layer < 0 || (size_t) job->layer >= pimpl->layers.size()) return false;
+    auto & g = pimpl->groups[job->group];
+    auto & l = pimpl->layers[job->layer];
+    if (!g.frozen || g.generation != job->owner_generation || g.device != job->device ||
+            l.group != job->group || job->slot < 0 || job->slot >= g.lru.n_slots ||
+            job->key < 0 || job->key / g.lru.n_expert != job->layer ||
+            !g.lru.slot_map[job->layer] || g.lru.state[job->slot] != moe_cache_lru::slot_state::COPYING ||
+            g.lru.key_of[job->slot] != job->key || g.lru.slot_generation[job->slot] != job->generation ||
+            g.lru.pin_count[job->slot] != 0 || g.lru.slot_map[job->layer][job->key % g.lru.n_expert] >= 0) return false;
+
+    if (copied) {
+        g.lru.slot_map[job->layer][job->key % g.lru.n_expert] = job->slot;
+        g.lru.state[job->slot] = moe_cache_lru::slot_state::READY;
+        g.lru.link_tail(job->slot);
+    } else {
+        g.lru.key_of[job->slot] = -1;
+        g.lru.state[job->slot] = moe_cache_lru::slot_state::FREE;
+        g.lru.link_tail(job->slot);
+    }
+    return true;
+}
+
+namespace {
+bool llama_moe_cache_resolve_callback(void * context, int32_t device, int32_t group, int32_t layer,
+        uint64_t owner_generation, const int32_t * ids, int32_t n_ids, ggml_cuda_moe_ffn_resolution * result) {
+    return context && static_cast<llama_moe_cache *>(context)->resolve_and_pin(
+            device, group, layer, owner_generation, ids, n_ids, result);
+}
+
+bool llama_moe_cache_release_callback(void * context, const ggml_cuda_moe_ffn_pin_token * pins, int32_t n_pins) {
+    return context && static_cast<llama_moe_cache *>(context)->release_pins(pins, n_pins);
+}
+
+bool llama_moe_cache_reserve_fill_callback(void * context, int32_t device, int32_t group,
+        int32_t layer, uint64_t owner_generation, int32_t expert, ggml_cuda_moe_ffn_fill_job * job) {
+    return context && static_cast<llama_moe_cache *>(context)->reserve_fill(
+            device, group, layer, owner_generation, expert, job);
+}
+
+bool llama_moe_cache_finish_fill_callback(void * context, const ggml_cuda_moe_ffn_fill_job * job, bool copied) {
+    return context && static_cast<llama_moe_cache *>(context)->finish_fill(job, copied);
+}
+} // namespace
+
+const ggml_cuda_moe_ffn_cache_callbacks * llama_moe_cache_get_cuda_callbacks() {
+    static const ggml_cuda_moe_ffn_cache_callbacks callbacks = {
+        llama_moe_cache_resolve_callback,
+        llama_moe_cache_release_callback,
+        llama_moe_cache_reserve_fill_callback,
+        llama_moe_cache_finish_fill_callback,
+    };
+    return &callbacks;
+}
+
+bool llama_moe_cache::freeze_group_for_layer(int32_t il, ggml_backend * expected_backend,
+        const std::vector<int32_t> & seed_experts, frozen_lease & lease) {
+    if (lease) return false;
+    llama_moe_cache_frozen_layer descriptor;
+    if (!pimpl->freeze_group_for_layer(il, expected_backend, seed_experts, descriptor)) return false;
+    lease.owner = this;
+    lease.descriptor = std::move(descriptor);
+    return true;
+}
+
+bool llama_moe_cache::frozen_snapshot_valid(const llama_moe_cache_frozen_layer & descriptor) const {
+    return pimpl->frozen_snapshot_valid(descriptor);
+}
+
+bool llama_moe_cache::frozen_layer_snapshot(const llama_moe_cache_frozen_layer & group_snapshot,
+        int32_t il, llama_moe_cache_frozen_layer & snapshot) const {
+    return pimpl->frozen_layer_snapshot(group_snapshot, il, snapshot);
+}
+
+bool llama_moe_cache::release_frozen_group(const llama_moe_cache_frozen_layer & descriptor) {
+    return pimpl->release_frozen_group(descriptor);
+}

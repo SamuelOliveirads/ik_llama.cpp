@@ -25,6 +25,7 @@
 #include "llama-hparams.h"
 #include "llama-context.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-ffn-prototype.h"
 #include "llama-spec-features.h"
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
@@ -909,6 +910,10 @@ llama_context::~llama_context() {
     free_dflash_kv_cache_tensors();
     free_dsv4_cache_tensors();
     ggml_backend_sched_free(sched);
+    if (moe_ffn_prototype) {
+        moe_ffn_prototype->shutdown();
+        moe_ffn_prototype.reset();
+    }
     moe_cache.reset();
 
     for (ggml_backend_t backend : backends) {
@@ -9318,9 +9323,10 @@ static void llama_repack_up_gate_exps(llama_context & lctx) {
     }
 }
 
-struct llama_context * llama_init_from_model(
+static struct llama_context * llama_init_from_model_internal(
                  struct llama_model * model,
-        struct llama_context_params   params) {
+        struct llama_context_params   params,
+        const llama_moe_ffn_prototype_config * prototype_config) {
 
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
@@ -10069,6 +10075,21 @@ struct llama_context * llama_init_from_model(
                 }
             }
 
+            if (prototype_config) {
+                if (!ctx->moe_cache || prototype_config->layer < 0 ||
+                        (size_t) prototype_config->layer >= model->layers.size()) {
+                    LLAMA_LOG_ERROR("%s: MoE FFN prototype requires a valid cache-group anchor layer\n", __func__);
+                    llama_free(ctx);
+                    return nullptr;
+                }
+                ctx->moe_ffn_prototype = std::make_unique<llama_moe_ffn_prototype_state>();
+                if (!ctx->moe_ffn_prototype->initialize(*ctx->moe_cache, *model, *prototype_config)) {
+                    LLAMA_LOG_ERROR("%s: failed to initialize the internal MoE FFN prototype\n", __func__);
+                    llama_free(ctx);
+                    return nullptr;
+                }
+            }
+
             // build worst-case graph
             int n_past = cparams.n_ctx - n_tokens;
             llama_token token = llama_token_bos(&ctx->model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
@@ -10188,6 +10209,15 @@ struct llama_context * llama_init_from_model(
     }
 
     return ctx;
+}
+
+struct llama_context * llama_init_from_model(struct llama_model * model, struct llama_context_params params) {
+    return llama_init_from_model_internal(model, params, nullptr);
+}
+
+struct llama_context * llama_init_from_model_with_moe_ffn_prototype(struct llama_model * model,
+        struct llama_context_params params, const llama_moe_ffn_prototype_config & config) {
+    return llama_init_from_model_internal(model, params, &config);
 }
 
 void llama_free(struct llama_context * ctx) {
