@@ -4,7 +4,6 @@
 #include "ggml-backend.h"
 #include "ggml-moe-ffn.h"
 
-enum { GGML_CUDA_MOE_FFN_MAX_FILL_PARTS = GGML_MOE_FFN_PARTS };
 enum { GGML_CUDA_MOE_FFN_PHASE_SAMPLE_CAPACITY = 4096 };
 
 typedef struct ggml_cuda_moe_ffn_phase_sample {
@@ -20,6 +19,11 @@ typedef struct ggml_cuda_moe_ffn_fill_part {
     const void * source;
     void * destination;
     size_t bytes;
+    // A merged up+gate parent is one physical payload, but the loader may
+    // store its two logical views in separate expert planes.
+    const void * source2;
+    void * destination2;
+    size_t bytes2;
 } ggml_cuda_moe_ffn_fill_part;
 
 typedef struct ggml_cuda_moe_ffn_fill_job {
@@ -31,9 +35,7 @@ typedef struct ggml_cuda_moe_ffn_fill_job {
     int32_t key;
     uint64_t owner_generation;
     uint64_t generation;
-    int32_t n_parts;
     size_t total_bytes;
-    ggml_cuda_moe_ffn_fill_part parts[GGML_CUDA_MOE_FFN_MAX_FILL_PARTS];
 } ggml_cuda_moe_ffn_fill_job;
 
 typedef struct ggml_cuda_moe_ffn_pin_token {
@@ -50,8 +52,10 @@ typedef struct ggml_cuda_moe_ffn_pin_token {
 typedef struct ggml_cuda_moe_ffn_resolution {
     int32_t n_draws;
     int32_t n_pins;
-    int32_t draw_slots[GGML_MOE_FFN_MAX_SELECTED];
-    ggml_cuda_moe_ffn_pin_token pins[GGML_MOE_FFN_MAX_SELECTED];
+    int32_t * draw_slots;
+    size_t draw_capacity;
+    ggml_cuda_moe_ffn_pin_token * pins;
+    size_t pin_capacity;
 } ggml_cuda_moe_ffn_resolution;
 
 typedef bool (*ggml_cuda_moe_ffn_resolve_and_pin_fn)(void * context,
@@ -61,7 +65,8 @@ typedef bool (*ggml_cuda_moe_ffn_release_pins_fn)(void * context,
         const ggml_cuda_moe_ffn_pin_token * pins, int32_t n_pins);
 typedef bool (*ggml_cuda_moe_ffn_reserve_fill_fn)(void * context,
         int32_t device, int32_t group, int32_t layer, uint64_t owner_generation,
-        int32_t expert, ggml_cuda_moe_ffn_fill_job * job);
+        int32_t expert, ggml_cuda_moe_ffn_fill_job * job,
+        ggml_cuda_moe_ffn_fill_part * parts, size_t part_capacity);
 typedef bool (*ggml_cuda_moe_ffn_finish_fill_fn)(void * context,
         const ggml_cuda_moe_ffn_fill_job * job, bool copied);
 
@@ -72,12 +77,21 @@ typedef struct ggml_cuda_moe_ffn_cache_callbacks {
     ggml_cuda_moe_ffn_finish_fill_fn finish_fill;
 } ggml_cuda_moe_ffn_cache_callbacks;
 
+typedef struct ggml_cuda_moe_ffn_resource_signature {
+    int32_t n_embd;
+    int32_t n_ff;
+    int32_t n_experts_used;
+} ggml_cuda_moe_ffn_resource_signature;
+
 typedef struct ggml_cuda_moe_ffn_cpu_resource {
     ggml_backend_t cpu_backend; // ownership transfers on successful registration
+    // Scratch-capacity envelope covering the explicitly registered signatures.
     int32_t n_embd;
     int32_t n_ff;
     int32_t n_experts_used;
     int32_t n_threads;
+    const ggml_cuda_moe_ffn_resource_signature * signatures; // copied on registration
+    size_t n_signatures;
 } ggml_cuda_moe_ffn_cpu_resource;
 
 typedef struct ggml_cuda_moe_ffn_cpu_resource_stats {
@@ -140,6 +154,8 @@ typedef struct ggml_cuda_moe_ffn_stats {
 
 // Internal model-free binding. The registered CPU resource owns the CPU backend;
 // each binding borrows it until binding unregister completes.
+GGML_API GGML_CALL bool ggml_backend_cuda_moe_ffn_layout_supported(ggml_backend_t backend,
+        const struct ggml_moe_ffn_layout * layout);
 GGML_API GGML_CALL int32_t ggml_backend_cuda_moe_ffn_register(ggml_backend_t backend,
         const ggml_cuda_moe_ffn_binding * binding);
 GGML_API GGML_CALL int32_t ggml_backend_cuda_moe_ffn_cpu_resource_register(ggml_backend_t backend,

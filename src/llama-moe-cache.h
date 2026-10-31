@@ -29,12 +29,15 @@ struct llama_moe_cache_frozen_layer {
     const ggml_tensor * host_up = nullptr;
     const ggml_tensor * host_gate = nullptr;
     const ggml_tensor * host_down = nullptr;
+    const ggml_tensor * host_up_gate_storage = nullptr;
     const ggml_tensor * bank_up = nullptr;
     const ggml_tensor * bank_gate = nullptr;
     const ggml_tensor * bank_down = nullptr;
+    const ggml_tensor * bank_up_gate_storage = nullptr;
     ggml_tensor * cached_up = nullptr;
     ggml_tensor * cached_gate = nullptr;
     ggml_tensor * cached_down = nullptr;
+    ggml_tensor * cached_up_gate_storage = nullptr;
     std::vector<int32_t> group_layers;
 };
 
@@ -80,7 +83,8 @@ public:
             const int32_t * ids, int32_t n_ids, ggml_cuda_moe_ffn_resolution * result);
     bool release_pins(const ggml_cuda_moe_ffn_pin_token * pins, int32_t n_pins);
     bool reserve_fill(int32_t device, int32_t group, int32_t layer, uint64_t owner_generation,
-            int32_t expert, ggml_cuda_moe_ffn_fill_job * job);
+            int32_t expert, ggml_cuda_moe_ffn_fill_job * job,
+            ggml_cuda_moe_ffn_fill_part * parts, size_t part_capacity);
     bool finish_fill(const ggml_cuda_moe_ffn_fill_job * job, bool copied);
 
 private:

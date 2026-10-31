@@ -355,7 +355,7 @@ bool evaluate_sequence(llama_context * ctx, llama_model * model, const std::vect
     return true;
 }
 
-llama_model * load_model(bool dual_device, const std::string & model_path) {
+llama_model * load_model(bool dual_device, const std::string & model_path, bool merge_up_gate) {
     llama_model_params params = llama_model_default_params();
     params.n_gpu_layers = 99;
     params.max_gpu = dual_device ? 2 : 1;
@@ -366,7 +366,7 @@ llama_model * load_model(bool dual_device, const std::string & model_path) {
     params.ncmoe = 999;
     params.use_mmap = true;
     params.fit = false;
-    params.merge_up_gate_exps = false;
+    params.merge_up_gate_exps = merge_up_gate;
     return llama_model_load_from_file(model_path.c_str(), params);
 }
 
@@ -387,21 +387,18 @@ bool lifecycle_zero(const llama_moe_ffn_prototype_lifecycle & lifecycle) {
 }
 
 size_t print_layout_inventory(const llama_model & model, const llama_moe_ffn_prototype_state & proto,
-        size_t & routed, size_t & unsupported_types) {
+        size_t & routed, size_t & unbound) {
     size_t accepted = 0;
-    routed = unsupported_types = 0;
+    routed = unbound = 0;
     for (size_t il = 0; il < model.layers.size(); ++il) {
         const auto & layer = model.layers[il];
         if (!layer.ffn_up_exps && !layer.ffn_gate_exps && !layer.ffn_down_exps) continue;
         ++routed;
-        const bool tuple = layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps &&
-                ggml_moe_ffn_types_supported(layer.ffn_up_exps->type, layer.ffn_gate_exps->type,
-                    layer.ffn_down_exps->type);
         const auto * binding = proto.find_layer((int32_t) il);
         if (binding) ++accepted;
-        if (!tuple) ++unsupported_types;
+        if (!binding) ++unbound;
         const int owner = il < model.default_layer_device.size() ? model.default_layer_device[il] : -1;
-        const char * reason = binding ? "accepted" : !tuple ? "unsupported-quant-tuple" : "ordinary-layout-or-semantics-fallback";
+        const char * reason = binding ? "accepted" : "ordinary-capability-or-semantics-fallback";
         std::printf("routed_layer_inventory layer=%zu owner=%d up=%s gate=%s down=%s shape_up=[%lld,%lld,%lld] shape_down=[%lld,%lld,%lld] strides=[%zu,%zu,%zu]/[%zu,%zu,%zu] binding=%d reason=%s\n",
                 il, owner, layer.ffn_up_exps ? ggml_type_name(layer.ffn_up_exps->type) : "none",
                 layer.ffn_gate_exps ? ggml_type_name(layer.ffn_gate_exps->type) : "none",
@@ -420,15 +417,15 @@ size_t print_layout_inventory(const llama_model & model, const llama_moe_ffn_pro
                 layer.ffn_down_exps ? layer.ffn_down_exps->nb[2] : 0,
                 binding ? binding->binding_id : 0, reason);
     }
-    std::printf("routed_layer_inventory_summary routed=%zu accepted=%zu unsupported_types=%zu selected=%d\n",
-            routed, accepted, unsupported_types, N_SELECTED);
+    std::printf("routed_layer_inventory_summary routed=%zu accepted=%zu unbound=%zu selected=%d\n",
+            routed, accepted, unbound, N_SELECTED);
     return accepted;
 }
 
 bool glm_trunk_inventory_contract(const llama_model & model, const llama_moe_ffn_prototype_state & proto,
         size_t expected_bindings) {
-    size_t routed_layers = 0, unsupported_types = 0;
-    const size_t inventoried_bindings = print_layout_inventory(model, proto, routed_layers, unsupported_types);
+    size_t routed_layers = 0, unbound = 0;
+    const size_t inventoried_bindings = print_layout_inventory(model, proto, routed_layers, unbound);
     if (!expected_bindings) return true;
     const size_t trunk_boundary = model.hparams.n_layer_kv_from_start >= 0 ?
             (size_t) model.hparams.n_layer_kv_from_start : 0;
@@ -453,20 +450,20 @@ bool glm_trunk_inventory_contract(const llama_model & model, const llama_moe_ffn
     const bool valid = metadata_contract && !mtp_triplet_loaded && !mtp_binding_registered &&
             !routed_outside_trunk && routed_trunk_layers == expected_bindings &&
             routed_layers == expected_bindings && inventoried_bindings == expected_bindings &&
-            unsupported_types == 0;
+            unbound == 0;
     std::printf("glm_trunk_inventory nextn_predict_layers=%u trunk_boundary=%zu declared_layers=%zu "
-            "routed_trunk=%zu routed_total=%zu accepted=%zu unsupported_loaded=%zu "
+            "routed_trunk=%zu routed_total=%zu accepted=%zu unbound_loaded=%zu "
             "mtp_layer=%zu mtp_triplet_loaded=%d mtp_binding=%d valid=%d\n",
             model.hparams.nextn_predict_layers, trunk_boundary, model.layers.size(),
-            routed_trunk_layers, routed_layers, inventoried_bindings, unsupported_types,
+            routed_trunk_layers, routed_layers, inventoried_bindings, unbound,
             trunk_boundary, mtp_triplet_loaded ? 1 : 0, mtp_binding_registered ? 1 : 0, valid ? 1 : 0);
     return valid;
 }
 
 bool dsv4_trunk_inventory_contract(const llama_model & model, const llama_moe_ffn_prototype_state & proto,
         size_t expected_bindings) {
-    size_t routed = 0, unsupported = 0;
-    const size_t accepted = print_layout_inventory(model, proto, routed, unsupported);
+    size_t routed = 0, unbound = 0;
+    const size_t accepted = print_layout_inventory(model, proto, routed, unbound);
     std::array<size_t, 4> tuples{};
     bool semantics_ok = true;
     for (size_t il = 0; il < model.layers.size(); ++il) {
@@ -490,12 +487,12 @@ bool dsv4_trunk_inventory_contract(const llama_model & model, const llama_moe_ff
                 !layer.ffn_down_exps_s;
     }
     const bool valid = expected_bindings == 43 && routed == expected_bindings && accepted == expected_bindings &&
-            unsupported == 0 && semantics_ok && tuples == std::array<size_t, 4>{25, 16, 1, 1} &&
+            unbound == 0 && semantics_ok && tuples == std::array<size_t, 4>{25, 16, 1, 1} &&
             model.hparams.n_expert == 256 && model.hparams.n_expert_used == 6 && model.hparams.n_embd == 4096 &&
             model.hparams.expert_gating_func == LLM_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS &&
             model.hparams.expert_weights_norm && model.hparams.expert_weights_scale == 1.5f;
-    std::printf("dsv4_trunk_inventory routed=%zu accepted=%zu unsupported=%zu tuple_counts=%zu/%zu/%zu/%zu "
-            "selected=%d normalized=%d scale=%.9g valid=%d\n", routed, accepted, unsupported,
+    std::printf("dsv4_trunk_inventory routed=%zu accepted=%zu unbound=%zu tuple_counts=%zu/%zu/%zu/%zu "
+            "selected=%d normalized=%d scale=%.9g valid=%d\n", routed, accepted, unbound,
             tuples[0], tuples[1], tuples[2], tuples[3], model.hparams.n_expert_used,
             model.hparams.expert_weights_norm, model.hparams.expert_weights_scale, valid ? 1 : 0);
     return valid;
@@ -772,11 +769,12 @@ bool run_hybrid(llama_model * model, const std::vector<llama_token> & tokens, co
                 account.resource.fills_accepted > 0 && account.resource.fills_completed == account.resource.fills_accepted &&
                 account.resource.fills_failed == 0 && account.resource.fill_outstanding == 0 &&
                 account.resource.pending_pin_active == 0;
-        std::printf("device_account arm=%s device=%d groups=%zu bindings=%zu semantic_ops=%llu gpu_rows=%llu cpu_rows=%llu fills=%llu completed=%llu rejected=%llu failed=%llu transport_bytes=%llu active_bindings=%llu outstanding=%llu pins=%llu path_ok=%d\n",
+        std::printf("device_account arm=%s device=%d groups=%zu bindings=%zu semantic_ops=%llu gpu_rows=%llu cpu_rows=%llu fills=%llu completed=%llu completed_physical_parts=%llu rejected=%llu failed=%llu transport_bytes=%llu active_bindings=%llu outstanding=%llu pins=%llu path_ok=%d\n",
                 label, account.device, device.groups.size(), device.layer_bindings.size(),
                 (unsigned long long)(account.stats.all_hit_calls + account.stats.any_miss_calls),
                 (unsigned long long)account.stats.gpu_hit_draws, (unsigned long long)account.stats.cpu_miss_draws,
                 (unsigned long long)account.resource.fills_accepted, (unsigned long long)account.resource.fills_completed,
+                (unsigned long long)account.resource.fill_parts_completed,
                 (unsigned long long)account.resource.fills_rejected, (unsigned long long)account.resource.fills_failed,
                 (unsigned long long)account.resource.fill_bytes_completed, (unsigned long long)account.resource.active_bindings,
                 (unsigned long long)account.resource.fill_outstanding, (unsigned long long)account.resource.pending_pin_active,
@@ -821,7 +819,7 @@ int main(int argc, char ** argv) {
     if (argc < 5 || std::strcmp(argv[1], "--devices") != 0 ||
             (std::strcmp(argv[2], "1") != 0 && std::strcmp(argv[2], "2") != 0) ||
             std::strcmp(argv[3], "--output-prefix") != 0) {
-    std::fprintf(stderr, "usage: %s --devices 1|2 --output-prefix PATH [--model MODEL] [--expected-bindings N] [--prompt-tokens N] [--expected-route-normalized 0|1] [--expected-route-scale FLOAT] [--inventory-profile glm-trunk|dsv4-trunk] [--init-only|--graph-contract-only|--hybrid-only|--inventory-only]\n", argv[0]);
+    std::fprintf(stderr, "usage: %s --devices 1|2 --output-prefix PATH [--model MODEL] [--merge-up-gate-experts] [--expected-bindings N] [--prompt-tokens N] [--expected-route-normalized 0|1] [--expected-route-scale FLOAT] [--inventory-profile glm-trunk|dsv4-trunk] [--init-only|--graph-contract-only|--hybrid-only|--inventory-only]\n", argv[0]);
         return 2;
     }
     const bool dual_device = std::strcmp(argv[2], "2") == 0;
@@ -834,6 +832,7 @@ int main(int argc, char ** argv) {
     bool glm_trunk_profile = false;
     bool dsv4_trunk_profile = false;
     bool inventory_only = false;
+    bool merge_up_gate = false;
     int route_normalized_override = -1;
     float route_scale_override = NAN;
     bool route_scale_overridden = false;
@@ -847,6 +846,8 @@ int main(int argc, char ** argv) {
             graph_contract_only = true;
         } else if (option == "--hybrid-only") {
             hybrid_only = true;
+        } else if (option == "--merge-up-gate-experts") {
+            merge_up_gate = true;
         } else if (option == "--inventory-profile" && i + 1 < argc) {
             const std::string profile = argv[++i];
             if (profile != "glm-trunk" && profile != "dsv4-trunk") {
@@ -873,10 +874,10 @@ int main(int argc, char ** argv) {
         return 2;
     }
     llama_backend_init();
-    llama_model * model = load_model(dual_device, model_path);
+    llama_model * model = load_model(dual_device, model_path, merge_up_gate);
     if (!model) { std::fprintf(stderr, "model load failed\n"); return 1; }
     N_SELECTED = model->hparams.n_expert_used;
-    if (N_SELECTED <= 0 || N_SELECTED > GGML_MOE_FFN_MAX_SELECTED) {
+    if (N_SELECTED <= 0 || N_SELECTED > model->hparams.n_expert) {
         std::fprintf(stderr, "unsupported selected-expert count: %d\n", N_SELECTED);
         llama_free_model(model); llama_backend_free(); return 1;
     }

@@ -5,16 +5,13 @@
 #include <stdint.h>
 #include <math.h>
 
-enum {
-    GGML_MOE_FFN_MAX_SELECTED = 10,
-    GGML_MOE_FFN_PARTS = 3,
-    GGML_MOE_FFN_MAX_EMBD = 8192,
-    GGML_MOE_FFN_MAX_FF = 32768,
-    GGML_MOE_FFN_ROW_ALIGNMENT = 32,
+enum ggml_moe_ffn_storage_topology {
+    GGML_MOE_FFN_STORAGE_SEPARATE_UP_GATE_DOWN = 0,
+    GGML_MOE_FFN_STORAGE_MERGED_UP_GATE_DOWN = 1,
 };
 
 enum ggml_moe_ffn_layout_flag {
-    GGML_MOE_FFN_LAYOUT_SEPARATE_PARTS = 1u << 0,
+    GGML_MOE_FFN_LAYOUT_PHYSICAL_STORAGE_VALID = 1u << 0,
     GGML_MOE_FFN_LAYOUT_NO_EXTRA_WEIGHTS = 1u << 1,
     GGML_MOE_FFN_LAYOUT_NO_HADAMARD = 1u << 2,
     GGML_MOE_FFN_LAYOUT_HOST_RESIDENT = 1u << 3,
@@ -29,15 +26,17 @@ enum ggml_moe_ffn_graph_flag {
     GGML_MOE_FFN_GRAPH_NO_HADAMARD = 1u << 5,
 };
 
-// Immutable description of the currently implemented three-part routed FFN.
+// Immutable description of a routed FFN's logical operands and physical storage.
 // Tensor pointers are identities; their metadata is validated by the query.
 struct ggml_moe_ffn_layout {
-    int32_t n_experts, n_experts_used, n_embd, n_ff, n_slots, n_parts;
+    int32_t n_experts, n_experts_used, n_embd, n_ff, n_slots;
     int32_t device, cache_group, cache_layer;
+    enum ggml_moe_ffn_storage_topology storage_topology;
     const void * owner_backend;
     const void * cache_owner;
     const struct ggml_tensor * up, * gate, * down;
     const struct ggml_tensor * bank_up, * bank_gate, * bank_down;
+    const struct ggml_tensor * up_gate_storage, * bank_up_gate_storage;
     const struct ggml_tensor * activation, * selected_ids, * route_weights;
     enum ggml_unary_op unary_op;
     float limit;
@@ -50,10 +49,9 @@ struct ggml_moe_ffn_layout {
 // alter expert arithmetic or its representation belong here.
 static inline bool ggml_moe_ffn_expert_execution_inputs_supported(
         const struct ggml_tensor * up_bias, const struct ggml_tensor * gate_bias,
-        const struct ggml_tensor * down_bias, const struct ggml_tensor * merged_up_gate,
-        const struct ggml_tensor * merged_up_gate_bias, const struct ggml_tensor * down_scale) {
-    return !up_bias && !gate_bias && !down_bias && !merged_up_gate &&
-        !merged_up_gate_bias && !down_scale;
+        const struct ggml_tensor * down_bias, const struct ggml_tensor * merged_up_gate_bias,
+        const struct ggml_tensor * down_scale) {
+    return !up_bias && !gate_bias && !down_bias && !merged_up_gate_bias && !down_scale;
 }
 
 static inline bool ggml_moe_ffn_tensor_shape(const struct ggml_tensor * tensor,
@@ -92,40 +90,90 @@ static inline bool ggml_moe_ffn_bank_layout_matches(const struct ggml_tensor * h
         host->nb[0] == bank->nb[0] && host->nb[1] == bank->nb[1] && host->nb[2] == bank->nb[2];
 }
 
-static inline bool ggml_moe_ffn_types_supported(enum ggml_type up, enum ggml_type gate,
-        enum ggml_type down) {
-    return (up == GGML_TYPE_IQ3_S && gate == GGML_TYPE_IQ3_S &&
-                (down == GGML_TYPE_IQ4_NL || down == GGML_TYPE_IQ4_XS || down == GGML_TYPE_MXFP4)) ||
-        (up == GGML_TYPE_IQ2_XS && gate == GGML_TYPE_IQ2_XS && down == GGML_TYPE_IQ3_XXS) ||
-        (up == GGML_TYPE_IQ3_XXS && gate == GGML_TYPE_IQ3_XXS &&
-                (down == GGML_TYPE_IQ3_XXS || down == GGML_TYPE_MXFP4));
+static inline bool ggml_moe_ffn_merged_view_fits(const struct ggml_tensor * view,
+        size_t view_offset, size_t part_bytes, size_t parent_extent) {
+    if (view_offset > parent_extent || view->nb[2] == 0 ||
+            (size_t) (view->ne[2] - 1) > (SIZE_MAX - part_bytes) / view->nb[2]) return false;
+    const size_t extent = part_bytes + (size_t) (view->ne[2] - 1) * view->nb[2];
+    return extent <= parent_extent - view_offset;
+}
+
+static inline bool ggml_moe_ffn_merged_views_match(const struct ggml_tensor * up,
+        const struct ggml_tensor * gate, const struct ggml_tensor * parent) {
+    size_t expected_up_offset = 0, row_bytes = 0, part_bytes = 0, parent_bytes = 0;
+    if (!up || !gate || !parent || up->type != gate->type || up->type != parent->type ||
+            up->ne[0] != gate->ne[0] || up->ne[1] != gate->ne[1] || up->ne[2] != gate->ne[2] ||
+            up->ne[3] != 1 || gate->ne[3] != 1 || parent->ne[0] != up->ne[0] ||
+            parent->ne[1] != up->ne[1] + gate->ne[1] || parent->ne[2] != up->ne[2] ||
+            parent->ne[3] != 1 || parent->nb[0] != ggml_type_size(parent->type) ||
+            !ggml_is_contiguous(parent)) return false;
+    row_bytes = ggml_row_size(parent->type, parent->ne[0]);
+    if (!row_bytes || row_bytes > SIZE_MAX / (size_t) gate->ne[1]) return false;
+    part_bytes = row_bytes * (size_t) gate->ne[1];
+    if (part_bytes > SIZE_MAX / 2 || part_bytes * 2 > SIZE_MAX / (size_t) parent->ne[2]) return false;
+    parent_bytes = part_bytes * 2;
+    if (parent->nb[1] != row_bytes || parent->nb[2] != parent_bytes ||
+            up->nb[0] != parent->nb[0] || gate->nb[0] != parent->nb[0] ||
+            up->nb[1] != parent->nb[1] || gate->nb[1] != parent->nb[1]) return false;
+    const struct ggml_tensor * view_root = parent->view_src ? parent->view_src : parent;
+    if (up->view_src != view_root || gate->view_src != view_root ||
+            up->view_offs < parent->view_offs || gate->view_offs < parent->view_offs) return false;
+    const size_t up_offset = up->view_offs - parent->view_offs;
+    const size_t gate_offset = gate->view_offs - parent->view_offs;
+    expected_up_offset = part_bytes;
+    const size_t parent_extent = parent_bytes * (size_t) parent->ne[2];
+    // Native merged tensors expose per-expert interleaved views. The model
+    // loader's merge flag instead creates a single parent with gate and up
+    // stored as full expert planes. Both are safe if their complete ranges fit
+    // inside the one physical parent and do not overlap.
+    const bool interleaved = gate_offset == 0 && up_offset == expected_up_offset &&
+        up->nb[2] == parent->nb[2] && gate->nb[2] == parent->nb[2];
+    const bool expert_planes = gate_offset == 0 &&
+        up_offset == part_bytes * (size_t) parent->ne[2] &&
+        up->nb[2] == part_bytes && gate->nb[2] == part_bytes;
+    if (!interleaved && !expert_planes) return false;
+    const size_t plane_bytes = part_bytes * (size_t) parent->ne[2];
+    const bool planes_disjoint = up_offset >= gate_offset + plane_bytes ||
+        gate_offset >= up_offset + plane_bytes;
+    return ggml_moe_ffn_merged_view_fits(up, up_offset, part_bytes, parent_extent) &&
+        ggml_moe_ffn_merged_view_fits(gate, gate_offset, part_bytes, parent_extent) &&
+        (interleaved || planes_disjoint);
 }
 
 static inline bool ggml_moe_ffn_layout_supported(const struct ggml_moe_ffn_layout * l) {
-    const uint32_t required = GGML_MOE_FFN_LAYOUT_SEPARATE_PARTS |
+    const uint32_t required = GGML_MOE_FFN_LAYOUT_PHYSICAL_STORAGE_VALID |
         GGML_MOE_FFN_LAYOUT_NO_EXTRA_WEIGHTS | GGML_MOE_FFN_LAYOUT_NO_HADAMARD |
         GGML_MOE_FFN_LAYOUT_HOST_RESIDENT;
-    return l && l->n_experts > 0 && l->n_experts_used >= 1 && l->n_experts_used <= l->n_experts &&
-        l->n_experts_used <= GGML_MOE_FFN_MAX_SELECTED && l->n_embd > 0 &&
-        l->n_embd <= GGML_MOE_FFN_MAX_EMBD && l->n_embd % GGML_MOE_FFN_ROW_ALIGNMENT == 0 &&
-        l->n_ff > 0 && l->n_ff <= GGML_MOE_FFN_MAX_FF &&
-        l->n_ff % GGML_MOE_FFN_ROW_ALIGNMENT == 0 && l->n_parts == GGML_MOE_FFN_PARTS &&
-        l->unary_op == GGML_UNARY_OP_SILU && isfinite(l->limit) && l->limit >= 0.0f &&
-        (l->flags & required) == required &&
-        l->up && l->gate && l->down &&
-        ggml_moe_ffn_types_supported(l->up->type, l->gate->type, l->down->type) &&
-        ggml_moe_ffn_tensor_layout(l->up, l->up->type, l->n_embd, l->n_ff, l->n_experts) &&
-        ggml_moe_ffn_tensor_layout(l->gate, l->gate->type, l->n_embd, l->n_ff, l->n_experts) &&
-        ggml_moe_ffn_tensor_layout(l->down, l->down->type, l->n_ff, l->n_embd, l->n_experts) &&
-        ((l->n_slots == 0 && !l->bank_up && !l->bank_gate && !l->bank_down) ||
-         (l->n_slots > 0 && l->device >= 0 && l->cache_group >= 0 && l->cache_layer >= 0 &&
-           l->owner_backend && l->cache_owner &&
+    if (!l || l->n_experts <= 0 || l->n_experts_used < 1 || l->n_experts_used > l->n_experts ||
+            l->n_embd <= 0 || l->n_ff <= 0 || l->unary_op != GGML_UNARY_OP_SILU ||
+            !isfinite(l->limit) || l->limit < 0.0f || (l->flags & required) != required ||
+            !l->up || !l->gate || !l->down ||
+            !ggml_moe_ffn_tensor_layout(l->down, l->down->type, l->n_ff, l->n_embd, l->n_experts)) return false;
+
+    bool host_up_gate_ok = false, bank_up_gate_ok = false;
+    if (l->storage_topology == GGML_MOE_FFN_STORAGE_SEPARATE_UP_GATE_DOWN) {
+        host_up_gate_ok = !l->up_gate_storage &&
+            ggml_moe_ffn_tensor_layout(l->up, l->up->type, l->n_embd, l->n_ff, l->n_experts) &&
+            ggml_moe_ffn_tensor_layout(l->gate, l->gate->type, l->n_embd, l->n_ff, l->n_experts);
+        bank_up_gate_ok = !l->bank_up_gate_storage &&
             ggml_moe_ffn_tensor_layout(l->bank_up, l->up->type, l->n_embd, l->n_ff, l->n_slots) &&
             ggml_moe_ffn_tensor_layout(l->bank_gate, l->gate->type, l->n_embd, l->n_ff, l->n_slots) &&
-           ggml_moe_ffn_tensor_layout(l->bank_down, l->down->type, l->n_ff, l->n_embd, l->n_slots) &&
-          ggml_moe_ffn_bank_layout_matches(l->up, l->bank_up) &&
-          ggml_moe_ffn_bank_layout_matches(l->gate, l->bank_gate) &&
-          ggml_moe_ffn_bank_layout_matches(l->down, l->bank_down)));
+            ggml_moe_ffn_bank_layout_matches(l->up, l->bank_up) &&
+            ggml_moe_ffn_bank_layout_matches(l->gate, l->bank_gate);
+    } else if (l->storage_topology == GGML_MOE_FFN_STORAGE_MERGED_UP_GATE_DOWN) {
+        host_up_gate_ok = ggml_moe_ffn_merged_views_match(l->up, l->gate, l->up_gate_storage);
+        bank_up_gate_ok = ggml_moe_ffn_merged_views_match(l->bank_up, l->bank_gate,
+                l->bank_up_gate_storage) &&
+            ggml_moe_ffn_bank_layout_matches(l->up_gate_storage, l->bank_up_gate_storage);
+    }
+    const bool down_bank_ok = ggml_moe_ffn_tensor_layout(l->bank_down, l->down->type,
+            l->n_ff, l->n_embd, l->n_slots) && ggml_moe_ffn_bank_layout_matches(l->down, l->bank_down);
+    const bool no_cache = l->n_slots == 0 && !l->bank_up && !l->bank_gate && !l->bank_down &&
+            !l->bank_up_gate_storage;
+    const bool cached = l->n_slots > 0 && l->device >= 0 && l->cache_group >= 0 &&
+            l->cache_layer >= 0 && l->owner_backend && l->cache_owner && l->bank_up && l->bank_gate &&
+            l->bank_down && down_bank_ok;
+    return host_up_gate_ok && (no_cache || (cached && bank_up_gate_ok));
 }
 
 static inline bool ggml_moe_ffn_graph_inputs_supported(const struct ggml_moe_ffn_layout * l) {

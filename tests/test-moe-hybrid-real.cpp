@@ -27,6 +27,20 @@ namespace {
 int32_t N_SELECTED = 10;
 constexpr size_t CACHE_BYTES = size_t(8) << 30;
 
+struct resolution_buffers {
+    std::vector<int32_t> draws;
+    std::vector<ggml_cuda_moe_ffn_pin_token> pins;
+    ggml_cuda_moe_ffn_resolution value{};
+    explicit resolution_buffers(size_t capacity) : draws(capacity), pins(capacity) {
+        value.draw_slots = draws.data(); value.draw_capacity = draws.size();
+        value.pins = pins.data(); value.pin_capacity = pins.size();
+    }
+};
+
+size_t expected_physical_fill_parts(const llama_moe_cache_frozen_layer & snapshot) {
+    return snapshot.host_up_gate_storage ? 2 : 3;
+}
+
 } // namespace
 
 struct llama_moe_cache_test_access {
@@ -291,7 +305,9 @@ bool valid_candidate(const llama_model & model, const llama_layer & layer, const
     const ggml_tensor * gate = layer.ffn_gate_exps;
     const ggml_tensor * down = layer.ffn_down_exps;
     if (layer.ffn_up_gate_exps || !up || !gate || !down) return false;
-    if (!ggml_moe_ffn_types_supported(up->type, gate->type, down->type)) return false;
+    // The fused CUDA executor requires one up/gate dispatch type; the CUDA-owned
+    // registration query validates both that type and the selected down kernel.
+    if (up->type != gate->type) return false;
     if (up->ne[2] != (int64_t)model.hparams.n_expert || gate->ne[2] != up->ne[2] || down->ne[2] != up->ne[2]) return false;
     if (up->ne[0] != gate->ne[0] || up->ne[1] != gate->ne[1] || down->ne[0] != up->ne[1] || down->ne[1] != up->ne[0]) return false;
     if (!up->data || !gate->data || !down->data || !up->buffer || !gate->buffer || !down->buffer) return false;
@@ -674,14 +690,14 @@ bool run_seed_fill_isolation(real_fixture & f, int32_t layer_a, int32_t n_expert
     llama_moe_cache::frozen_lease lease_a;
     if (!f.cache->freeze_group_for_layer(layer_a, f.cuda, { 0 }, lease_a)) return false;
     const auto seeded_a = lease_a.snapshot();
-    ggml_cuda_moe_ffn_resolution before{};
+    resolution_buffers before(1);
     const int32_t expert = 0;
     if (!f.cache->resolve_and_pin(seeded_a.device_group, seeded_a.group, layer_a, seeded_a.generation,
-                &expert, 1, &before) || before.n_draws != 1 || before.n_pins != 1 || before.draw_slots[0] < 0) return false;
-    const int32_t slot = before.draw_slots[0];
-    const auto owner_before = before.pins[0];
+                &expert, 1, &before.value) || before.value.n_draws != 1 || before.value.n_pins != 1 || before.value.draw_slots[0] < 0) return false;
+    const int32_t slot = before.value.draw_slots[0];
+    const auto owner_before = before.value.pins[0];
     if (owner_before.key != layer_a * n_experts + expert || owner_before.slot != slot ||
-            !f.cache->release_pins(before.pins, before.n_pins)) return false;
+            !f.cache->release_pins(before.value.pins, before.value.n_pins)) return false;
 
     ggml_backend_synchronize(f.cuda);
     const std::array<const ggml_tensor *, 3> banks_before = { seeded_a.bank_up, seeded_a.bank_gate, seeded_a.bank_down };
@@ -705,16 +721,16 @@ bool run_seed_fill_isolation(real_fixture & f, int32_t layer_a, int32_t n_expert
     if (!f.cache->freeze_group_for_layer(layer_b, f.cuda, {}, lease_b)) return false;
     const auto empty_b = lease_b.snapshot();
     llama_moe_cache_frozen_layer seeded_a_after;
-    ggml_cuda_moe_ffn_resolution after{};
+    resolution_buffers after(1);
     const bool snapshot_ok = empty_b.group == seeded_a.group && empty_b.seed_bytes == 0 &&
             f.cache->frozen_layer_snapshot(empty_b, layer_a, seeded_a_after);
     const bool resolve_ok = snapshot_ok && f.cache->resolve_and_pin(empty_b.device_group,
-            empty_b.group, layer_a, empty_b.generation, &expert, 1, &after);
-    const bool same_owner = resolve_ok && after.n_draws == 1 && after.n_pins == 1 &&
-            after.draw_slots[0] == slot && after.pins[0].key == owner_before.key &&
-            after.pins[0].slot == owner_before.slot && after.pins[0].owner == owner_before.owner &&
-            after.pins[0].device == owner_before.device && after.pins[0].group == owner_before.group;
-    const bool released_pins = after.n_pins == 0 || f.cache->release_pins(after.pins, after.n_pins);
+            empty_b.group, layer_a, empty_b.generation, &expert, 1, &after.value);
+    const bool same_owner = resolve_ok && after.value.n_draws == 1 && after.value.n_pins == 1 &&
+            after.value.draw_slots[0] == slot && after.value.pins[0].key == owner_before.key &&
+            after.value.pins[0].slot == owner_before.slot && after.value.pins[0].owner == owner_before.owner &&
+            after.value.pins[0].device == owner_before.device && after.value.pins[0].group == owner_before.group;
+    const bool released_pins = after.value.n_pins == 0 || f.cache->release_pins(after.value.pins, after.value.n_pins);
     bool same_contents = snapshot_ok;
     ggml_backend_synchronize(f.cuda);
     const std::array<const ggml_tensor *, 3> banks_after = {
@@ -755,7 +771,7 @@ bool run(const std::string & model_path, int32_t device, const char * timing_mod
     f.model = llama_model_load_from_file(model_path.c_str(), model_params);
     if (!f.model) { std::fprintf(stderr, "model load failed: %s\n", model_path.c_str()); return false; }
     N_SELECTED = (int32_t) f.model->hparams.n_expert_used;
-    if (N_SELECTED < 5 || N_SELECTED > GGML_MOE_FFN_MAX_SELECTED) {
+    if (N_SELECTED < 5 || N_SELECTED > f.model->hparams.n_expert) {
         std::fprintf(stderr, "unsupported model selected-expert count: %d\n", N_SELECTED);
         return false;
     }
@@ -868,7 +884,8 @@ bool run(const std::string & model_path, int32_t device, const char * timing_mod
     }
     setup_seed_bytes += snapshot.seed_bytes;
     const size_t expected_seed_bytes = setup_seed_count *
-            (layer.ffn_up_exps->nb[2] + layer.ffn_gate_exps->nb[2] + layer.ffn_down_exps->nb[2]);
+            ((snapshot.host_up_gate_storage ? snapshot.host_up_gate_storage->nb[2] :
+              layer.ffn_up_exps->nb[2] + layer.ffn_gate_exps->nb[2]) + layer.ffn_down_exps->nb[2]);
     if (setup_seed_bytes != expected_seed_bytes) {
         std::fprintf(stderr, "seed byte accounting mismatch got=%zu expected=%zu\n", setup_seed_bytes, expected_seed_bytes);
         return false;
@@ -877,19 +894,19 @@ bool run(const std::string & model_path, int32_t device, const char * timing_mod
             snapshot.n_slots, setup_seed_count, setup_seed_bytes);
     std::vector<int32_t> duplicate_ids(N_SELECTED);
     for (int32_t i = 0; i < N_SELECTED; ++i) duplicate_ids[i] = i == 0 ? 0 : i - 1;
-    ggml_cuda_moe_ffn_resolution pin_result{};
+    resolution_buffers pin_result(N_SELECTED);
     const bool rejected_device = f.cache->resolve_and_pin(device + 1, snapshot.group, layer_id, snapshot.generation,
-                duplicate_ids.data(), N_SELECTED, &pin_result) ||
+                duplicate_ids.data(), N_SELECTED, &pin_result.value) ||
             f.cache->resolve_and_pin(device, snapshot.group + 1, layer_id, snapshot.generation,
-                duplicate_ids.data(), N_SELECTED, &pin_result) ||
+                duplicate_ids.data(), N_SELECTED, &pin_result.value) ||
             !f.cache->resolve_and_pin(device, snapshot.group, layer_id, snapshot.generation,
-                duplicate_ids.data(), N_SELECTED, &pin_result);
-    if (rejected_device || pin_result.n_draws != N_SELECTED || pin_result.n_pins != N_SELECTED - 1) {
+                duplicate_ids.data(), N_SELECTED, &pin_result.value);
+    if (rejected_device || pin_result.value.n_draws != N_SELECTED || pin_result.value.n_pins != N_SELECTED - 1) {
         std::fprintf(stderr, "cache pin setup failed device_reject=%d draws=%d pins=%d expected=%d\n",
-                rejected_device ? 1 : 0, pin_result.n_draws, pin_result.n_pins, N_SELECTED - 1);
+                rejected_device ? 1 : 0, pin_result.value.n_draws, pin_result.value.n_pins, N_SELECTED - 1);
         return false;
     }
-    const auto original_pin = pin_result.pins[0];
+    const auto original_pin = pin_result.value.pins[0];
     auto invalid_pin = original_pin;
     ++invalid_pin.device;
     if (f.cache->release_pins(&invalid_pin, 1)) return false;
@@ -901,14 +918,14 @@ bool run(const std::string & model_path, int32_t device, const char * timing_mod
     if (f.cache->release_pins(&invalid_pin, 1)) return false;
     invalid_pin = original_pin; ++invalid_pin.owner_generation;
     if (f.cache->release_pins(&invalid_pin, 1)) return false;
-    if (!f.cache->release_pins(pin_result.pins, pin_result.n_pins) ||
-            f.cache->release_pins(pin_result.pins, pin_result.n_pins)) return false;
-    ggml_cuda_moe_ffn_resolution repinned{};
+    if (!f.cache->release_pins(pin_result.value.pins, pin_result.value.n_pins) ||
+            f.cache->release_pins(pin_result.value.pins, pin_result.value.n_pins)) return false;
+    resolution_buffers repinned(N_SELECTED);
     if (!f.cache->resolve_and_pin(device, snapshot.group, layer_id, snapshot.generation,
-                duplicate_ids.data(), N_SELECTED, &repinned) ||
-            repinned.pins[0].generation == original_pin.generation ||
-            f.cache->release_pins(pin_result.pins, pin_result.n_pins) ||
-            !f.cache->release_pins(repinned.pins, repinned.n_pins)) return false;
+                duplicate_ids.data(), N_SELECTED, &repinned.value) ||
+            repinned.value.pins[0].generation == original_pin.generation ||
+            f.cache->release_pins(pin_result.value.pins, pin_result.value.n_pins) ||
+            !f.cache->release_pins(repinned.value.pins, repinned.value.n_pins)) return false;
     std::printf("cache_pin_contract draws=%d unique_slots=%d wrong_device_group_key_generation_rejected=1 repeated_stale_rejected=1 repin_generation_advanced=1\n",
             N_SELECTED, N_SELECTED - 1);
     std::printf("freeze layer=%d group=%d device_group=%d generation=%llu slots=%d group_members=%zu seed_experts=%zu seed_bytes=%zu bank_identity=%p,%p,%p\n",
@@ -980,19 +997,19 @@ bool run(const std::string & model_path, int32_t device, const char * timing_mod
     const std::vector<float> routes2 = route_weights(2);
     std::vector<int32_t> seed_slots(seed_experts.size(), -1);
     const auto capture_slots = [&](const std::vector<int32_t> & ids) {
-        ggml_cuda_moe_ffn_resolution resolved{};
+        resolution_buffers resolved(ids.size());
         if (!f.cache->resolve_and_pin(device, snapshot.group, layer_id, snapshot.generation,
-                    ids.data(), ids.size(), &resolved) || resolved.n_draws != (int32_t) ids.size()) return false;
+                    ids.data(), ids.size(), &resolved.value) || resolved.value.n_draws != (int32_t) ids.size()) return false;
         bool valid = true;
-        for (int32_t i = 0; i < resolved.n_draws; ++i) {
+        for (int32_t i = 0; i < resolved.value.n_draws; ++i) {
             const auto it = std::find(seed_experts.begin(), seed_experts.end(), ids[i]);
-            if (resolved.draw_slots[i] < 0 || it == seed_experts.end()) {
+            if (resolved.value.draw_slots[i] < 0 || it == seed_experts.end()) {
                 valid = false;
             } else {
-                seed_slots[it - seed_experts.begin()] = resolved.draw_slots[i];
+                seed_slots[it - seed_experts.begin()] = resolved.value.draw_slots[i];
             }
         }
-        return f.cache->release_pins(resolved.pins, resolved.n_pins) && valid;
+        return f.cache->release_pins(resolved.value.pins, resolved.value.n_pins) && valid;
     };
     if (!capture_slots(seed_ids)) {
         std::fprintf(stderr, "failed to capture seed CUDA slots after freeze\n");
@@ -1026,12 +1043,31 @@ bool run(const std::string & model_path, int32_t device, const char * timing_mod
 
     ggml_cuda_moe_ffn_binding binding{};
     binding.generation = snapshot.generation;
-    binding.layout = { n_experts, N_SELECTED, n_embd, n_ff, snapshot.n_slots, GGML_MOE_FFN_PARTS, device, snapshot.group,
-        snapshot.layer, f.cuda, f.cache.get(), snapshot.host_up, snapshot.host_gate, snapshot.host_down,
-        snapshot.cached_up, snapshot.cached_gate, snapshot.cached_down, nullptr, nullptr, nullptr,
-        GGML_UNARY_OP_SILU, routed_limit, GGML_MOE_FFN_LAYOUT_SEPARATE_PARTS |
+    binding.layout.n_experts = n_experts;
+    binding.layout.n_experts_used = N_SELECTED;
+    binding.layout.n_embd = n_embd;
+    binding.layout.n_ff = n_ff;
+    binding.layout.n_slots = snapshot.n_slots;
+    binding.layout.device = device;
+    binding.layout.cache_group = snapshot.group;
+    binding.layout.cache_layer = snapshot.layer;
+    binding.layout.storage_topology = snapshot.host_up_gate_storage ?
+            GGML_MOE_FFN_STORAGE_MERGED_UP_GATE_DOWN : GGML_MOE_FFN_STORAGE_SEPARATE_UP_GATE_DOWN;
+    binding.layout.owner_backend = f.cuda;
+    binding.layout.cache_owner = f.cache.get();
+    binding.layout.up = snapshot.host_up;
+    binding.layout.gate = snapshot.host_gate;
+    binding.layout.down = snapshot.host_down;
+    binding.layout.bank_up = snapshot.cached_up;
+    binding.layout.bank_gate = snapshot.cached_gate;
+    binding.layout.bank_down = snapshot.cached_down;
+    binding.layout.up_gate_storage = snapshot.host_up_gate_storage;
+    binding.layout.bank_up_gate_storage = snapshot.cached_up_gate_storage;
+    binding.layout.unary_op = GGML_UNARY_OP_SILU;
+    binding.layout.limit = routed_limit;
+    binding.layout.flags = GGML_MOE_FFN_LAYOUT_PHYSICAL_STORAGE_VALID |
         GGML_MOE_FFN_LAYOUT_NO_EXTRA_WEIGHTS | GGML_MOE_FFN_LAYOUT_NO_HADAMARD |
-        GGML_MOE_FFN_LAYOUT_HOST_RESIDENT, 0 };
+        GGML_MOE_FFN_LAYOUT_HOST_RESIDENT;
     binding.cache_callbacks = llama_moe_cache_get_cuda_callbacks();
     binding.cache_context = f.cache.get();
     binding.cpu_resource_id = f.cpu_resource_id;
@@ -1125,7 +1161,7 @@ bool run(const std::string & model_path, int32_t device, const char * timing_mod
         if (!ggml_backend_cuda_moe_ffn_cpu_resource_get_stats(f.cuda, f.cpu_resource_id, &published) ||
                 published.fills_accepted != 1 || published.fills_completed != 1 ||
                 published.fills_failed != 0 || published.fill_outstanding != 0 ||
-                published.fill_parts_completed != GGML_CUDA_MOE_FFN_MAX_FILL_PARTS) return false;
+                published.fill_parts_completed != expected_physical_fill_parts(snapshot)) return false;
         replaced_expert = miss_ids.back();
         ggml_cuda_moe_ffn_resolution published_expert{};
         if (!f.cache->resolve_and_pin(device, snapshot.group, layer_id, snapshot.generation,
@@ -1175,7 +1211,7 @@ bool run(const std::string & model_path, int32_t device, const char * timing_mod
                 (unsigned long long)failed_fill.fill_parts_completed);
         if (failed_fill.fills_accepted != 2 || failed_fill.fills_completed != 1 ||
                 failed_fill.fills_failed != 1 || failed_fill.fill_outstanding != 0 ||
-                failed_fill.fill_parts_completed != GGML_CUDA_MOE_FFN_MAX_FILL_PARTS) {
+                failed_fill.fill_parts_completed != expected_physical_fill_parts(snapshot)) {
             std::fprintf(stderr, "replacement failed-fill counters did not match the expected rollback\n");
             return false;
         }
@@ -1310,7 +1346,7 @@ bool run(const std::string & model_path, int32_t device, const char * timing_mod
         if (!ggml_backend_cuda_moe_ffn_cpu_resource_get_stats(f.cuda, f.cpu_resource_id, &ready) ||
                 ready.fills_accepted == 0 || ready.fills_completed != ready.fills_accepted ||
                 ready.fills_failed != 0 || ready.fill_outstanding != 0 ||
-                ready.fill_parts_completed != ready.fills_completed * GGML_CUDA_MOE_FFN_MAX_FILL_PARTS ||
+                ready.fill_parts_completed != ready.fills_completed * expected_physical_fill_parts(snapshot) ||
                 ready.fill_bytes_completed == 0) {
             std::fprintf(stderr, "GLM miss fill did not drain completely before later READY use\n");
             return false;
@@ -1436,7 +1472,7 @@ bool run(const std::string & model_path, int32_t device, const char * timing_mod
         if (!ggml_backend_cuda_moe_ffn_cpu_resource_get_stats(f.cuda, f.cpu_resource_id, &drained) ||
                 drained.fills_accepted == 0 || drained.fills_completed != drained.fills_accepted ||
                 drained.fills_failed != 0 || drained.fill_outstanding != 0 ||
-                drained.fill_parts_completed != drained.fills_completed * GGML_CUDA_MOE_FFN_MAX_FILL_PARTS ||
+                drained.fill_parts_completed != drained.fills_completed * expected_physical_fill_parts(first_snapshot) ||
                 drained.fill_bytes_completed == 0 || drained.fills_rejected == 0 ||
                 drained.pending_pin_active != 0) return false;
         std::printf("transport_stop_frozen_group accepted=%llu completed=%llu failed=%llu rejected=%llu outstanding=%llu parts=%llu bytes=%llu pending_pins=%llu\n",

@@ -127,11 +127,8 @@ struct moe_cache_lru {
 };
 
 static std::vector<ggml_tensor *> layer_experts(const llama_layer & layer) {
-    std::vector<ggml_tensor *> res;
-    for (ggml_tensor * t : { layer.ffn_up_gate_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
-        if (t) res.push_back(t);
-    }
-    return res;
+    if (layer.ffn_up_gate_exps) return { layer.ffn_up_gate_exps, layer.ffn_down_exps };
+    return { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps };
 }
 
 static bool is_host_weight(const ggml_tensor * t) {
@@ -177,6 +174,7 @@ struct llama_moe_cache::impl {
         ggml_tensor * host_up = nullptr;
         ggml_tensor * host_gate = nullptr;
         ggml_tensor * host_down = nullptr;
+        ggml_tensor * host_up_gate_storage = nullptr;
         std::vector<ggml_tensor *> experts;
     };
     struct binding {
@@ -300,7 +298,12 @@ struct llama_moe_cache::impl {
                 continue;
             }
             g.lru.init((int32_t) layers.size(), n_expert, g.n_slots);
-            device_tensor_counts[g.device] += g.ref.size() * (1 + g.layers.size());
+            device_tensor_counts[g.device] += g.ref.size();
+            for (const int32_t il : g.layers) {
+                const auto & layer = model.layers[il];
+                device_tensor_counts[g.device] += layer.ffn_up_gate_exps ?
+                    (layer.ffn_up_exps && layer.ffn_gate_exps ? 4 : 2) : 3;
+            }
             host_layer_count += g.layers.size();
         }
         if (host_layer_count == 0) throw std::runtime_error("MoE cache budget is too small to hold one token");
@@ -332,12 +335,45 @@ struct llama_moe_cache::impl {
                 l.host_up = model.layers[il].ffn_up_exps;
                 l.host_gate = model.layers[il].ffn_gate_exps;
                 l.host_down = model.layers[il].ffn_down_exps;
-                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                l.host_up_gate_storage = model.layers[il].ffn_up_gate_exps;
+                auto physical_index = [&](const ggml_tensor * host) -> int32_t {
+                    const auto it = std::find(l.experts.begin(), l.experts.end(), host);
+                    return it == l.experts.end() ? -1 : (int32_t) std::distance(l.experts.begin(), it);
+                };
+                auto cached_range = [&](int32_t ip, const ggml_tensor * name_tensor) -> ggml_tensor * {
+                    if (ip < 0 || (size_t) ip >= g.banks.size()) return nullptr;
                     ggml_tensor * bank = g.banks[ip];
                     ggml_tensor * cached = ggml_view_3d(d.ctx.get(), bank, bank->ne[0], bank->ne[1], g.n_slots,
                             bank->nb[1], bank->nb[2], 0);
-                    ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
-                    bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
+                    ggml_format_name(cached, "moe_cache.%s", name_tensor->name);
+                    return cached;
+                };
+                if (l.host_up_gate_storage) {
+                    const int32_t parent_ip = physical_index(l.host_up_gate_storage);
+                    const int32_t down_ip = physical_index(l.host_down);
+                    ggml_tensor * cached_parent = cached_range(parent_ip, l.host_up_gate_storage);
+                    ggml_tensor * cached_down = cached_range(down_ip, l.host_down);
+                    bindings[l.host_up_gate_storage] = { il, parent_ip, cached_parent };
+                    bindings[l.host_down] = { il, down_ip, cached_down };
+                    if (l.host_up && l.host_gate) {
+                        const size_t up_gate_offset = ggml_row_size(l.host_up->type, l.host_up->ne[0]) *
+                                (size_t) l.host_gate->ne[1];
+                        ggml_tensor * cached_up = ggml_view_3d(d.ctx.get(), cached_parent, l.host_up->ne[0],
+                                l.host_up->ne[1], g.n_slots, l.host_up->nb[1], cached_parent->nb[2],
+                                up_gate_offset);
+                        ggml_tensor * cached_gate = ggml_view_3d(d.ctx.get(), cached_parent, l.host_gate->ne[0],
+                                l.host_gate->ne[1], g.n_slots, l.host_gate->nb[1], cached_parent->nb[2],
+                                l.host_gate->view_offs);
+                        ggml_format_name(cached_up, "moe_cache.%s", l.host_up->name);
+                        ggml_format_name(cached_gate, "moe_cache.%s", l.host_gate->name);
+                        bindings[l.host_up] = { il, parent_ip, cached_up };
+                        bindings[l.host_gate] = { il, parent_ip, cached_gate };
+                    }
+                } else {
+                    for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                        ggml_tensor * cached = cached_range((int32_t) ip, l.experts[ip]);
+                        bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
+                    }
                 }
                 l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
                 ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
@@ -393,7 +429,8 @@ struct llama_moe_cache::impl {
         const layer & l = layers[il];
         const group & g = groups[l.group];
         if (g.frozen) return nullptr;
-        if (n_tokens <= 0 || n_tokens > max_batch) {
+        if (n_tokens <= 0 || n_tokens > max_batch || n_expert_used <= 0 ||
+                n_tokens > std::numeric_limits<int64_t>::max() / n_expert_used) {
             ++large_batch_skips;
             return nullptr;
         }
@@ -536,6 +573,7 @@ struct llama_moe_cache::impl {
         out.host_up = l.host_up;
         out.host_gate = l.host_gate;
         out.host_down = l.host_down;
+        out.host_up_gate_storage = l.host_up_gate_storage;
         auto bank_for = [&](const ggml_tensor * host) -> ggml_tensor * {
             auto it = bindings.find(host);
             return it == bindings.end() ? nullptr : g.banks[it->second.part];
@@ -547,11 +585,14 @@ struct llama_moe_cache::impl {
         out.bank_up = bank_for(out.host_up);
         out.bank_gate = bank_for(out.host_gate);
         out.bank_down = bank_for(out.host_down);
+        out.bank_up_gate_storage = bank_for(out.host_up_gate_storage);
         out.cached_up = cached_for(out.host_up);
         out.cached_gate = cached_for(out.host_gate);
         out.cached_down = cached_for(out.host_down);
+        out.cached_up_gate_storage = cached_for(out.host_up_gate_storage);
         out.group_layers = g.layers;
-        GGML_ASSERT(out.bank_up && out.bank_gate && out.bank_down && out.cached_up && out.cached_gate && out.cached_down);
+        GGML_ASSERT(out.bank_up && out.bank_gate && out.bank_down && out.cached_up && out.cached_gate && out.cached_down &&
+                (!out.host_up_gate_storage || (out.bank_up_gate_storage && out.cached_up_gate_storage)));
         return true;
     }
 
@@ -568,9 +609,12 @@ struct llama_moe_cache::impl {
                     it->second.cached == cached && g.banks[it->second.part] == bank;
         };
         return snapshot.host_up == l.host_up && snapshot.host_gate == l.host_gate && snapshot.host_down == l.host_down &&
+                snapshot.host_up_gate_storage == l.host_up_gate_storage &&
                 same_view(l.host_up, snapshot.cached_up, snapshot.bank_up) &&
                 same_view(l.host_gate, snapshot.cached_gate, snapshot.bank_gate) &&
-                same_view(l.host_down, snapshot.cached_down, snapshot.bank_down);
+                same_view(l.host_down, snapshot.cached_down, snapshot.bank_down) &&
+                (!l.host_up_gate_storage || same_view(l.host_up_gate_storage,
+                    snapshot.cached_up_gate_storage, snapshot.bank_up_gate_storage));
     }
 
     bool frozen_layer_snapshot(const llama_moe_cache_frozen_layer & group_snapshot, int32_t il,
@@ -595,6 +639,8 @@ struct llama_moe_cache::impl {
         if (!matches(group_snapshot.host_up, group_snapshot.cached_up, group_snapshot.bank_up, anchor.host_up) ||
                 !matches(group_snapshot.host_gate, group_snapshot.cached_gate, group_snapshot.bank_gate, anchor.host_gate) ||
                 !matches(group_snapshot.host_down, group_snapshot.cached_down, group_snapshot.bank_down, anchor.host_down) ||
+                (anchor.host_up_gate_storage && !matches(group_snapshot.host_up_gate_storage,
+                    group_snapshot.cached_up_gate_storage, group_snapshot.bank_up_gate_storage, anchor.host_up_gate_storage)) ||
                 !l.host_up || !l.host_gate || !l.host_down || l.experts.size() != g.banks.size()) return false;
         auto bank_for = [&](const ggml_tensor * host) -> const ggml_tensor * {
             const auto it = bindings.find(host);
@@ -618,9 +664,12 @@ struct llama_moe_cache::impl {
         snapshot.bank_up = bank_for(l.host_up);
         snapshot.bank_gate = bank_for(l.host_gate);
         snapshot.bank_down = bank_for(l.host_down);
+        snapshot.bank_up_gate_storage = bank_for(l.host_up_gate_storage);
         snapshot.cached_up = cached_for(l.host_up);
         snapshot.cached_gate = cached_for(l.host_gate);
         snapshot.cached_down = cached_for(l.host_down);
+        snapshot.host_up_gate_storage = l.host_up_gate_storage;
+        snapshot.cached_up_gate_storage = cached_for(l.host_up_gate_storage);
         snapshot.group_layers = g.layers;
         return snapshot.bank_up && snapshot.bank_gate && snapshot.bank_down &&
                 snapshot.cached_up && snapshot.cached_gate && snapshot.cached_down;
@@ -702,33 +751,35 @@ bool llama_moe_cache::copy(ggml_backend * backend, const ggml_tensor * src, ggml
 
 bool llama_moe_cache::resolve_and_pin(int32_t device, int32_t group_id, int32_t il, uint64_t owner_generation,
         const int32_t * ids, int32_t n_ids, ggml_cuda_moe_ffn_resolution * result) {
-    if (!ids || !result || n_ids <= 0 || n_ids > GGML_MOE_FFN_MAX_SELECTED) return false;
+    if (!ids || !result || n_ids <= 0 || !result->draw_slots || !result->pins ||
+            result->draw_capacity < (size_t) n_ids || result->pin_capacity < (size_t) n_ids) return false;
+    result->n_draws = 0;
+    result->n_pins = 0;
     std::lock_guard<std::mutex> lock(pimpl->state_mutex);
     if (group_id < 0 || (size_t) group_id >= pimpl->groups.size() ||
             il < 0 || (size_t) il >= pimpl->layers.size()) return false;
     auto & g = pimpl->groups[group_id];
     auto & l = pimpl->layers[il];
-    if (!g.frozen || g.generation != owner_generation || g.device != device ||
+    if (!g.frozen || g.generation != owner_generation || g.device != device || n_ids > g.lru.n_expert ||
             l.group != group_id || !g.lru.slot_map[il]) return false;
 
-    ggml_cuda_moe_ffn_resolution resolved{};
-    resolved.n_draws = n_ids;
+    int32_t n_pins = 0;
     for (int32_t i = 0; i < n_ids; ++i) {
         const int32_t expert = ids[i];
         if (expert < 0 || expert >= g.lru.n_expert) return false;
         const int32_t slot = g.lru.slot_map[il][expert];
         if (slot < -1 || slot >= g.lru.n_slots) return false;
-        resolved.draw_slots[i] = slot;
+        result->draw_slots[i] = slot;
         if (slot < 0) continue;
         if (g.lru.state[slot] != moe_cache_lru::slot_state::READY ||
                 g.lru.key_of[slot] != il*g.lru.n_expert + expert ||
                 g.lru.slot_generation[slot] == 0 || g.lru.pin_count[slot] != 0) return false;
         bool already_added = false;
-        for (int32_t p = 0; p < resolved.n_pins; ++p) {
-            already_added |= resolved.pins[p].slot == slot;
+        for (int32_t p = 0; p < n_pins; ++p) {
+            already_added |= result->pins[p].slot == slot;
         }
         if (!already_added) {
-            auto & token = resolved.pins[resolved.n_pins++];
+            auto & token = result->pins[n_pins++];
             token.owner = this;
             token.device = device;
             token.group = group_id;
@@ -739,18 +790,19 @@ bool llama_moe_cache::resolve_and_pin(int32_t device, int32_t group_id, int32_t 
         }
     }
 
-    for (int32_t p = 0; p < resolved.n_pins; ++p) {
-        auto & token = resolved.pins[p];
+    for (int32_t p = 0; p < n_pins; ++p) {
+        auto & token = result->pins[p];
         token.generation = g.lru.advance_generation(token.slot);
         ++g.lru.pin_count[token.slot];
         g.lru.touch(token.slot);
     }
-    *result = resolved;
+    result->n_draws = n_ids;
+    result->n_pins = n_pins;
     return true;
 }
 
 bool llama_moe_cache::release_pins(const ggml_cuda_moe_ffn_pin_token * pins, int32_t n_pins) {
-    if (!pins || n_pins <= 0 || n_pins > GGML_MOE_FFN_MAX_SELECTED) return false;
+    if (!pins || n_pins <= 0) return false;
     std::lock_guard<std::mutex> lock(pimpl->state_mutex);
     for (int32_t i = 0; i < n_pins; ++i) {
         const auto & token = pins[i];
@@ -777,16 +829,18 @@ bool llama_moe_cache::release_pins(const ggml_cuda_moe_ffn_pin_token * pins, int
 }
 
 bool llama_moe_cache::reserve_fill(int32_t device, int32_t group_id, int32_t il,
-        uint64_t owner_generation, int32_t expert, ggml_cuda_moe_ffn_fill_job * job) {
-    if (!job) return false;
+        uint64_t owner_generation, int32_t expert, ggml_cuda_moe_ffn_fill_job * job,
+        ggml_cuda_moe_ffn_fill_part * parts, size_t part_capacity) {
+    if (!job || !parts) return false;
     std::lock_guard<std::mutex> lock(pimpl->state_mutex);
     if (group_id < 0 || (size_t) group_id >= pimpl->groups.size() ||
             il < 0 || (size_t) il >= pimpl->layers.size()) return false;
     auto & g = pimpl->groups[group_id];
     auto & l = pimpl->layers[il];
+    const size_t physical_parts = l.experts.size();
     if (!g.frozen || g.generation != owner_generation || g.device != device ||
             l.group != group_id || expert < 0 || expert >= g.lru.n_expert ||
-            !g.lru.slot_map[il] || l.experts.size() != GGML_CUDA_MOE_FFN_MAX_FILL_PARTS ||
+            !g.lru.slot_map[il] || physical_parts == 0 || part_capacity != physical_parts ||
             g.banks.size() != l.experts.size() || g.lru.slot_map[il][expert] >= 0) return false;
 
     const int64_t key64 = int64_t(il) * g.lru.n_expert + expert;
@@ -828,16 +882,66 @@ bool llama_moe_cache::reserve_fill(int32_t device, int32_t group_id, int32_t il,
     pending.slot = slot;
     pending.key = key;
     pending.owner_generation = owner_generation;
-    pending.n_parts = GGML_CUDA_MOE_FFN_MAX_FILL_PARTS;
-    const ggml_tensor * canonical_parts[GGML_CUDA_MOE_FFN_MAX_FILL_PARTS] = {
-        l.host_up, l.host_gate, l.host_down,
-    };
-    for (int32_t ip = 0; ip < pending.n_parts; ++ip) {
-        const ggml_tensor * weights = canonical_parts[ip];
-        const auto part = std::find(l.experts.begin(), l.experts.end(), weights);
-        if (!weights || part == l.experts.end()) return false;
-        const size_t bank_index = std::distance(l.experts.begin(), part);
+    for (size_t ip = 0; ip < physical_parts; ++ip) {
+        const ggml_tensor * weights = l.experts[ip];
+        const size_t bank_index = ip;
         ggml_tensor * bank = g.banks[bank_index];
+        if (ip == 0 && l.host_up_gate_storage && l.host_up && l.host_gate) {
+            const auto up_binding = pimpl->bindings.find(l.host_up);
+            const auto gate_binding = pimpl->bindings.find(l.host_gate);
+            if (!weights || !weights->data || !bank || !bank->data ||
+                    up_binding == pimpl->bindings.end() || gate_binding == pimpl->bindings.end() ||
+                    !up_binding->second.cached || !gate_binding->second.cached ||
+                    up_binding->second.part != (int32_t) ip || gate_binding->second.part != (int32_t) ip) return false;
+            const ggml_tensor * up = l.host_up;
+            const ggml_tensor * gate = l.host_gate;
+            const ggml_tensor * cached_up = up_binding->second.cached;
+            const ggml_tensor * cached_gate = gate_binding->second.cached;
+            const ggml_tensor * weights_root = weights->view_src ? weights->view_src : weights;
+            const ggml_tensor * bank_root = bank->view_src ? bank->view_src : bank;
+            const size_t up_bytes = ggml_row_size(up->type, up->ne[0]) * (size_t) up->ne[1];
+            const size_t gate_bytes = ggml_row_size(gate->type, gate->ne[0]) * (size_t) gate->ne[1];
+            if (!up_bytes || !gate_bytes || up_bytes > SIZE_MAX - gate_bytes ||
+                    up_bytes + gate_bytes != weights->nb[2] ||
+                    up->type != weights->type || gate->type != weights->type ||
+                    up->view_src != weights_root || gate->view_src != weights_root ||
+                    cached_up->view_src != bank_root || cached_gate->view_src != bank_root ||
+                    up->view_offs < weights->view_offs || gate->view_offs < weights->view_offs ||
+                    cached_up->view_offs < bank->view_offs || cached_gate->view_offs < bank->view_offs ||
+                    up->ne[2] <= expert || gate->ne[2] <= expert ||
+                    cached_up->ne[2] <= slot || cached_gate->ne[2] <= slot ||
+                    up->nb[2] == 0 || gate->nb[2] == 0 || cached_up->nb[2] == 0 || cached_gate->nb[2] == 0 ||
+                    (size_t) expert > SIZE_MAX / up->nb[2] || (size_t) expert > SIZE_MAX / gate->nb[2] ||
+                    (size_t) slot > SIZE_MAX / cached_up->nb[2] || (size_t) slot > SIZE_MAX / cached_gate->nb[2]) return false;
+            const size_t up_source_step = (size_t) expert * up->nb[2];
+            const size_t gate_source_step = (size_t) expert * gate->nb[2];
+            const size_t up_destination_step = (size_t) slot * cached_up->nb[2];
+            const size_t gate_destination_step = (size_t) slot * cached_gate->nb[2];
+            const size_t up_source_base = up->view_offs - weights->view_offs;
+            const size_t gate_source_base = gate->view_offs - weights->view_offs;
+            const size_t up_destination_base = cached_up->view_offs - bank->view_offs;
+            const size_t gate_destination_base = cached_gate->view_offs - bank->view_offs;
+            if (up_source_base > SIZE_MAX - up_source_step || gate_source_base > SIZE_MAX - gate_source_step ||
+                    up_destination_base > SIZE_MAX - up_destination_step ||
+                    gate_destination_base > SIZE_MAX - gate_destination_step) return false;
+            const size_t up_source_offset = up_source_base + up_source_step;
+            const size_t gate_source_offset = gate_source_base + gate_source_step;
+            const size_t up_destination_offset = up_destination_base + up_destination_step;
+            const size_t gate_destination_offset = gate_destination_base + gate_destination_step;
+            const size_t source_bytes = ggml_nbytes(weights);
+            const size_t destination_bytes = ggml_nbytes(bank);
+            if (up_source_offset > source_bytes || up_bytes > source_bytes - up_source_offset ||
+                    gate_source_offset > source_bytes || gate_bytes > source_bytes - gate_source_offset ||
+                    up_destination_offset > destination_bytes || up_bytes > destination_bytes - up_destination_offset ||
+                    gate_destination_offset > destination_bytes || gate_bytes > destination_bytes - gate_destination_offset ||
+                    pending.total_bytes > SIZE_MAX - up_bytes - gate_bytes) return false;
+            parts[ip] = { (const uint8_t *) weights->data + gate_source_offset,
+                    (uint8_t *) bank->data + gate_destination_offset, gate_bytes,
+                    (const uint8_t *) weights->data + up_source_offset,
+                    (uint8_t *) bank->data + up_destination_offset, up_bytes };
+            pending.total_bytes += gate_bytes + up_bytes;
+            continue;
+        }
         if (!weights || !weights->data || !bank || !bank->data || weights->nb[2] == 0 ||
                 (size_t) expert > std::numeric_limits<size_t>::max() / weights->nb[2] ||
                 (size_t) slot > std::numeric_limits<size_t>::max() / weights->nb[2]) return false;
@@ -849,8 +953,8 @@ bool llama_moe_cache::reserve_fill(int32_t device, int32_t group_id, int32_t il,
         if (source_offset > source_bytes || bytes > source_bytes - source_offset ||
                 destination_offset > bank_bytes || bytes > bank_bytes - destination_offset ||
                 pending.total_bytes > std::numeric_limits<size_t>::max() - bytes) return false;
-        pending.parts[ip] = { (const uint8_t *) weights->data + source_offset,
-                (uint8_t *) bank->data + destination_offset, bytes };
+        parts[ip] = { (const uint8_t *) weights->data + source_offset,
+                (uint8_t *) bank->data + destination_offset, bytes, nullptr, nullptr, 0 };
         pending.total_bytes += bytes;
     }
     if (pending.total_bytes == 0) return false;
@@ -869,7 +973,7 @@ bool llama_moe_cache::reserve_fill(int32_t device, int32_t group_id, int32_t il,
 }
 
 bool llama_moe_cache::finish_fill(const ggml_cuda_moe_ffn_fill_job * job, bool copied) {
-    if (!job || job->owner != this || job->n_parts != GGML_CUDA_MOE_FFN_MAX_FILL_PARTS) return false;
+    if (!job || job->owner != this) return false;
     std::lock_guard<std::mutex> lock(pimpl->state_mutex);
     if (job->group < 0 || (size_t) job->group >= pimpl->groups.size() ||
             job->layer < 0 || (size_t) job->layer >= pimpl->layers.size()) return false;
@@ -906,9 +1010,10 @@ bool llama_moe_cache_release_callback(void * context, const ggml_cuda_moe_ffn_pi
 }
 
 bool llama_moe_cache_reserve_fill_callback(void * context, int32_t device, int32_t group,
-        int32_t layer, uint64_t owner_generation, int32_t expert, ggml_cuda_moe_ffn_fill_job * job) {
+        int32_t layer, uint64_t owner_generation, int32_t expert, ggml_cuda_moe_ffn_fill_job * job,
+        ggml_cuda_moe_ffn_fill_part * parts, size_t part_capacity) {
     return context && static_cast<llama_moe_cache *>(context)->reserve_fill(
-            device, group, layer, owner_generation, expert, job);
+            device, group, layer, owner_generation, expert, job, parts, part_capacity);
 }
 
 bool llama_moe_cache_finish_fill_callback(void * context, const ggml_cuda_moe_ffn_fill_job * job, bool copied) {

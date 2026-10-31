@@ -34,6 +34,12 @@ struct llama_moe_ffn_prototype_config {
 };
 
 struct llama_moe_ffn_prototype_state {
+    struct resource_signature {
+        int32_t n_embd = 0;
+        int32_t n_ff = 0;
+        int32_t n_experts_used = 0;
+    };
+
     struct group_state {
         llama_moe_cache::frozen_lease lease;
         llama_moe_cache_frozen_layer snapshot;
@@ -63,6 +69,7 @@ struct llama_moe_ffn_prototype_state {
         int32_t n_embd = 0;
         int32_t n_ff = 0;
         int32_t n_experts_used = 0;
+        std::vector<resource_signature> resource_signatures;
         bool cpu_backend_transferred = false;
         std::vector<group_state> groups;
         std::vector<layer_binding> layer_bindings;

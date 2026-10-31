@@ -1737,7 +1737,7 @@ llm_expert_gating_func_type   gating_op,
             if (type_op == LLM_FFN_SILU && std::isfinite(routed_limit) && routed_limit >= 0.0f)
                 layout.graph_flags |= GGML_MOE_FFN_GRAPH_SILU_LIMIT;
             if (ggml_moe_ffn_expert_execution_inputs_supported(up_exps_b, gate_exps_b,
-                    down_exps_b, up_gate_exps, up_gate_exps_b, down_exps_s))
+                    down_exps_b, up_gate_exps_b, down_exps_s))
                 layout.graph_flags |= GGML_MOE_FFN_GRAPH_NO_EXPERT_EXECUTION_EXTRAS;
             if ((!up_exps || !lctx.model.hadamard_rotation(up_exps)) &&
                     (!gate_exps || !lctx.model.hadamard_rotation(gate_exps)) &&

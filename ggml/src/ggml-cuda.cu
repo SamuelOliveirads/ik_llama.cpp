@@ -72,15 +72,16 @@
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
+#include <climits>
 #include <mutex>
 #include <thread>
 
 static constexpr int32_t MOE_CACHE_TRANSPORT_STREAM = 1;
-static_assert(GGML_MOE_FFN_ROW_ALIGNMENT == QK8_1, "semantic FFN layout and Q8_1 alignment must agree");
 
 struct ggml_cuda_moe_ffn_cpu_resource_state {
     struct fill_request {
         ggml_cuda_moe_ffn_fill_job owner_job{};
+        std::vector<ggml_cuda_moe_ffn_fill_part> parts;
         const ggml_cuda_moe_ffn_cache_callbacks * callbacks = nullptr;
         void * cache_context = nullptr;
         int32_t binding_id = -1;
@@ -90,12 +91,12 @@ struct ggml_cuda_moe_ffn_cpu_resource_state {
     struct pending_pin_record {
         const ggml_cuda_moe_ffn_cache_callbacks * callbacks = nullptr;
         void * context = nullptr;
-        int32_t n_pins = 0;
-        ggml_cuda_moe_ffn_pin_token pins[GGML_MOE_FFN_MAX_SELECTED]{};
+        std::vector<ggml_cuda_moe_ffn_pin_token> pins;
         bool active = false;
     };
 
     ggml_cuda_moe_ffn_cpu_resource resource{};
+    std::vector<ggml_cuda_moe_ffn_resource_signature> signatures;
     int32_t device = -1;
     std::mutex execution_mutex;
     std::mutex fill_mutex;
@@ -156,6 +157,8 @@ struct ggml_cuda_moe_ffn_cpu_resource_state {
     size_t phase_sample_count = 0;
     uint64_t phase_samples_dropped = 0;
     pending_pin_record pending_pins{};
+    std::vector<ggml_cuda_moe_ffn_pin_token> resolved_pins;
+    std::vector<int32_t> fill_candidates;
 
     ~ggml_cuda_moe_ffn_cpu_resource_state() {
         GGML_ASSERT(!pending_pins.active && "destroying CUDA MoE resource with live cache pins");
@@ -229,32 +232,104 @@ struct ggml_cuda_moe_ffn_binding_state {
 #include <vector>
 #include <sstream>
 
+static size_t ggml_cuda_moe_ffn_physical_part_count(const ggml_moe_ffn_layout & layout) {
+    switch (layout.storage_topology) {
+        case GGML_MOE_FFN_STORAGE_SEPARATE_UP_GATE_DOWN: return 3;
+        case GGML_MOE_FFN_STORAGE_MERGED_UP_GATE_DOWN: return 2;
+        default: return 0;
+    }
+}
+
+static std::pair<const ggml_tensor *, const ggml_tensor *> ggml_cuda_moe_ffn_physical_part(
+        const ggml_moe_ffn_layout & layout, size_t index) {
+    if (layout.storage_topology == GGML_MOE_FFN_STORAGE_SEPARATE_UP_GATE_DOWN) {
+        switch (index) {
+            case 0: return { layout.up, layout.bank_up };
+            case 1: return { layout.gate, layout.bank_gate };
+            case 2: return { layout.down, layout.bank_down };
+            default: break;
+        }
+    } else if (layout.storage_topology == GGML_MOE_FFN_STORAGE_MERGED_UP_GATE_DOWN) {
+        switch (index) {
+            case 0: return { layout.up_gate_storage, layout.bank_up_gate_storage };
+            case 1: return { layout.down, layout.bank_down };
+            default: break;
+        }
+    }
+    return { nullptr, nullptr };
+}
+
 static bool ggml_cuda_moe_ffn_validate_fill_job(const ggml_cuda_moe_ffn_binding & binding,
-        const ggml_cuda_moe_ffn_fill_job & job, int32_t expected_expert) {
+        const ggml_cuda_moe_ffn_fill_job & job, int32_t expected_expert,
+        const ggml_cuda_moe_ffn_fill_part * parts, size_t part_count) {
+    const auto & layout = binding.layout;
+    const size_t expected_parts = ggml_cuda_moe_ffn_physical_part_count(layout);
     if (binding.layout.n_experts <= 0 || binding.layout.n_slots <= 0 || binding.layout.cache_layer < 0 ||
             expected_expert < 0 || expected_expert >= binding.layout.n_experts ||
             job.owner != binding.cache_context || job.device != binding.layout.device ||
             job.group != binding.layout.cache_group || job.layer != binding.layout.cache_layer ||
             job.owner_generation != binding.generation || job.slot < 0 || job.slot >= binding.layout.n_slots ||
-            job.n_parts != GGML_CUDA_MOE_FFN_MAX_FILL_PARTS || job.generation == 0 ||
+            !parts || expected_parts == 0 || part_count != expected_parts || job.generation == 0 ||
             job.key < 0 || job.key / binding.layout.n_experts != binding.layout.cache_layer ||
             job.key % binding.layout.n_experts != expected_expert) return false;
 
-    const ggml_tensor * hosts[GGML_CUDA_MOE_FFN_MAX_FILL_PARTS] = {
-        binding.layout.up, binding.layout.gate, binding.layout.down,
-    };
-    const ggml_tensor * banks[GGML_CUDA_MOE_FFN_MAX_FILL_PARTS] = {
-        binding.layout.bank_up, binding.layout.bank_gate, binding.layout.bank_down,
-    };
     size_t total = 0;
-    for (int32_t i = 0; i < GGML_CUDA_MOE_FFN_MAX_FILL_PARTS; ++i) {
-        const ggml_tensor * host = hosts[i];
-        const ggml_tensor * bank = banks[i];
+    for (size_t i = 0; i < expected_parts; ++i) {
+        if (layout.storage_topology == GGML_MOE_FFN_STORAGE_MERGED_UP_GATE_DOWN && i == 0) {
+            const ggml_tensor * host = layout.up_gate_storage;
+            const ggml_tensor * bank = layout.bank_up_gate_storage;
+            const ggml_tensor * host_root = host && host->view_src ? host->view_src : host;
+            const ggml_tensor * bank_root = bank && bank->view_src ? bank->view_src : bank;
+            const ggml_tensor * views[2] = { layout.gate, layout.up };
+            const ggml_tensor * bank_views[2] = { layout.bank_gate, layout.bank_up };
+            if (!host || !host->data || !bank || !bank->data) return false;
+            for (size_t v = 0; v < 2; ++v) {
+                const ggml_tensor * source_view = views[v];
+                const ggml_tensor * destination_view = bank_views[v];
+                if (!source_view || !destination_view || source_view->view_src != host_root ||
+                        destination_view->view_src != bank_root ||
+                        source_view->view_offs < host->view_offs ||
+                        destination_view->view_offs < bank->view_offs ||
+                        source_view->ne[2] <= expected_expert ||
+                        destination_view->ne[2] <= job.slot || source_view->nb[2] == 0 ||
+                        destination_view->nb[2] == 0) return false;
+                const size_t rows = ggml_row_size(source_view->type, source_view->ne[0]);
+                if (!rows || rows > SIZE_MAX / (size_t) source_view->ne[1]) return false;
+                const size_t bytes = rows * (size_t) source_view->ne[1];
+                if (source_view->type != destination_view->type || bytes == 0 ||
+                        (size_t) expected_expert > SIZE_MAX / source_view->nb[2] ||
+                        (size_t) job.slot > SIZE_MAX / destination_view->nb[2]) return false;
+                const size_t source_step = (size_t) expected_expert * source_view->nb[2];
+                const size_t destination_step = (size_t) job.slot * destination_view->nb[2];
+                const size_t source_base = source_view->view_offs - host->view_offs;
+                const size_t destination_base = destination_view->view_offs - bank->view_offs;
+                if (source_base > SIZE_MAX - source_step ||
+                        destination_base > SIZE_MAX - destination_step) return false;
+                const size_t source_offset = source_base + source_step;
+                const size_t destination_offset = destination_base + destination_step;
+                const size_t source_size = ggml_nbytes(host);
+                const size_t destination_size = ggml_nbytes(bank);
+                const void * expected_source = (const uint8_t *) host->data + source_offset;
+                void * expected_destination = (uint8_t *) bank->data + destination_offset;
+                const size_t descriptor_bytes = v == 0 ? parts[i].bytes : parts[i].bytes2;
+                const void * descriptor_source = v == 0 ? parts[i].source : parts[i].source2;
+                void * descriptor_destination = v == 0 ? parts[i].destination : parts[i].destination2;
+                if (source_offset > source_size || bytes > source_size - source_offset ||
+                        destination_offset > destination_size || bytes > destination_size - destination_offset ||
+                        descriptor_bytes != bytes || descriptor_source != expected_source ||
+                        descriptor_destination != expected_destination || total > SIZE_MAX - bytes) return false;
+                total += bytes;
+            }
+            continue;
+        }
+        const auto expected = ggml_cuda_moe_ffn_physical_part(layout, i);
+        const ggml_tensor * host = expected.first;
+        const ggml_tensor * bank = expected.second;
         if (!host || !host->data || !bank || !bank->data ||
                 host->ne[2] <= expected_expert || bank->ne[2] <= job.slot ||
                 host->nb[2] == 0 || host->nb[2] != bank->nb[2]) return false;
         const size_t bytes = host->nb[2];
-        if (job.parts[i].bytes != bytes ||
+        if (parts[i].bytes != bytes || parts[i].source2 || parts[i].destination2 || parts[i].bytes2 != 0 ||
                 (size_t) expected_expert > SIZE_MAX / bytes || (size_t) job.slot > SIZE_MAX / bytes) return false;
         const size_t source_offset = (size_t) expected_expert * bytes;
         const size_t destination_offset = (size_t) job.slot * bytes;
@@ -262,8 +337,8 @@ static bool ggml_cuda_moe_ffn_validate_fill_job(const ggml_cuda_moe_ffn_binding 
         const size_t destination_size = ggml_nbytes(bank);
         if (source_offset > source_size || bytes > source_size - source_offset ||
                 destination_offset > destination_size || bytes > destination_size - destination_offset ||
-                job.parts[i].source != (const uint8_t *) host->data + source_offset ||
-                job.parts[i].destination != (uint8_t *) bank->data + destination_offset ||
+                parts[i].source != (const uint8_t *) host->data + source_offset ||
+                parts[i].destination != (uint8_t *) bank->data + destination_offset ||
                 total > SIZE_MAX - bytes) return false;
         total += bytes;
     }
@@ -293,16 +368,19 @@ static int ggml_cuda_moe_ffn_copy_fill_request(
     }
     if (!binding_state || binding_state->binding.layout.n_experts <= 0 || job.key < 0) return rollback();
     const int32_t expert = job.key % binding_state->binding.layout.n_experts;
-    if (!ggml_cuda_moe_ffn_validate_fill_job(binding_state->binding, job, expert)) return rollback();
+    if (!ggml_cuda_moe_ffn_validate_fill_job(binding_state->binding, job, expert,
+                request.parts.data(), request.parts.size())) return rollback();
 
     if (cudaSetDevice(resource.device) != cudaSuccess) return 0;
     bool copied = true;
-    for (int32_t i = 0; i < job.n_parts; ++i) {
-        const auto & part = job.parts[i];
+    for (size_t i = 0; i < request.parts.size(); ++i) {
+        const auto & part = request.parts[i];
         // Canonical model weights are persistent host buffers. CUDA may stage
         // pageable sources synchronously; correctness does not assume overlap.
         if (cudaMemcpyAsync(part.destination, part.source, part.bytes,
-                    cudaMemcpyHostToDevice, resource.fill_stream) != cudaSuccess) {
+                    cudaMemcpyHostToDevice, resource.fill_stream) != cudaSuccess ||
+                (part.bytes2 && cudaMemcpyAsync(part.destination2, part.source2, part.bytes2,
+                    cudaMemcpyHostToDevice, resource.fill_stream) != cudaSuccess)) {
             copied = false;
             break;
         }
@@ -348,7 +426,7 @@ static void ggml_cuda_moe_ffn_fill_worker(ggml_cuda_moe_ffn_cpu_resource_state *
                 if (resource->fill_stopping) return;
                 continue;
             }
-            request = resource->queued_fill;
+            request = std::move(resource->queued_fill);
             resource->queued_fill = {};
             resource->fill_queued = false;
             resource->fill_active = true;
@@ -366,7 +444,7 @@ static void ggml_cuda_moe_ffn_fill_worker(ggml_cuda_moe_ffn_cpu_resource_state *
             } else {
                 if (result == 2) {
                     ++resource->fills_completed;
-                    resource->fill_parts_completed += request.owner_job.n_parts;
+                    resource->fill_parts_completed += request.parts.size();
                     resource->fill_bytes_completed += request.owner_job.total_bytes;
                 }
                 else ++resource->fills_failed;
@@ -391,13 +469,27 @@ static bool ggml_cuda_moe_ffn_enqueue_fill(ggml_cuda_moe_ffn_cpu_resource_state 
     }
 
     ggml_cuda_moe_ffn_fill_job job{};
-    if (!callbacks->reserve_fill(binding.cache_context, binding.layout.device, binding.layout.cache_group,
-                binding.layout.cache_layer, binding.generation, expert, &job)) {
+    const size_t part_count = ggml_cuda_moe_ffn_physical_part_count(binding.layout);
+    if (part_count == 0) {
         std::lock_guard<std::mutex> lock(resource.fill_mutex);
         ++resource.fills_rejected;
         return false;
     }
-    if (!ggml_cuda_moe_ffn_validate_fill_job(binding, job, expert)) {
+    std::vector<ggml_cuda_moe_ffn_fill_part> parts;
+    try {
+        parts.resize(part_count);
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(resource.fill_mutex);
+        ++resource.fills_rejected;
+        return false;
+    }
+    if (!callbacks->reserve_fill(binding.cache_context, binding.layout.device, binding.layout.cache_group,
+                binding.layout.cache_layer, binding.generation, expert, &job, parts.data(), parts.size())) {
+        std::lock_guard<std::mutex> lock(resource.fill_mutex);
+        ++resource.fills_rejected;
+        return false;
+    }
+    if (!ggml_cuda_moe_ffn_validate_fill_job(binding, job, expert, parts.data(), parts.size())) {
         if (!callbacks->finish_fill(binding.cache_context, &job, false)) {
             GGML_ABORT("failed to roll back invalid MoE cache fill reservation");
         }
@@ -408,6 +500,7 @@ static bool ggml_cuda_moe_ffn_enqueue_fill(ggml_cuda_moe_ffn_cpu_resource_state 
 
     ggml_cuda_moe_ffn_cpu_resource_state::fill_request request{};
     request.owner_job = job;
+    request.parts = std::move(parts);
     request.callbacks = callbacks;
     request.cache_context = binding.cache_context;
     request.binding_id = binding_id;
@@ -416,7 +509,7 @@ static bool ggml_cuda_moe_ffn_enqueue_fill(ggml_cuda_moe_ffn_cpu_resource_state 
     {
         std::lock_guard<std::mutex> lock(resource.fill_mutex);
         if (resource.accepting_fills && !resource.fill_stopping && !resource.fill_outstanding) {
-            resource.queued_fill = request;
+            resource.queued_fill = std::move(request);
             resource.fill_queued = true;
             resource.fill_outstanding = true;
             ++resource.fills_accepted;
@@ -4142,6 +4235,17 @@ static bool ggml_cuda_moe_ffn_shape_matches(const ggml_backend_cuda_context & ct
         ggml_is_contiguous(op);
 }
 
+static bool ggml_cuda_moe_ffn_resource_supports_signature(
+        const ggml_cuda_moe_ffn_cpu_resource_state & resource,
+        const ggml_moe_ffn_layout & layout) {
+    if (layout.n_embd > resource.resource.n_embd || layout.n_ff > resource.resource.n_ff ||
+            layout.n_experts_used > resource.resource.n_experts_used) return false;
+    return std::any_of(resource.signatures.begin(), resource.signatures.end(), [&](const auto & signature) {
+        return signature.n_embd == layout.n_embd && signature.n_ff == layout.n_ff &&
+            signature.n_experts_used == layout.n_experts_used;
+    });
+}
+
 static bool ggml_cuda_moe_ffn_supports_op(ggml_backend_cuda_context & ctx, const ggml_tensor * op) {
     ggml_moe_ffn_op_params params{};
     if (!ggml_cuda_moe_ffn_op_params(op, params) || params.device != ctx.device ||
@@ -4245,7 +4349,8 @@ static bool ggml_cuda_moe_ffn_enqueue_hit_rows(ggml_backend_cuda_context & ctx,
     CUDA_CHECK(cudaGetLastError());
 
     const int64_t down_padded = GGML_PAD(b.layout.n_ff, MATRIX_ROW_PADDING);
-    const size_t q8_per_expert = resource.down_q8_bytes / b.layout.n_experts_used;
+    const size_t q8_per_expert = (size_t) GGML_PAD((int64_t) b.layout.n_ff, MATRIX_ROW_PADDING) /
+        QK8_1 * sizeof(block_q8_1);
     quantize_row_q8_1_cuda((const float *) resource.device_hidden, resource.device_down_q8,
             b.layout.n_ff, n_hits, 1, down_padded, b.layout.down->type, stream);
     CUDA_CHECK(cudaGetLastError());
@@ -4335,8 +4440,8 @@ static bool ggml_cuda_moe_ffn_release_pin_set(const ggml_cuda_moe_ffn_cache_call
 static bool ggml_cuda_moe_ffn_release_pending_pins(ggml_cuda_moe_ffn_cpu_resource_state & resource) {
     auto & pending = resource.pending_pins;
     if (!pending.active) return true;
-    if (!ggml_cuda_moe_ffn_release_pin_set(pending.callbacks, pending.context, pending.pins,
-                pending.n_pins, resource, true)) {
+    if (!ggml_cuda_moe_ffn_release_pin_set(pending.callbacks, pending.context, pending.pins.data(),
+                (int32_t) pending.pins.size(), resource, true)) {
         return false;
     }
     pending = {};
@@ -4345,8 +4450,10 @@ static bool ggml_cuda_moe_ffn_release_pending_pins(ggml_cuda_moe_ffn_cpu_resourc
 
 static bool ggml_cuda_moe_ffn_validate_resolution(const ggml_cuda_moe_ffn_binding & binding,
         const ggml_cuda_moe_ffn_resolution & resolved) {
-    if (resolved.n_draws != binding.layout.n_experts_used || resolved.n_pins < 0 ||
-            resolved.n_pins > resolved.n_draws) return false;
+    if (resolved.n_draws != binding.layout.n_experts_used || resolved.n_draws < 0 ||
+            !resolved.draw_slots || resolved.draw_capacity < (size_t) resolved.n_draws ||
+            resolved.n_pins < 0 || resolved.n_pins > resolved.n_draws || !resolved.pins ||
+            resolved.pin_capacity < (size_t) resolved.n_pins) return false;
     int32_t unique_hits = 0;
     for (int32_t i = 0; i < resolved.n_draws; ++i) {
         const int32_t slot = resolved.draw_slots[i];
@@ -4380,8 +4487,7 @@ static void ggml_cuda_moe_ffn_store_pending_pins(ggml_cuda_moe_ffn_cpu_resource_
     if (resolved.n_pins == 0) return;
     pending.callbacks = binding.cache_callbacks;
     pending.context = binding.cache_context;
-    pending.n_pins = resolved.n_pins;
-    std::copy_n(resolved.pins, resolved.n_pins, pending.pins);
+    pending.pins.assign(resolved.pins, resolved.pins + resolved.n_pins);
     pending.active = true;
 }
 
@@ -4440,8 +4546,28 @@ static bool ggml_cuda_moe_ffn_compute(ggml_backend_cuda_context & ctx, ggml_tens
         return false;
     }
     ggml_cuda_moe_ffn_resolution resolved{};
-    if (!b.cache_callbacks->resolve_and_pin(b.cache_context, b.layout.device, b.layout.cache_group,
-                b.layout.cache_layer, b.generation, resource.host_ids, b.layout.n_experts_used, &resolved)) {
+    resolved.draw_slots = resource.host_slots;
+    resolved.draw_capacity = (size_t) b.layout.n_experts_used;
+    resource.resolved_pins.resize((size_t) b.layout.n_experts_used);
+    resolved.pins = resource.resolved_pins.data();
+    resolved.pin_capacity = resource.resolved_pins.size();
+    const auto * const draw_storage = resolved.draw_slots;
+    auto * const pin_storage = resolved.pins;
+    const size_t draw_capacity = resolved.draw_capacity;
+    const size_t pin_capacity = resolved.pin_capacity;
+    const bool resolved_ok = b.cache_callbacks->resolve_and_pin(b.cache_context, b.layout.device,
+            b.layout.cache_group, b.layout.cache_layer, b.generation, resource.host_ids,
+            b.layout.n_experts_used, &resolved);
+    // A C-style owner callback may fill only caller-owned storage. If it reports
+    // malformed counts, release every token that could have fit in that storage.
+    if (!resolved_ok || resolved.draw_slots != draw_storage || resolved.pins != pin_storage ||
+            resolved.draw_capacity != draw_capacity || resolved.pin_capacity != pin_capacity) {
+        const int32_t acquired = std::clamp<int32_t>(resolved.n_pins, 0, (int32_t) pin_capacity);
+        resource.pin_acquisitions += (uint64_t) acquired;
+        if (acquired > 0 && !ggml_cuda_moe_ffn_release_pin_set(b.cache_callbacks,
+                    b.cache_context, pin_storage, acquired, resource, false)) {
+            GGML_ABORT("failed to release malformed MoE cache pin result");
+        }
         ++stats.rejected_calls;
         return false;
     }
@@ -4450,8 +4576,11 @@ static bool ggml_cuda_moe_ffn_compute(ggml_backend_cuda_context & ctx, ggml_tens
                 resolved.pins, resolved.n_pins, resource, false);
     };
     if (!ggml_cuda_moe_ffn_validate_resolution(b, resolved)) {
-        if (resolved.n_pins >= 0 && resolved.n_pins <= GGML_MOE_FFN_MAX_SELECTED &&
-                !release_current_pins()) GGML_ABORT("failed to release invalid MoE cache pin result");
+        const int32_t acquired = std::clamp<int32_t>(resolved.n_pins, 0, (int32_t) pin_capacity);
+        resource.pin_acquisitions += (uint64_t) acquired;
+        if (acquired > 0 && !ggml_cuda_moe_ffn_release_pin_set(b.cache_callbacks,
+                    b.cache_context, pin_storage, acquired, resource, false))
+            GGML_ABORT("failed to release invalid MoE cache pin result");
         ++stats.rejected_calls;
         return false;
     }
@@ -4466,17 +4595,17 @@ static bool ggml_cuda_moe_ffn_compute(ggml_backend_cuda_context & ctx, ggml_tens
     stats.selected_ids += b.layout.n_experts_used;
 
     const int32_t n_misses = b.layout.n_experts_used - n_hits;
-    int32_t fill_candidates[GGML_MOE_FFN_MAX_SELECTED]{};
+    resource.fill_candidates.clear();
     int32_t n_fill_candidates = 0;
     for (int32_t i = 0; i < b.layout.n_experts_used; ++i) {
         if (resource.host_slots[i] >= 0) continue;
         const int32_t expert = resource.host_ids[i];
         bool duplicate = false;
-        for (int32_t j = 0; j < n_fill_candidates; ++j) duplicate |= fill_candidates[j] == expert;
-        if (!duplicate) fill_candidates[n_fill_candidates++] = expert;
+        for (int32_t j = 0; j < n_fill_candidates; ++j) duplicate |= resource.fill_candidates[j] == expert;
+        if (!duplicate) { resource.fill_candidates.push_back(expert); ++n_fill_candidates; }
     }
     for (int32_t i = 0; i < n_fill_candidates; ++i) {
-        ggml_cuda_moe_ffn_enqueue_fill(resource, b, params.binding_id, fill_candidates[i]);
+        ggml_cuda_moe_ffn_enqueue_fill(resource, b, params.binding_id, resource.fill_candidates[i]);
     }
     if (phase_candidate) {
         const auto phase_end = std::chrono::steady_clock::now();
@@ -6568,6 +6697,70 @@ static bool ggml_cuda_moe_ffn_device_tensor(const ggml_tensor * tensor, int devi
     return tensor && tensor->data && ggml_cuda_moe_ffn_tensor_on_device(tensor, device);
 }
 
+struct ggml_cuda_moe_ffn_workspace_sizes {
+    size_t ids, activation, route, output, host_stage;
+    size_t up_q8, down_q8, hidden, down, device_routes;
+};
+
+static bool ggml_cuda_moe_ffn_checked_mul(size_t a, size_t b, size_t & result) {
+    if (b && a > SIZE_MAX / b) return false;
+    result = a * b;
+    return true;
+}
+
+static bool ggml_cuda_moe_ffn_checked_add(size_t a, size_t b, size_t & result) {
+    if (a > SIZE_MAX - b) return false;
+    result = a + b;
+    return true;
+}
+
+static bool ggml_cuda_moe_ffn_get_workspace_sizes(int32_t n_embd, int32_t n_ff,
+        int32_t n_experts_used, ggml_cuda_moe_ffn_workspace_sizes & sizes) {
+    if (n_embd <= 0 || n_ff <= 0 || n_experts_used <= 0 ||
+            n_embd % QK8_1 != 0 || n_ff % QK8_1 != 0) return false;
+
+    const int64_t up_padded = GGML_PAD((int64_t) n_embd, MATRIX_ROW_PADDING);
+    const int64_t down_padded = GGML_PAD((int64_t) n_ff, MATRIX_ROW_PADDING);
+    if (up_padded > INT_MAX || down_padded > INT_MAX) return false;
+
+    size_t up_q8_row = 0, down_q8_row = 0;
+    if (!ggml_cuda_moe_ffn_checked_mul((size_t) up_padded / QK8_1,
+                sizeof(block_q8_1), up_q8_row) ||
+        !ggml_cuda_moe_ffn_checked_mul((size_t) down_padded / QK8_1,
+                sizeof(block_q8_1), down_q8_row) ||
+        !ggml_cuda_moe_ffn_checked_mul((size_t) n_experts_used, sizeof(int32_t), sizes.ids) ||
+        !ggml_cuda_moe_ffn_checked_mul((size_t) n_embd, sizeof(float), sizes.activation)) return false;
+    if (!ggml_cuda_moe_ffn_checked_mul((size_t) n_experts_used, sizeof(float), sizes.route)) return false;
+    sizes.output = sizes.activation;
+    size_t ids_staging = 0, routes_staging = 0, host_base = 0;
+    if (!ggml_cuda_moe_ffn_checked_mul(sizes.ids, 3, ids_staging) ||
+        !ggml_cuda_moe_ffn_checked_mul(sizes.route, 2, routes_staging) ||
+        !ggml_cuda_moe_ffn_checked_add(ids_staging, sizes.activation, host_base) ||
+        !ggml_cuda_moe_ffn_checked_add(host_base, routes_staging, host_base) ||
+        !ggml_cuda_moe_ffn_checked_add(host_base, sizes.output, sizes.host_stage) ||
+        !ggml_cuda_moe_ffn_checked_mul(down_q8_row, (size_t) n_experts_used, sizes.down_q8) ||
+        !ggml_cuda_moe_ffn_checked_mul((size_t) n_ff, (size_t) n_experts_used, sizes.hidden) ||
+        !ggml_cuda_moe_ffn_checked_mul(sizes.hidden, sizeof(float), sizes.hidden) ||
+        !ggml_cuda_moe_ffn_checked_mul((size_t) n_embd, (size_t) n_experts_used + 1, sizes.down) ||
+        !ggml_cuda_moe_ffn_checked_mul(sizes.down, sizeof(float), sizes.down) ||
+        !ggml_cuda_moe_ffn_checked_mul((size_t) n_experts_used + 1, sizeof(float), sizes.device_routes)) return false;
+    sizes.up_q8 = up_q8_row;
+    return true;
+}
+
+GGML_CALL bool ggml_backend_cuda_moe_ffn_layout_supported(ggml_backend_t backend,
+        const ggml_moe_ffn_layout * layout) {
+    if (!ggml_backend_is_cuda(backend) || !layout) return false;
+    const auto * ctx = (const ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_moe_ffn_workspace_sizes sizes{};
+    return layout->owner_backend == backend && (layout->device < 0 || layout->device == ctx->device) &&
+        ggml_moe_ffn_layout_supported(layout) && layout->up->type == layout->gate->type &&
+        ggml_cuda_mmvq_type_supported(layout->up->type) &&
+        ggml_cuda_mmvq_type_supported(layout->down->type) &&
+        ggml_cuda_moe_ffn_get_workspace_sizes(layout->n_embd, layout->n_ff,
+                layout->n_experts_used, sizes);
+}
+
 GGML_CALL int32_t ggml_backend_cuda_moe_ffn_register(ggml_backend_t backend,
         const ggml_cuda_moe_ffn_binding * binding) {
     if (!ggml_backend_is_cuda(backend) || !binding) return -1;
@@ -6575,13 +6768,11 @@ GGML_CALL int32_t ggml_backend_cuda_moe_ffn_register(ggml_backend_t backend,
     const ggml_moe_ffn_layout & layout = binding->layout;
     if (layout.device != ctx->device || layout.owner_backend != backend ||
         layout.cache_owner != binding->cache_context || binding->generation == 0 ||
-        !ggml_moe_ffn_layout_supported(&layout) || layout.n_slots <= 0 ||
+        !ggml_backend_cuda_moe_ffn_layout_supported(backend, &layout) || layout.n_slots <= 0 ||
         !binding->cache_callbacks || !binding->cache_callbacks->resolve_and_pin ||
         !binding->cache_callbacks->release_pins || !binding->cache_context ||
         binding->cpu_resource_id <= 0 || !binding->cpu_graph ||
-        !binding->cpu_activations || !binding->cpu_ids || !binding->cpu_route_weights || !binding->cpu_output ||
-        !ggml_cuda_mmvq_type_supported(layout.up->type) ||
-        !ggml_cuda_mmvq_type_supported(layout.down->type)) return -1;
+        !binding->cpu_activations || !binding->cpu_ids || !binding->cpu_route_weights || !binding->cpu_output) return -1;
 
     if (!ggml_cuda_moe_ffn_host_tensor(layout.up) || !ggml_cuda_moe_ffn_host_tensor(layout.gate) ||
         !ggml_cuda_moe_ffn_host_tensor(layout.down) || !ggml_cuda_moe_ffn_device_tensor(layout.bank_up, ctx->device) ||
@@ -6602,8 +6793,7 @@ GGML_CALL int32_t ggml_backend_cuda_moe_ffn_register(ggml_backend_t backend,
         if (it == ctx->moe_ffn_cpu_resources.end()) return -1;
         resource = it->second;
     }
-    if (resource->device != ctx->device || resource->resource.n_embd != layout.n_embd ||
-        resource->resource.n_ff != layout.n_ff || resource->resource.n_experts_used != layout.n_experts_used) return -1;
+    if (resource->device != ctx->device || !ggml_cuda_moe_ffn_resource_supports_signature(*resource, layout)) return -1;
 
     {
         std::lock_guard<std::mutex> execution_lock(resource->execution_mutex);
@@ -6627,25 +6817,47 @@ GGML_CALL int32_t ggml_backend_cuda_moe_ffn_register(ggml_backend_t backend,
 GGML_CALL int32_t ggml_backend_cuda_moe_ffn_cpu_resource_register(ggml_backend_t backend,
         const ggml_cuda_moe_ffn_cpu_resource * resource) {
     if (!ggml_backend_is_cuda(backend) || !resource || !ggml_backend_is_cpu(resource->cpu_backend) ||
-        resource->n_embd <= 0 || resource->n_embd > GGML_MOE_FFN_MAX_EMBD ||
-        resource->n_ff <= 0 || resource->n_ff > GGML_MOE_FFN_MAX_FF ||
-        resource->n_experts_used <= 0 || resource->n_experts_used > GGML_MOE_FFN_MAX_SELECTED ||
-        resource->n_threads <= 0 ||
-        resource->n_embd % QK8_1 != 0 || resource->n_ff % QK8_1 != 0) return -1;
+        resource->n_threads <= 0 || !resource->signatures || resource->n_signatures == 0) return -1;
+    ggml_cuda_moe_ffn_workspace_sizes sizes{};
+    if (!ggml_cuda_moe_ffn_get_workspace_sizes(resource->n_embd, resource->n_ff,
+                resource->n_experts_used, sizes)) return -1;
+    for (size_t i = 0; i < resource->n_signatures; ++i) {
+        const auto & signature = resource->signatures[i];
+        ggml_cuda_moe_ffn_workspace_sizes signature_sizes{};
+        if (signature.n_embd <= 0 || signature.n_ff <= 0 || signature.n_experts_used <= 0 ||
+                signature.n_embd > resource->n_embd || signature.n_ff > resource->n_ff ||
+                signature.n_experts_used > resource->n_experts_used ||
+                !ggml_cuda_moe_ffn_get_workspace_sizes(signature.n_embd, signature.n_ff,
+                    signature.n_experts_used, signature_sizes)) return -1;
+        for (size_t j = 0; j < i; ++j) {
+            if (resource->signatures[j].n_embd == signature.n_embd &&
+                    resource->signatures[j].n_ff == signature.n_ff &&
+                    resource->signatures[j].n_experts_used == signature.n_experts_used) return -1;
+        }
+    }
     auto * ctx = (ggml_backend_cuda_context *) backend->context;
     {
         std::lock_guard<std::mutex> lock(ctx->moe_ffn_mutex);
         if (!ctx->moe_ffn_cpu_resources.empty()) return -1;
     }
 
-    auto state = std::make_shared<ggml_cuda_moe_ffn_cpu_resource_state>();
+    std::shared_ptr<ggml_cuda_moe_ffn_cpu_resource_state> state;
+    try {
+        state = std::make_shared<ggml_cuda_moe_ffn_cpu_resource_state>();
+        state->signatures.assign(resource->signatures, resource->signatures + resource->n_signatures);
+        state->resolved_pins.resize((size_t) resource->n_experts_used);
+        state->pending_pins.pins.reserve((size_t) resource->n_experts_used);
+        state->fill_candidates.reserve((size_t) resource->n_experts_used);
+    } catch (...) {
+        return -1;
+    }
     state->device = ctx->device;
     state->cuda_context = ctx;
-    const size_t ids_bytes = size_t(resource->n_experts_used) * sizeof(int32_t);
-    const size_t activation_bytes = size_t(resource->n_embd) * sizeof(float);
-    const size_t route_bytes = size_t(resource->n_experts_used) * sizeof(float);
-    const size_t output_bytes = size_t(resource->n_embd) * sizeof(float);
-    const size_t host_bytes = 3 * ids_bytes + activation_bytes + 2 * route_bytes + output_bytes;
+    const size_t ids_bytes = sizes.ids;
+    const size_t activation_bytes = sizes.activation;
+    const size_t route_bytes = sizes.route;
+    const size_t output_bytes = sizes.output;
+    const size_t host_bytes = sizes.host_stage;
     ggml_cuda_set_device(ctx->device);
     if (cudaHostAlloc(&state->host_stage, host_bytes, cudaHostAllocPortable) != cudaSuccess) return -1;
     auto * host = (uint8_t *) state->host_stage;
@@ -6656,13 +6868,13 @@ GGML_CALL int32_t ggml_backend_cuda_moe_ffn_cpu_resource_register(ggml_backend_t
     state->host_routes = (float *) (host + 3 * ids_bytes + activation_bytes);
     state->host_hit_routes = (float *) (host + 3 * ids_bytes + activation_bytes + route_bytes);
     state->host_output = (float *) (host + 3 * ids_bytes + activation_bytes + 2 * route_bytes);
-    state->up_q8_bytes = size_t(GGML_PAD(resource->n_embd, MATRIX_ROW_PADDING)) * sizeof(block_q8_1) / QK8_1;
-    state->down_q8_bytes = size_t(GGML_PAD(resource->n_ff, MATRIX_ROW_PADDING)) * sizeof(block_q8_1) / QK8_1 * resource->n_experts_used;
-    const size_t hidden_bytes = size_t(resource->n_ff) * resource->n_experts_used * sizeof(float);
-    const size_t down_bytes = size_t(resource->n_embd) * (resource->n_experts_used + 1) * sizeof(float);
+    state->up_q8_bytes = sizes.up_q8;
+    state->down_q8_bytes = sizes.down_q8;
+    const size_t hidden_bytes = sizes.hidden;
+    const size_t down_bytes = sizes.down;
     auto alloc_device = [](void ** ptr, size_t bytes) { return cudaMalloc(ptr, bytes) == cudaSuccess; };
     if (!alloc_device((void **) &state->device_slots, ids_bytes) ||
-        !alloc_device((void **) &state->device_routes, (resource->n_experts_used + 1) * sizeof(float)) ||
+        !alloc_device((void **) &state->device_routes, sizes.device_routes) ||
         !alloc_device(&state->device_up_q8, state->up_q8_bytes) ||
         !alloc_device(&state->device_down_q8, state->down_q8_bytes) ||
         !alloc_device((void **) &state->device_hidden, hidden_bytes) ||
@@ -6678,6 +6890,7 @@ GGML_CALL int32_t ggml_backend_cuda_moe_ffn_cpu_resource_register(ggml_backend_t
 
     ggml_backend_cpu_set_n_threads(resource->cpu_backend, resource->n_threads);
     state->resource = *resource; // Ownership transfers only after successful warm allocation.
+    state->resource.signatures = state->signatures.data();
     int32_t resource_id = -1;
     {
         std::lock_guard<std::mutex> lock(ctx->moe_ffn_mutex);
