@@ -10076,8 +10076,9 @@ static struct llama_context * llama_init_from_model_internal(
             }
 
             if (prototype_config) {
-                if (!ctx->moe_cache || prototype_config->layer < 0 ||
-                        (size_t) prototype_config->layer >= model->layers.size()) {
+                if (!ctx->moe_cache || (!prototype_config->all_devices &&
+                        (prototype_config->layer < 0 ||
+                         (size_t) prototype_config->layer >= model->layers.size()))) {
                     LLAMA_LOG_ERROR("%s: MoE FFN prototype requires a valid cache-group anchor layer\n", __func__);
                     llama_free(ctx);
                     return nullptr;

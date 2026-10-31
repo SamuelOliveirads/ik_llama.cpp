@@ -538,8 +538,6 @@ bool create_context(llama_model * model, bool prototype, size_t cache_bytes, con
         return *out != nullptr;
     }
     llama_moe_ffn_prototype_config config;
-    config.layer = 0;
-    config.device = 0;
     config.cpu_threads = dual_device ? 12 : 24;
     config.all_devices = true;
     config.test_poison_cpu_priming_inputs = poison_priming_inputs;
