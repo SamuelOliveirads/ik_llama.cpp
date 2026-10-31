@@ -94,8 +94,11 @@ static inline bool ggml_moe_ffn_bank_layout_matches(const struct ggml_tensor * h
 
 static inline bool ggml_moe_ffn_types_supported(enum ggml_type up, enum ggml_type gate,
         enum ggml_type down) {
-    return up == GGML_TYPE_IQ3_S && gate == GGML_TYPE_IQ3_S &&
-        (down == GGML_TYPE_IQ4_NL || down == GGML_TYPE_IQ4_XS);
+    return (up == GGML_TYPE_IQ3_S && gate == GGML_TYPE_IQ3_S &&
+                (down == GGML_TYPE_IQ4_NL || down == GGML_TYPE_IQ4_XS || down == GGML_TYPE_MXFP4)) ||
+        (up == GGML_TYPE_IQ2_XS && gate == GGML_TYPE_IQ2_XS && down == GGML_TYPE_IQ3_XXS) ||
+        (up == GGML_TYPE_IQ3_XXS && gate == GGML_TYPE_IQ3_XXS &&
+                (down == GGML_TYPE_IQ3_XXS || down == GGML_TYPE_MXFP4));
 }
 
 static inline bool ggml_moe_ffn_layout_supported(const struct ggml_moe_ffn_layout * l) {

@@ -28,7 +28,7 @@ namespace {
 constexpr size_t CACHE_BYTES = 8ull * 1024 * 1024 * 1024;
 int N_SELECTED = 10;
 constexpr int N_SCORED = 32;
-constexpr int N_PROMPT = 16;
+int N_PROMPT = 16;
 float EXPECTED_ROUTE_SCALE = 0.0f;
 bool EXPECTED_ROUTE_NORMALIZED = false;
 
@@ -263,7 +263,7 @@ bool logits_finite(llama_context * ctx, llama_model * model, std::vector<float> 
 }
 
 bool evaluate_sequence(llama_context * ctx, llama_model * model, const std::vector<llama_token> & tokens,
-        run_result & result, llama_moe_ffn_prototype_state * proto) {
+        run_result & result, llama_moe_ffn_prototype_state * proto, bool dsv4_trunk_profile = false) {
     if (tokens.size() < N_PROMPT + N_SCORED + 1) return false;
     std::vector<llama_token> prompt(tokens.begin(), tokens.begin() + N_PROMPT);
     llama_batch prompt_batch = llama_batch_get_one(prompt.data(), (int32_t) prompt.size(), 0, 0);
@@ -273,14 +273,27 @@ bool evaluate_sequence(llama_context * ctx, llama_model * model, const std::vect
                 prompt_batch.n_tokens, prompt_status);
         return false;
     }
+    if (dsv4_trunk_profile && proto) {
+        ggml_cuda_moe_ffn_stats prompt_stats{};
+        const bool prompt_ordinary = proto->collect_stats(prompt_stats) &&
+                prompt_stats.all_hit_calls == 0 && prompt_stats.any_miss_calls == 0 &&
+                prompt_stats.output_commits == 0;
+        std::printf("dsv4_prompt_ordinary tokens=%d semantic_ops=%llu output_commits=%llu valid=%d\n",
+                prompt_batch.n_tokens,
+                (unsigned long long)(prompt_stats.all_hit_calls + prompt_stats.any_miss_calls),
+                (unsigned long long)prompt_stats.output_commits, prompt_ordinary);
+        if (!prompt_ordinary) return false;
+    }
     ggml_cuda_moe_ffn_stats prev_s{};
     ggml_cuda_moe_ffn_cpu_resource_stats prev_r{};
     bool first_window = true;
     for (int32_t i = 0; i < N_SCORED; ++i) {
         llama_token token = tokens[N_PROMPT + i];
         llama_batch next = llama_batch_get_one(&token, 1, N_PROMPT + i, 0);
-        if (i == 0 && !node_count_and_contract(*ctx, next,
-                    proto ? (int) proto->layer_count() : 0, proto, proto != nullptr)) return false;
+        if (i == 0 && proto && !dsv4_trunk_profile &&
+                !node_count_and_contract(*ctx, next, (int) proto->layer_count(), proto, true)) return false;
+        ggml_cuda_moe_ffn_stats before_first_decode{};
+        if (i == 0 && proto && dsv4_trunk_profile && !proto->collect_stats(before_first_decode)) return false;
         std::vector<std::pair<int32_t, ggml_cuda_moe_ffn_stats>> before_device_stats;
         if (proto) {
             for (const auto & device : proto->devices) {
@@ -292,6 +305,17 @@ bool evaluate_sequence(llama_context * ctx, llama_model * model, const std::vect
             }
         }
         if (llama_decode(ctx, next) != 0) return false;
+        if (i == 0 && proto && dsv4_trunk_profile) {
+            ggml_cuda_moe_ffn_stats after_first_decode{};
+            const bool got = proto->collect_stats(after_first_decode);
+            const uint64_t calls = after_first_decode.all_hit_calls + after_first_decode.any_miss_calls -
+                    before_first_decode.all_hit_calls - before_first_decode.any_miss_calls;
+            const uint64_t commits = after_first_decode.output_commits - before_first_decode.output_commits;
+            std::printf("dsv4_first_token_executed_semantic_nodes calls=%llu commits=%llu expected=%zu valid=%d\n",
+                    (unsigned long long)calls, (unsigned long long)commits, proto->layer_count(),
+                    got && calls == proto->layer_count() && commits == proto->layer_count());
+            if (!got || calls != proto->layer_count() || commits != proto->layer_count()) return false;
+        }
         for (const auto & before : before_device_stats) {
             ggml_cuda_moe_ffn_stats after{};
             for (const auto & device : proto->devices) {
@@ -436,6 +460,44 @@ bool glm_trunk_inventory_contract(const llama_model & model, const llama_moe_ffn
             model.hparams.nextn_predict_layers, trunk_boundary, model.layers.size(),
             routed_trunk_layers, routed_layers, inventoried_bindings, unsupported_types,
             trunk_boundary, mtp_triplet_loaded ? 1 : 0, mtp_binding_registered ? 1 : 0, valid ? 1 : 0);
+    return valid;
+}
+
+bool dsv4_trunk_inventory_contract(const llama_model & model, const llama_moe_ffn_prototype_state & proto,
+        size_t expected_bindings) {
+    size_t routed = 0, unsupported = 0;
+    const size_t accepted = print_layout_inventory(model, proto, routed, unsupported);
+    std::array<size_t, 4> tuples{};
+    bool semantics_ok = true;
+    for (size_t il = 0; il < model.layers.size(); ++il) {
+        const auto & layer = model.layers[il];
+        if (!layer.ffn_up_exps && !layer.ffn_gate_exps && !layer.ffn_down_exps) continue;
+        if (!layer.ffn_up_exps || !layer.ffn_gate_exps || !layer.ffn_down_exps) {
+            semantics_ok = false;
+            continue;
+        }
+        const ggml_type up = layer.ffn_up_exps->type, gate = layer.ffn_gate_exps->type, down = layer.ffn_down_exps->type;
+        if (up == GGML_TYPE_IQ2_XS && gate == GGML_TYPE_IQ2_XS && down == GGML_TYPE_IQ3_XXS) ++tuples[0];
+        else if (up == GGML_TYPE_IQ3_XXS && gate == GGML_TYPE_IQ3_XXS && down == GGML_TYPE_IQ3_XXS) ++tuples[1];
+        else if (up == GGML_TYPE_IQ3_S && gate == GGML_TYPE_IQ3_S && down == GGML_TYPE_MXFP4) ++tuples[2];
+        else if (up == GGML_TYPE_IQ3_XXS && gate == GGML_TYPE_IQ3_XXS && down == GGML_TYPE_MXFP4) ++tuples[3];
+        else semantics_ok = false;
+        semantics_ok = semantics_ok && model.swiglu_limit((int32_t)il, false) == 10.0f &&
+                !model.hadamard_rotation(layer.ffn_up_exps) && !model.hadamard_rotation(layer.ffn_gate_exps) &&
+                !model.hadamard_rotation(layer.ffn_down_exps) && !layer.ffn_up_exps_b && !layer.ffn_gate_exps_b &&
+                !layer.ffn_down_exps_b && !layer.ffn_up_exps_b_dup && !layer.ffn_gate_exps_b_dup &&
+                !layer.ffn_down_exps_b_dup && !layer.ffn_up_gate_exps && !layer.ffn_up_gate_exps_b &&
+                !layer.ffn_down_exps_s;
+    }
+    const bool valid = expected_bindings == 43 && routed == expected_bindings && accepted == expected_bindings &&
+            unsupported == 0 && semantics_ok && tuples == std::array<size_t, 4>{25, 16, 1, 1} &&
+            model.hparams.n_expert == 256 && model.hparams.n_expert_used == 6 && model.hparams.n_embd == 4096 &&
+            model.hparams.expert_gating_func == LLM_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS &&
+            model.hparams.expert_weights_norm && model.hparams.expert_weights_scale == 1.5f;
+    std::printf("dsv4_trunk_inventory routed=%zu accepted=%zu unsupported=%zu tuple_counts=%zu/%zu/%zu/%zu "
+            "selected=%d normalized=%d scale=%.9g valid=%d\n", routed, accepted, unsupported,
+            tuples[0], tuples[1], tuples[2], tuples[3], model.hparams.n_expert_used,
+            model.hparams.expert_weights_norm, model.hparams.expert_weights_scale, valid ? 1 : 0);
     return valid;
 }
 
@@ -660,7 +722,8 @@ bool run_ordinary(llama_model * model, const std::vector<llama_token> & tokens, 
 }
 
 bool run_hybrid(llama_model * model, const std::vector<llama_token> & tokens, const char * label, run_result & result,
-        bool dual_device = false, size_t expected_bindings = 0, bool glm_trunk_profile = false) {
+        bool dual_device = false, size_t expected_bindings = 0, bool glm_trunk_profile = false,
+        bool dsv4_trunk_profile = false) {
     llama_moe_ffn_prototype_lifecycle lifecycle; llama_context * ctx = nullptr;
     if (!create_context(model, true, CACHE_BYTES, {}, lifecycle, &ctx, dual_device)) return false;
     auto & proto = *ctx->moe_ffn_prototype;
@@ -668,8 +731,9 @@ bool run_hybrid(llama_model * model, const std::vector<llama_token> & tokens, co
     const size_t n_groups = std::accumulate(proto.devices.begin(), proto.devices.end(), size_t(0),
             [](size_t n, const auto & d) { return n + d.groups.size(); });
     const bool inventory_contract = expected_bindings == 0 || n_eligible == expected_bindings;
-    const bool profile_contract = !glm_trunk_profile ||
-            glm_trunk_inventory_contract(*model, proto, expected_bindings);
+    const bool profile_contract = (!glm_trunk_profile ||
+            glm_trunk_inventory_contract(*model, proto, expected_bindings)) &&
+            (!dsv4_trunk_profile || dsv4_trunk_inventory_contract(*model, proto, expected_bindings));
     if (!proto.valid() || !inspect_frozen_group(*ctx, proto) || n_eligible == 0 ||
             !inventory_contract || !profile_contract ||
             proto.devices.size() != (dual_device ? 2u : 1u) ||
@@ -678,8 +742,13 @@ bool run_hybrid(llama_model * model, const std::vector<llama_token> & tokens, co
         llama_free(ctx); return false;
     }
     std::vector<llama_token> prompt(tokens.begin(), tokens.begin() + N_PROMPT);
-    bool ok = node_count_and_contract(*ctx, llama_batch_get_one(prompt.data(), N_PROMPT, 0, 0), 0, &proto, false) &&
-            evaluate_sequence(ctx, model, tokens, result, &proto);
+    // The DSV4 builder keeps per-context planning state that is advanced by
+    // decode. Avoid probing an unexecuted prompt graph ahead of the real
+    // prompt decode; the operation counters below still prove that prompt
+    // work stays on the ordinary path.
+    const bool prompt_contract = dsv4_trunk_profile ||
+            node_count_and_contract(*ctx, llama_batch_get_one(prompt.data(), N_PROMPT, 0, 0), 0, &proto, false);
+    bool ok = prompt_contract && evaluate_sequence(ctx, model, tokens, result, &proto, dsv4_trunk_profile);
     ok = ok && proto.valid() && inspect_frozen_group(*ctx, proto);
     for (const auto & device : proto.devices)
         ok = ok && ggml_backend_cuda_moe_ffn_cpu_resource_stop(device.cuda_backend, device.cpu_resource_id);
@@ -752,7 +821,7 @@ int main(int argc, char ** argv) {
     if (argc < 5 || std::strcmp(argv[1], "--devices") != 0 ||
             (std::strcmp(argv[2], "1") != 0 && std::strcmp(argv[2], "2") != 0) ||
             std::strcmp(argv[3], "--output-prefix") != 0) {
-        std::fprintf(stderr, "usage: %s --devices 1|2 --output-prefix PATH [--model MODEL] [--expected-bindings N] [--expected-route-normalized 0|1] [--expected-route-scale FLOAT] [--inventory-profile glm-trunk] [--init-only|--graph-contract-only|--hybrid-only]\n", argv[0]);
+    std::fprintf(stderr, "usage: %s --devices 1|2 --output-prefix PATH [--model MODEL] [--expected-bindings N] [--prompt-tokens N] [--expected-route-normalized 0|1] [--expected-route-scale FLOAT] [--inventory-profile glm-trunk|dsv4-trunk] [--init-only|--graph-contract-only|--hybrid-only|--inventory-only]\n", argv[0]);
         return 2;
     }
     const bool dual_device = std::strcmp(argv[2], "2") == 0;
@@ -763,6 +832,8 @@ int main(int argc, char ** argv) {
     bool graph_contract_only = false;
     bool hybrid_only = false;
     bool glm_trunk_profile = false;
+    bool dsv4_trunk_profile = false;
+    bool inventory_only = false;
     int route_normalized_override = -1;
     float route_scale_override = NAN;
     bool route_scale_overridden = false;
@@ -770,22 +841,26 @@ int main(int argc, char ** argv) {
         const std::string option = argv[i];
         if (option == "--init-only") {
             init_only = true;
+        } else if (option == "--inventory-only") {
+            inventory_only = true;
         } else if (option == "--graph-contract-only") {
             graph_contract_only = true;
         } else if (option == "--hybrid-only") {
             hybrid_only = true;
         } else if (option == "--inventory-profile" && i + 1 < argc) {
             const std::string profile = argv[++i];
-            if (profile != "glm-trunk") {
+            if (profile != "glm-trunk" && profile != "dsv4-trunk") {
                 std::fprintf(stderr, "unsupported inventory profile: %s\n", profile.c_str());
                 return 2;
             }
-            glm_trunk_profile = true;
-        } else if ((option == "--model" || option == "--expected-bindings" ||
+            glm_trunk_profile = profile == "glm-trunk";
+            dsv4_trunk_profile = profile == "dsv4-trunk";
+        } else if ((option == "--model" || option == "--expected-bindings" || option == "--prompt-tokens" ||
                     option == "--expected-route-normalized" || option == "--expected-route-scale") && i + 1 < argc) {
             const std::string value = argv[++i];
             if (option == "--model") model_path = value;
             else if (option == "--expected-bindings") expected_bindings = std::stoul(value);
+            else if (option == "--prompt-tokens") N_PROMPT = std::stoi(value);
             else if (option == "--expected-route-normalized") route_normalized_override = std::stoi(value);
             else { route_scale_override = std::stof(value); route_scale_overridden = true; }
         } else {
@@ -793,8 +868,8 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
-    if (glm_trunk_profile && expected_bindings == 0) {
-        std::fprintf(stderr, "--inventory-profile glm-trunk requires --expected-bindings\n");
+    if ((glm_trunk_profile || dsv4_trunk_profile) && expected_bindings == 0) {
+        std::fprintf(stderr, "--inventory-profile requires --expected-bindings\n");
         return 2;
     }
     llama_backend_init();
@@ -836,6 +911,80 @@ int main(int argc, char ** argv) {
             llama_free_model(model); llama_backend_free(); return 1;
         }
     }
+    if (inventory_only) {
+        llama_context_params params = context_params(CACHE_BYTES);
+        llama_context * ctx = llama_init_from_model(model, params);
+        if (!ctx || !ctx->moe_cache) {
+            std::fprintf(stderr, "inventory_context_init_failed\n");
+            if (ctx) llama_free(ctx);
+            llama_free_model(model); llama_backend_free(); return 1;
+        }
+        auto print_tensor = [](const char * name, const ggml_tensor * t) {
+            if (!t) { std::printf(" %s=none", name); return; }
+            std::printf(" %s=%s:%lldx%lldx%lldx%lld@%zu,%zu,%zu,%zu", name,
+                    ggml_type_name(t->type), (long long)t->ne[0], (long long)t->ne[1],
+                    (long long)t->ne[2], (long long)t->ne[3], t->nb[0], t->nb[1], t->nb[2], t->nb[3]);
+        };
+        std::unordered_set<int32_t> reported_groups;
+        size_t routed = 0;
+        for (size_t il = 0; il < model->layers.size(); ++il) {
+            const auto & layer = model->layers[il];
+            if (!layer.ffn_up_exps && !layer.ffn_gate_exps && !layer.ffn_down_exps) continue;
+            ++routed;
+            const int owner = il < model->default_layer_device.size() ? model->default_layer_device[il] : -1;
+            std::printf("loaded_routed_layer layer=%zu owner=%d clamp=%.9g hadamard=%d", il, owner,
+                    model->swiglu_limit((int32_t)il, false),
+                    (layer.ffn_up_exps && model->hadamard_rotation(layer.ffn_up_exps)) ||
+                    (layer.ffn_gate_exps && model->hadamard_rotation(layer.ffn_gate_exps)) ||
+                    (layer.ffn_down_exps && model->hadamard_rotation(layer.ffn_down_exps)));
+            print_tensor("up", layer.ffn_up_exps); print_tensor("gate", layer.ffn_gate_exps);
+            print_tensor("down", layer.ffn_down_exps); print_tensor("merged_up_gate", layer.ffn_up_gate_exps);
+            print_tensor("gate_inp", layer.ffn_gate_inp); print_tensor("gate_inp_bias", layer.ffn_gate_inp_b);
+            print_tensor("gate_inp_scale", layer.ffn_gate_inp_s);
+            print_tensor("expert_prob_bias", layer.ffn_exp_probs_b);
+            print_tensor("expert_prob_bias_vl", layer.ffn_exp_probs_b_vl);
+            print_tensor("gate_tid2eid", layer.ffn_gate_tid2eid); print_tensor("activation", layer.ffn_act);
+            print_tensor("up_bias", layer.ffn_up_exps_b); print_tensor("gate_bias", layer.ffn_gate_exps_b);
+            print_tensor("up_bias_dup", layer.ffn_up_exps_b_dup);
+            print_tensor("gate_bias_dup", layer.ffn_gate_exps_b_dup);
+            print_tensor("down_bias_dup", layer.ffn_down_exps_b_dup);
+            print_tensor("down_bias", layer.ffn_down_exps_b); print_tensor("merged_bias", layer.ffn_up_gate_exps_b);
+            print_tensor("down_scale", layer.ffn_down_exps_s); print_tensor("shared_gate_inp", layer.ffn_gate_inp_shexp);
+            print_tensor("shared_up", layer.ffn_up_shexp); print_tensor("shared_gate", layer.ffn_gate_shexp);
+            print_tensor("shared_down", layer.ffn_down_shexp); std::printf("\n");
+            if (!reported_groups.contains((int32_t)il)) {
+                llama_moe_cache::frozen_lease lease;
+                ggml_backend * backend = ctx->moe_cache->backend((int32_t)il);
+                if (backend && ctx->moe_cache->freeze_group_for_layer((int32_t)il, backend, {}, lease)) {
+                    const auto snap = lease.snapshot();
+                    std::printf("loaded_cache_group layer=%zu group=%d device=%d slots=%d owner=%p members=", il,
+                            snap.group, snap.device_group, snap.n_slots, (void *)snap.owner_backend);
+                    for (int32_t member : snap.group_layers) {
+                        std::printf("%s%d", reported_groups.contains(member) ? ",seen:" : ",", member);
+                        reported_groups.insert(member);
+                        llama_moe_cache_frozen_layer member_snapshot;
+                        if (ctx->moe_cache->frozen_layer_snapshot(snap, member, member_snapshot)) {
+                            std::printf("\nloaded_cache_layer_layout layer=%d device=%d group=%d", member,
+                                    member_snapshot.device_group, member_snapshot.group);
+                            print_tensor("bank_up", member_snapshot.cached_up);
+                            print_tensor("bank_gate", member_snapshot.cached_gate);
+                            print_tensor("bank_down", member_snapshot.cached_down);
+                        }
+                    }
+                    std::printf("\n");
+                    if (!lease.release()) {
+                        std::fprintf(stderr, "inventory_group_release_failed layer=%zu\n", il);
+                        llama_free(ctx); llama_free_model(model); llama_backend_free(); return 1;
+                    }
+                }
+            }
+        }
+        std::printf("loaded_routed_summary layers=%zu declared=%zu experts=%u selected=%d embd=%u gating=%d normalized=%d scale=%.9g visible_devices=%zu mode=%d\n",
+                routed, model->layers.size(), model->hparams.n_expert, model->hparams.n_expert_used,
+                model->hparams.n_embd, model->hparams.expert_gating_func, model->hparams.expert_weights_norm,
+                model->hparams.expert_weights_scale, model->devices.size(), (int)model->split_mode);
+        llama_free(ctx); llama_free_model(model); llama_backend_free(); return 0;
+    }
     if (init_only) {
         llama_moe_ffn_prototype_lifecycle lifecycle;
         llama_context * ctx = nullptr;
@@ -846,7 +995,8 @@ int main(int argc, char ** argv) {
             ok = proto.valid() && proto.layer_count() > 0 && proto.devices.size() == 1 &&
                     proto.devices[0].device == 0 &&
                     (!expected_bindings || proto.layer_count() == expected_bindings) &&
-                    (!glm_trunk_profile || glm_trunk_inventory_contract(*model, proto, expected_bindings));
+                    (!glm_trunk_profile || glm_trunk_inventory_contract(*model, proto, expected_bindings)) &&
+                    (!dsv4_trunk_profile || dsv4_trunk_inventory_contract(*model, proto, expected_bindings));
             for (const auto & device : proto.devices) for (const auto & layer : device.layer_bindings) {
                 const float * activations = static_cast<const float *>(layer.cpu_activations->data);
                 const int32_t * ids = static_cast<const int32_t *>(layer.cpu_ids->data);
@@ -870,16 +1020,26 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return ok && clean ? 0 : 1;
     }
-    int32_t n_tokens = llama_tokenize(model, CORPUS, (int32_t) std::strlen(CORPUS), nullptr, 0, true, false);
+    if (N_PROMPT < 2 || N_PROMPT > 128) {
+        std::fprintf(stderr, "--prompt-tokens must be in [2,128]\n");
+        llama_free_model(model); llama_backend_free(); return 2;
+    }
+    std::string corpus_text = CORPUS;
+    int32_t n_tokens = llama_tokenize(model, corpus_text.data(), (int32_t) corpus_text.size(), nullptr, 0, true, false);
+    while (n_tokens >= 0 || (size_t)(-n_tokens) < (size_t)(N_PROMPT + N_SCORED + 1)) {
+        corpus_text += "\n";
+        corpus_text += CORPUS;
+        n_tokens = llama_tokenize(model, corpus_text.data(), (int32_t) corpus_text.size(), nullptr, 0, true, false);
+    }
     if (n_tokens >= 0) { llama_free_model(model); llama_backend_free(); return 1; }
     std::vector<llama_token> tokens((size_t) -n_tokens);
-    n_tokens = llama_tokenize(model, CORPUS, (int32_t) std::strlen(CORPUS), tokens.data(), (int32_t) tokens.size(), true, false);
+    n_tokens = llama_tokenize(model, corpus_text.data(), (int32_t) corpus_text.size(), tokens.data(), (int32_t) tokens.size(), true, false);
     if (n_tokens < N_PROMPT + N_SCORED + 1) {
         std::fprintf(stderr, "tokenized corpus too short: %d\n", n_tokens);
         llama_free_model(model); llama_backend_free(); return 1;
     }
     tokens.resize(N_PROMPT + N_SCORED + 1);
-    { std::ofstream corpus(prefix + ".corpus.txt", std::ios::binary); corpus.write(CORPUS, std::strlen(CORPUS)); }
+    { std::ofstream corpus(prefix + ".corpus.txt", std::ios::binary); corpus.write(corpus_text.data(), corpus_text.size()); }
     { std::ofstream ids(prefix + ".token-ids.txt"); for (size_t i = 0; i < tokens.size(); ++i) ids << i << ',' << tokens[i] << '\n'; }
     std::printf("corpus token_count=%zu scored_positions=%d prompt_tokens=%d devices=%d token_ids_file=%s.token-ids.txt\n",
             tokens.size(), N_SCORED, N_PROMPT, dual_device ? 2 : 1, prefix.c_str());
@@ -892,7 +1052,8 @@ int main(int argc, char ** argv) {
             const size_t expected_nodes = expected_bindings ? expected_bindings : proto.layer_count();
             ok = proto.valid() && proto.layer_count() > 0 &&
                     (!expected_bindings || proto.layer_count() == expected_bindings) &&
-                    (!glm_trunk_profile || glm_trunk_inventory_contract(*model, proto, expected_bindings));
+                    (!glm_trunk_profile || glm_trunk_inventory_contract(*model, proto, expected_bindings)) &&
+                    (!dsv4_trunk_profile || dsv4_trunk_inventory_contract(*model, proto, expected_bindings));
             std::vector<llama_token> prompt(tokens.begin(), tokens.begin() + N_PROMPT);
             const int32_t prompt_status = ok ?
                     llama_decode(ctx, llama_batch_get_one(prompt.data(), N_PROMPT, 0, 0)) : -1;
@@ -939,7 +1100,8 @@ int main(int argc, char ** argv) {
         const std::string label = "HYBRID" + std::to_string(i + 1);
         const std::string run_prefix = prefix + ".hybrid-0" + std::to_string(i + 1);
         pair_summary p;
-        ok = run_hybrid(model, tokens, label.c_str(), hybrids[i], dual_device, expected_bindings, glm_trunk_profile) &&
+        ok = run_hybrid(model, tokens, label.c_str(), hybrids[i], dual_device, expected_bindings,
+                glm_trunk_profile, dsv4_trunk_profile) &&
                 write_run_artifacts(run_prefix, hybrids[i]) && summarize_arm(hybrids[i], hybrid_summary[i]);
         if (ok && !hybrid_only) ok = compare_pair(blocking, hybrids[i], p);
         if (!ok) break;

@@ -417,6 +417,37 @@ bool layout_parameterization_check(const ggml_moe_ffn_layout & base) {
     layout.down = q8_down;
     const bool unlisted_down_type_rejected = q8_down && !ggml_moe_ffn_layout_supported(&layout);
 
+    const std::array<std::array<ggml_type, 3>, 4> dsv4_tuples = {{
+        {{ GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS }},
+        {{ GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_XXS }},
+        {{ GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_S, GGML_TYPE_MXFP4 }},
+        {{ GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_XXS, GGML_TYPE_MXFP4 }},
+    }};
+    bool dsv4_tuple_layouts_supported = true;
+    for (const auto & types : dsv4_tuples) {
+        auto * up = ggml_new_tensor_3d(ctx, types[0], base.n_embd, base.n_ff, base.n_experts);
+        auto * gate = ggml_new_tensor_3d(ctx, types[1], base.n_embd, base.n_ff, base.n_experts);
+        auto * down = ggml_new_tensor_3d(ctx, types[2], base.n_ff, base.n_embd, base.n_experts);
+        auto * bank_up = ggml_new_tensor_3d(ctx, types[0], base.n_embd, base.n_ff, base.n_slots);
+        auto * bank_gate = ggml_new_tensor_3d(ctx, types[1], base.n_embd, base.n_ff, base.n_slots);
+        auto * bank_down = ggml_new_tensor_3d(ctx, types[2], base.n_ff, base.n_embd, base.n_slots);
+        ggml_moe_ffn_layout tuple_layout = base;
+        tuple_layout.up = up; tuple_layout.gate = gate; tuple_layout.down = down;
+        tuple_layout.bank_up = bank_up; tuple_layout.bank_gate = bank_gate; tuple_layout.bank_down = bank_down;
+        dsv4_tuple_layouts_supported = dsv4_tuple_layouts_supported && up && gate && down &&
+                bank_up && bank_gate && bank_down && ggml_moe_ffn_layout_supported(&tuple_layout);
+    }
+    auto * mixed_up = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ2_XS, base.n_embd, base.n_ff, base.n_experts);
+    auto * mixed_gate = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ3_XXS, base.n_embd, base.n_ff, base.n_experts);
+    auto * mixed_down = ggml_new_tensor_3d(ctx, GGML_TYPE_MXFP4, base.n_ff, base.n_embd, base.n_experts);
+    auto * mixed_bank_up = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ2_XS, base.n_embd, base.n_ff, base.n_slots);
+    auto * mixed_bank_gate = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ3_XXS, base.n_embd, base.n_ff, base.n_slots);
+    auto * mixed_bank_down = ggml_new_tensor_3d(ctx, GGML_TYPE_MXFP4, base.n_ff, base.n_embd, base.n_slots);
+    ggml_moe_ffn_layout mixed_tuple = base;
+    mixed_tuple.up = mixed_up; mixed_tuple.gate = mixed_gate; mixed_tuple.down = mixed_down;
+    mixed_tuple.bank_up = mixed_bank_up; mixed_tuple.bank_gate = mixed_bank_gate; mixed_tuple.bank_down = mixed_bank_down;
+    const bool unsupported_dsv4_tuple_rejected = !ggml_moe_ffn_layout_supported(&mixed_tuple);
+
     auto * bad_host_slice = ggml_view_3d(ctx, const_cast<ggml_tensor *>(base.up),
             base.up->ne[0], base.up->ne[1], base.up->ne[2],
             base.up->nb[1], base.up->nb[2] + ggml_type_size(base.up->type), 0);
@@ -452,7 +483,7 @@ bool layout_parameterization_check(const ggml_moe_ffn_layout & base) {
     return supported && router_bias_upstream_accepted && expert_bias_rejected && expert_scale_rejected &&
         finite_clamp_supported && negative_clamp_rejected &&
         infinite_clamp_rejected && nan_clamp_rejected && final_route_contract_required && iq4_xs_down_supported &&
-        unlisted_down_type_rejected && padded_expert_slice_rejected &&
+        unlisted_down_type_rejected && dsv4_tuple_layouts_supported && unsupported_dsv4_tuple_rejected && padded_expert_slice_rejected &&
         padded_bank_row_rejected && excessive_selection_rejected;
 }
 

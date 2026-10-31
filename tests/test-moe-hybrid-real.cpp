@@ -286,7 +286,7 @@ std::vector<float> route_weights(int variant) {
     return values;
 }
 
-bool valid_candidate(const llama_model & model, const llama_layer & layer) {
+bool valid_candidate(const llama_model & model, const llama_layer & layer, const std::string & tuple_filter) {
     const ggml_tensor * up = layer.ffn_up_exps;
     const ggml_tensor * gate = layer.ffn_gate_exps;
     const ggml_tensor * down = layer.ffn_down_exps;
@@ -300,7 +300,11 @@ bool valid_candidate(const llama_model & model, const llama_layer & layer) {
         if (t->nb[2] != ggml_nbytes(t) / t->ne[2]) return false;
         if (model.hadamard_rotation(t)) return false;
     }
-    return !layer.ffn_up_exps_b && !layer.ffn_gate_exps_b && !layer.ffn_down_exps_b && !layer.ffn_down_exps_s;
+    const std::string tuple = std::string(ggml_type_name(up->type)) + "/" + ggml_type_name(gate->type) + "/" + ggml_type_name(down->type);
+    return (!tuple_filter.empty() ? tuple == tuple_filter : true) &&
+            !layer.ffn_up_exps_b && !layer.ffn_gate_exps_b && !layer.ffn_down_exps_b &&
+            !layer.ffn_up_exps_b_dup && !layer.ffn_gate_exps_b_dup && !layer.ffn_down_exps_b_dup &&
+            !layer.ffn_down_exps_s;
 }
 
 struct timing_samples {
@@ -691,7 +695,7 @@ bool run_seed_fill_isolation(real_fixture & f, int32_t layer_a, int32_t n_expert
 
     int32_t layer_b = -1;
     for (const int32_t candidate : seeded_a.group_layers) {
-        if (candidate != layer_a && valid_candidate(*f.model, f.model->layers[candidate])) {
+        if (candidate != layer_a && valid_candidate(*f.model, f.model->layers[candidate], {})) {
             layer_b = candidate;
             break;
         }
@@ -731,7 +735,8 @@ bool run_seed_fill_isolation(real_fixture & f, int32_t layer_a, int32_t n_expert
 }
 
 bool run(const std::string & model_path, int32_t device, const char * timing_mode,
-        const std::vector<int32_t> & cpu_thread_counts, int32_t samples, int32_t miss_count) {
+        const std::vector<int32_t> & cpu_thread_counts, int32_t samples, int32_t miss_count,
+        const std::string & tuple_filter) {
     real_fixture f;
     llama_backend_init();
     f.backend_initialized = true;
@@ -757,16 +762,18 @@ bool run(const std::string & model_path, int32_t device, const char * timing_mod
 
     int32_t layer_id = -1;
     for (size_t i = 0; i < f.model->layers.size(); ++i) {
-        if (valid_candidate(*f.model, f.model->layers[i])) { layer_id = (int32_t)i; break; }
+        if (valid_candidate(*f.model, f.model->layers[i], tuple_filter)) { layer_id = (int32_t)i; break; }
     }
-    if (layer_id < 0) { std::fprintf(stderr, "no host-resident supported IQ3_S/IQ3_S routed layer without bias/scale/Hadamard\n"); return false; }
+    if (layer_id < 0) { std::fprintf(stderr, "no host-resident layer matches the requested supported routed layout and has no expert auxiliary input\n"); return false; }
     const llama_layer & layer = f.model->layers[layer_id];
     const int32_t n_embd = (int32_t) layer.ffn_up_exps->ne[0];
     const int32_t n_ff = (int32_t) layer.ffn_up_exps->ne[1];
     const int32_t n_experts = (int32_t) layer.ffn_up_exps->ne[2];
     const float routed_limit = f.model->swiglu_limit(layer_id, false);
-    std::printf("model=%s layer=%d experts=%d top_k=%d n_embd=%d n_ff=%d\n",
-            model_path.c_str(), layer_id, n_experts, N_SELECTED, n_embd, n_ff);
+    std::printf("model=%s layer=%d tuple=%s/%s/%s experts=%d top_k=%d n_embd=%d n_ff=%d\n",
+            model_path.c_str(), layer_id, ggml_type_name(layer.ffn_up_exps->type),
+            ggml_type_name(layer.ffn_gate_exps->type), ggml_type_name(layer.ffn_down_exps->type),
+            n_experts, N_SELECTED, n_embd, n_ff);
     std::printf("routed_silu_limit=%.9g shared_expert_outside_semantic=1\n", routed_limit);
     report_tensor("up", layer.ffn_up_exps);
     report_tensor("gate", layer.ffn_gate_exps);
@@ -1476,7 +1483,7 @@ bool run(const std::string & model_path, int32_t device, const char * timing_mod
 
 int main(int argc, char ** argv) {
     if (argc < 4 || std::strcmp(argv[2], "--device") != 0) {
-        std::fprintf(stderr, "usage: %s <Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf> --device <ordinal> [--timing-mode correctness|replacement|primary|nocapture|miss|trace|scaling|scaling-abba|thread-curve|thread-abba|seed-isolation] [--cpu-thread-counts list] [--samples N] [--miss-count 1|5|10]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <model.gguf> --device <ordinal> [--timing-mode correctness|replacement|primary|nocapture|miss|trace|scaling|scaling-abba|thread-curve|thread-abba|seed-isolation] [--layout-tuple UP/GATE/DOWN] [--cpu-thread-counts list] [--samples N] [--miss-count 1|5|10]\n", argv[0]);
         return 2;
     }
     const int device = std::stoi(argv[3]);
@@ -1485,6 +1492,7 @@ int main(int argc, char ** argv) {
     std::vector<int32_t> thread_counts;
     int32_t samples = 24;
     int32_t miss_count = 1;
+    std::string tuple_filter;
     for (int i = 4; i < argc; i += 2) {
         if (i + 1 >= argc) return 2;
         const std::string option = argv[i];
@@ -1503,6 +1511,8 @@ int main(int argc, char ** argv) {
             samples = std::stoi(value);
         } else if (option == "--miss-count") {
             miss_count = std::stoi(value);
+        } else if (option == "--layout-tuple") {
+            tuple_filter = value;
         } else {
             std::fprintf(stderr, "unknown option: %s\n", option.c_str());
             return 2;
@@ -1511,5 +1521,5 @@ int main(int argc, char ** argv) {
     std::printf("harness_config,mode=%s,cpu_thread_counts=", mode.c_str());
     for (size_t i = 0; i < thread_counts.size(); ++i) std::printf("%s%d", i ? "," : "", thread_counts[i]);
     std::printf(",samples=%d,miss_count=%d,affinity=inherited,max_parallel_calls=1\n", samples, miss_count);
-    return run(argv[1], device, mode.c_str(), thread_counts, samples, miss_count) ? 0 : 1;
+    return run(argv[1], device, mode.c_str(), thread_counts, samples, miss_count, tuple_filter) ? 0 : 1;
 }
