@@ -14,15 +14,8 @@ struct ggml_backend;
 struct ggml_backend_buffer;
 
 struct llama_moe_cache_ffn_state {
-    struct resource_signature {
-        int32_t n_embd = 0;
-        int32_t n_ff = 0;
-        int32_t n_experts_used = 0;
-    };
-
     struct group_state {
         llama_moe_cache::frozen_lease lease;
-        llama_moe_cache_frozen_layer snapshot;
     };
 
     struct layer_binding {
@@ -48,7 +41,7 @@ struct llama_moe_cache_ffn_state {
         int32_t n_embd = 0;
         int32_t n_ff = 0;
         int32_t n_experts_used = 0;
-        std::vector<resource_signature> resource_signatures;
+        std::vector<ggml_cuda_moe_ffn_resource_signature> resource_signatures;
         bool cpu_backend_transferred = false;
         std::vector<group_state> groups;
         std::vector<layer_binding> layer_bindings;
@@ -56,17 +49,12 @@ struct llama_moe_cache_ffn_state {
 
     llama_moe_cache * cache = nullptr;
     std::vector<device_state> devices;
+    std::vector<const layer_binding *> layer_by_index;
+    bool ready = false;
 
     bool initialize(llama_moe_cache & cache, const llama_model & model, int32_t cpu_threads);
     void shutdown();
-    bool valid() const;
     const layer_binding * find_layer(int32_t il) const;
-    const group_state * find_group(int32_t group) const;
-    size_t layer_count() const;
-    bool collect_stats(ggml_cuda_moe_ffn_stats & stats) const;
-    bool collect_device_stats(ggml_backend * backend, ggml_cuda_moe_ffn_stats & stats) const;
-    bool collect_resource_stats(ggml_cuda_moe_ffn_cpu_resource_stats & stats) const;
-    bool collect_device_resource_stats(ggml_backend * backend, ggml_cuda_moe_ffn_cpu_resource_stats & stats) const;
     ggml_tensor * build_node(ggml_context * ctx, ggml_backend_sched_t sched,
             const ggml_moe_ffn_layout & layout);
 };
