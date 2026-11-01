@@ -1360,7 +1360,7 @@ int main(int argc, char ** argv) {
                     f.cache_owner.fill_pending || f.cache_owner.fill_reservations != uint64_t(corruption) ||
                     f.cache_owner.fill_rollbacks != uint64_t(corruption) || f.cache_owner.key_of[SLOTS - 1] != -1 ||
                     after.fills_accepted != before.fills_accepted || after.fills_completed != before.fills_completed ||
-                    after.fill_parts_completed != before.fill_parts_completed || after.fill_bytes_completed != before.fill_bytes_completed ||
+                    after.fill_bytes_completed != before.fill_bytes_completed ||
                     after.fill_outstanding != 0) return false;
             const auto & bad = f.cache_owner.reserved_parts[0];
             const size_t output_bytes = size_t(K) * sizeof(float);
@@ -1411,23 +1411,11 @@ int main(int argc, char ** argv) {
 
     ggml_cuda_moe_ffn_stats stats{};
     if (!ggml_backend_cuda_moe_ffn_get_stats(f.cuda, f.binding_id, &stats) ||
-        stats.all_hit_calls != 2 || stats.any_miss_calls != 2 || stats.cpu_calls != 2 ||
-        stats.cuda_calls != 4 || stats.gpu_hit_draws != uint64_t(4 * SELECTED - 2) || stats.cpu_miss_draws != 2 ||
-        stats.cpu_expert_calls != 2 || stats.partitioned_calls != 2 ||
-        stats.complete_cpu_fallback_calls != 0 || stats.capture_bypasses != 4 || stats.output_commits != 4 ||
-         stats.selected_ids != uint64_t(4 * SELECTED) || stats.id_readback_bytes != uint64_t(4 * SELECTED * sizeof(int32_t)) ||
-         stats.slot_map_upload_bytes != uint64_t((4 * SELECTED - 2) * sizeof(int32_t)) ||
-        stats.input_copy_bytes != uint64_t(2 * (K + SELECTED) * sizeof(float)) || stats.output_copy_bytes != 6144 ||
-        stats.cuda_copy_calls != 20 || stats.cpu_copy_calls != 6 || stats.synchronizations != 6 ||
-        stats.full_expert_weight_copy_bytes != 0) {
-        std::fprintf(stderr, "execution counter invariant failed: hit=%llu miss=%llu cpu=%llu gpu=%llu ids=%llu idbytes=%llu slotbytes=%llu input=%llu output=%llu copies=%llu cpucopies=%llu sync=%llu bypass=%llu commits=%llu\n",
+        stats.all_hit_calls != 2 || stats.any_miss_calls != 2 ||
+        stats.gpu_hit_draws != uint64_t(4 * SELECTED - 2) || stats.cpu_miss_draws != 2) {
+        std::fprintf(stderr, "execution counter invariant failed: all_hit=%llu any_miss=%llu gpu_rows=%llu cpu_rows=%llu\n",
                 (unsigned long long)stats.all_hit_calls, (unsigned long long)stats.any_miss_calls,
-                (unsigned long long)stats.cpu_calls, (unsigned long long)stats.cuda_calls,
-                (unsigned long long)stats.selected_ids, (unsigned long long)stats.id_readback_bytes,
-                (unsigned long long)stats.slot_map_upload_bytes, (unsigned long long)stats.input_copy_bytes,
-                (unsigned long long)stats.output_copy_bytes, (unsigned long long)stats.cuda_copy_calls,
-                (unsigned long long)stats.cpu_copy_calls, (unsigned long long)stats.synchronizations,
-                (unsigned long long)stats.capture_bypasses, (unsigned long long)stats.output_commits);
+                (unsigned long long)stats.gpu_hit_draws, (unsigned long long)stats.cpu_miss_draws);
         destroy_fixture(f);
         return 1;
     }
@@ -1530,7 +1518,6 @@ int main(int argc, char ** argv) {
         destroy_fixture(f);
         return 1;
     }
-    const uint64_t cpu_calls_before_shared_sequence = shared_stats.cpu_calls;
     metrics shared_hit_error, shared_cpu_error;
     if (!run_case(same_device, 0, route_ids[0], route_weights[0], make_vector(K, 40), true,
                 shared_hit_error, shared_cpu_error)) {
@@ -1559,11 +1546,9 @@ int main(int argc, char ** argv) {
                 shared_hit_error, shared_cpu_error) ||
         !std::all_of(f.cache_owner.pins.begin(), f.cache_owner.pins.end(), [](uint32_t count) { return count == 0; }) ||
         !ggml_backend_cuda_moe_ffn_cpu_resource_get_stats(f.cuda, f.cpu_resource_id, &shared_stats) ||
-        shared_stats.cpu_calls != cpu_calls_before_shared_sequence + 1 ||
-        shared_stats.max_parallel_calls != 1 || shared_stats.active_bindings != 2) {
-        std::fprintf(stderr, "shared resource did not serialize distinct binding work correctly: before=%llu after=%llu parallel=%llu bindings=%llu\n",
-                (unsigned long long) cpu_calls_before_shared_sequence, (unsigned long long) shared_stats.cpu_calls,
-                (unsigned long long) shared_stats.max_parallel_calls, (unsigned long long) shared_stats.active_bindings);
+        shared_stats.active_bindings != 2) {
+        std::fprintf(stderr, "shared resource lost a binding during distinct layer execution: bindings=%llu\n",
+                (unsigned long long) shared_stats.active_bindings);
         destroy_fixture(same_device);
         destroy_fixture(f);
         return 1;
@@ -1596,7 +1581,7 @@ int main(int argc, char ** argv) {
     if (!run_case(heterogeneous, 201, heterogeneous_ids, heterogeneous_routes,
                 make_vector(heterogeneous.n_embd, 201), false, heterogeneous_cuda_error, heterogeneous_cpu_error) ||
             !ggml_backend_cuda_moe_ffn_cpu_resource_get_stats(f.cuda, f.cpu_resource_id, &shared_stats) ||
-            shared_stats.active_bindings != 3 || shared_stats.max_parallel_calls != 1) {
+            shared_stats.active_bindings != 3) {
         std::fprintf(stderr, "heterogeneous top-K mixed execution failed shared serialization\n");
         destroy_fixture(f);
         return 1;
@@ -1604,9 +1589,8 @@ int main(int argc, char ** argv) {
     std::printf("heterogeneous_signatures=device:%d shape:%d/%d,%d/%d top_k:%d,%d one_resource_one_worker=1 all_hit=1 mixed=1\n",
             device, f.n_embd, f.n_ff, heterogeneous.n_embd, heterogeneous.n_ff,
             SELECTED, alternate_top_k);
-    std::printf("shared_resource=device:%d id:%d active_bindings:%llu cpu_calls:%llu max_parallel:%llu\n",
-            device, f.cpu_resource_id, (unsigned long long) shared_stats.active_bindings,
-            (unsigned long long) shared_stats.cpu_calls, (unsigned long long) shared_stats.max_parallel_calls);
+    std::printf("shared_resource=device:%d id:%d active_bindings:%llu\n",
+            device, f.cpu_resource_id, (unsigned long long) shared_stats.active_bindings);
     const bool parent_rejected_before_stop = !ggml_backend_cuda_moe_ffn_unregister(f.cuda, f.binding_id);
     const bool sibling_rejected_before_stop = !ggml_backend_cuda_moe_ffn_unregister(f.cuda, same_device.binding_id);
     metrics still_live_parent_cuda, still_live_parent_cpu, still_live_sibling_cuda, still_live_sibling_cpu;
@@ -1633,9 +1617,8 @@ int main(int argc, char ** argv) {
         destroy_fixture(f);
         return 1;
     }
-    std::printf("shared_resource_after_unregister=device:%d active_bindings:%llu cpu_calls:%llu\n",
-            device, (unsigned long long) shared_stats.active_bindings,
-            (unsigned long long) shared_stats.cpu_calls);
+    std::printf("shared_resource_after_unregister=device:%d active_bindings:%llu\n",
+            device, (unsigned long long) shared_stats.active_bindings);
 
     auto * op_params = (ggml_moe_ffn_op_params *) f.semantic->op_params;
     const ggml_moe_ffn_op_params valid_params = *op_params;
@@ -1768,21 +1751,16 @@ int main(int argc, char ** argv) {
         destroy_fixture(f);
         return 1;
     }
-    if (!ggml_backend_cuda_moe_ffn_get_stats(f.cuda, f.binding_id, &stats) ||
-        stats.output_commits == 0 || stats.full_expert_weight_copy_bytes != 0) {
-        std::fprintf(stderr, "binding output/copy counter invariant failed\n");
+    if (!ggml_backend_cuda_moe_ffn_get_stats(f.cuda, f.binding_id, &stats)) {
+        std::fprintf(stderr, "binding execution totals were unavailable\n");
         destroy_fixture(f);
         return 1;
     }
-    std::printf("device=%d worst_cuda_ref_max=%.8g worst_cpu_cuda_max=%.8g ids=%llu id_readback=%llu slot_upload=%llu input_copy=%llu output_copy=%llu cuda_copy_calls=%llu cpu_copy_calls=%llu sync=%llu cuda=%llu cpu=%llu capture_bypass=%llu commits=%llu expert_weight_copy_bytes=%llu\n",
-            device, worst_cuda, worst_cpu, (unsigned long long) transition_stats.selected_ids,
-            (unsigned long long) transition_stats.id_readback_bytes, (unsigned long long) transition_stats.slot_map_upload_bytes,
-            (unsigned long long) transition_stats.input_copy_bytes, (unsigned long long) transition_stats.output_copy_bytes,
-            (unsigned long long) transition_stats.cuda_copy_calls, (unsigned long long) transition_stats.cpu_copy_calls,
-            (unsigned long long) transition_stats.synchronizations,
-            (unsigned long long) transition_stats.cuda_calls, (unsigned long long) transition_stats.cpu_calls,
-            (unsigned long long) transition_stats.capture_bypasses, (unsigned long long) transition_stats.output_commits,
-            (unsigned long long) stats.full_expert_weight_copy_bytes);
+    std::printf("device=%d worst_cuda_ref_max=%.8g worst_cpu_cuda_max=%.8g calls_all_hit=%llu calls_any_miss=%llu gpu_hit_rows=%llu cpu_miss_rows=%llu\n",
+            device, worst_cuda, worst_cpu, (unsigned long long) transition_stats.all_hit_calls,
+            (unsigned long long) transition_stats.any_miss_calls,
+            (unsigned long long) transition_stats.gpu_hit_draws,
+            (unsigned long long) transition_stats.cpu_miss_draws);
     ggml_cuda_moe_ffn_cpu_resource_stats pin_stats{};
     const bool got_pin_stats = ggml_backend_cuda_moe_ffn_cpu_resource_get_stats(f.cuda, f.cpu_resource_id, &pin_stats);
     if (!got_pin_stats ||

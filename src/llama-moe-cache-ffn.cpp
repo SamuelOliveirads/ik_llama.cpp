@@ -70,12 +70,11 @@ bool layer_is_eligible(const llama_model & model, int32_t il, const llama_moe_ca
     return identity && cuda;
 }
 
-template<typename T>
-void add_stats(T & dst, const T & src) {
-    static_assert(sizeof(T) % sizeof(uint64_t) == 0);
-    auto * d = reinterpret_cast<uint64_t *>(&dst);
-    const auto * s = reinterpret_cast<const uint64_t *>(&src);
-    for (size_t i = 0; i < sizeof(T) / sizeof(uint64_t); ++i) d[i] += s[i];
+void add_stats(ggml_cuda_moe_ffn_stats & dst, const ggml_cuda_moe_ffn_stats & src) {
+    dst.all_hit_calls += src.all_hit_calls;
+    dst.any_miss_calls += src.any_miss_calls;
+    dst.gpu_hit_draws += src.gpu_hit_draws;
+    dst.cpu_miss_draws += src.cpu_miss_draws;
 }
 
 } // namespace
