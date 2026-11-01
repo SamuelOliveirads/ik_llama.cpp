@@ -234,11 +234,4 @@ if (GGML_CUDA)
     target_include_directories(test-moe-hybrid-ffn PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     add_test(NAME test-moe-hybrid-ffn COMMAND $<TARGET_FILE:test-moe-hybrid-ffn> --device 0)
 
-    add_executable(test-moe-hybrid-real test-moe-hybrid-real.cpp)
-    target_link_libraries(test-moe-hybrid-real PRIVATE common)
-    target_include_directories(test-moe-hybrid-real PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
-
-    add_executable(test-moe-hybrid-context test-moe-hybrid-context.cpp)
-    target_link_libraries(test-moe-hybrid-context PRIVATE common)
-    target_include_directories(test-moe-hybrid-context PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
 endif()

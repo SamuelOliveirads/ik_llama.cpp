@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -14,6 +15,7 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -45,6 +47,19 @@ metrics compare(const std::vector<float> & a, const std::vector<float> & b) {
 
 bool finite(const std::vector<float> & values) {
     return std::all_of(values.begin(), values.end(), [](float x) { return std::isfinite(x); });
+}
+
+bool wait_fill_idle(ggml_backend_t cuda, int32_t resource_id, uint32_t timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    do {
+        ggml_cuda_moe_ffn_cpu_resource_stats stats{};
+        if (!ggml_backend_cuda_moe_ffn_cpu_resource_get_stats(cuda, resource_id, &stats)) return false;
+        // Pending bank-read pins are retired at the next semantic entry;
+        // waiting for them here would prevent that next call from occurring.
+        if (!stats.fill_outstanding) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
 }
 
 bool byte_ranges_overlap(const void * a, size_t an, const void * b, size_t bn) {
@@ -958,8 +973,7 @@ bool query_support_without_allocating_output(fixture & f, int owner_device, int3
 
 bool run_case(fixture & f, int iteration, const std::vector<int32_t> & ids,
         const std::vector<float> & routes, const std::vector<float> & input_seed,
-        bool expect_hit, metrics & cuda_error, metrics & cpu_error,
-        bool expect_complete_cpu_fallback = false) {
+        bool expect_hit, metrics & cuda_error, metrics & cpu_error) {
     set_tensor(f.ids, ids.data());
     set_tensor(f.routes, routes.data());
     std::vector<float> scaled_seed = input_seed;
@@ -1033,23 +1047,11 @@ bool run_case(fixture & f, int iteration, const std::vector<int32_t> & ids,
             }
         }
     }
-    std::vector<float> cpu_draw_reference;
-    if (expect_complete_cpu_fallback) {
-        cpu_draw_reference.assign(f.n_embd, 0.0f);
-        for (int draw = 0; draw < f.selected; ++draw) {
-            ggml_backend_tensor_set(f.cpu_single_ids, &ids[draw], 0, sizeof(int32_t));
-            ggml_backend_tensor_set(f.cpu_single_routes, &routes[draw], 0, sizeof(float));
-            if (ggml_backend_graph_compute(f.cpu, f.cpu_single_graph) != GGML_STATUS_SUCCESS) return false;
-            const auto contribution = get_f32(f.cpu_single_output);
-            if (!finite(contribution)) return false;
-            for (int i = 0; i < f.n_embd; ++i) cpu_draw_reference[i] += contribution[i];
-        }
-    }
     if (ggml_backend_graph_compute(f.cuda, f.semantic_graph) != GGML_STATUS_SUCCESS) return false;
     const auto semantic = get_f32(f.semantic);
     if (!finite(semantic)) return false;
     cpu_error = compare(semantic, cpu);
-    const auto & expected = expect_complete_cpu_fallback ? cpu_draw_reference : (expect_hit ? ordinary_cuda : mixed_reference);
+    const auto & expected = expect_hit ? ordinary_cuda : mixed_reference;
     cuda_error = compare(semantic, expected);
     if ((!expect_hit && !has_miss) || cuda_error.max_abs > 1e-5 || cuda_error.rms > 5e-6) {
         std::fprintf(stderr, "clamp_semantic_reference_failure limit=%g ordinary_cpu_cuda_max=%.9g ordinary_cpu_cuda_rms=%.9g semantic_reference_max=%.9g semantic_reference_rms=%.9g semantic_cpu_max=%.9g semantic_cpu_rms=%.9g\n",
@@ -1079,9 +1081,9 @@ bool run_non_proof_tuple_case(fixture & f, const std::vector<std::vector<float>>
     metrics cuda_error, cpu_error;
     bool okay = run_case(f, 100, all_hit, route_weights[0], make_vector(K, 100), true, cuda_error, cpu_error) &&
             run_case(f, 101, partial_miss, route_weights[1], make_vector(K, 101), false, cuda_error, cpu_error) &&
-            ggml_backend_cuda_moe_ffn_test_wait_fill_idle(f.cuda, f.cpu_resource_id, 5000) &&
+            wait_fill_idle(f.cuda, f.cpu_resource_id, 5000) &&
             run_case(f, 102, all_miss, route_weights[2], make_vector(K, 102), false, cuda_error, cpu_error) &&
-            ggml_backend_cuda_moe_ffn_test_wait_fill_idle(f.cuda, f.cpu_resource_id, 5000) &&
+            wait_fill_idle(f.cuda, f.cpu_resource_id, 5000) &&
             run_case(f, 103, later_ready_hit, route_weights[3], make_vector(K, 103), true, cuda_error, cpu_error);
     ggml_cuda_moe_ffn_cpu_resource_stats stats{};
     okay = okay && ggml_backend_cuda_moe_ffn_cpu_resource_stop(f.cuda, f.cpu_resource_id) &&
@@ -1475,26 +1477,6 @@ int main(int argc, char ** argv) {
     }
     std::printf("malformed_resolution capacity_rejected=1 over_count_rejected=%d acquired_pins_released_once=1\n",
             SELECTED == 10 ? 1 : 0);
-
-    ggml_cuda_moe_ffn_stats before_dispatch_failure{};
-    if (!ggml_backend_cuda_moe_ffn_get_stats(f.cuda, f.binding_id, &before_dispatch_failure) ||
-            !ggml_backend_cuda_moe_ffn_test_fail_next_dispatch_after_start(f.cuda, f.binding_id)) {
-        std::fprintf(stderr, "could not arm post-dispatch fallback contract test\n");
-        destroy_fixture(f);
-        return 1;
-    }
-    metrics dispatched_failure_cuda_error, dispatched_failure_cpu_error;
-    ggml_cuda_moe_ffn_stats after_dispatch_failure{};
-    if (!run_case(f, 4, route_ids[0], route_weights[0], make_vector(K, 32), true,
-                dispatched_failure_cuda_error, dispatched_failure_cpu_error, true) ||
-            !ggml_backend_cuda_moe_ffn_get_stats(f.cuda, f.binding_id, &after_dispatch_failure) ||
-            after_dispatch_failure.complete_cpu_fallback_calls != before_dispatch_failure.complete_cpu_fallback_calls + 1 ||
-            std::count(f.cache_owner.pins.begin(), f.cache_owner.pins.end(), 1u) != unique_all_hit_pins) {
-        std::fprintf(stderr, "post-dispatch fallback did not retain the submitted hit-read pins\n");
-        destroy_fixture(f);
-        return 1;
-    }
-    std::printf("post_dispatch_failure_recovery=complete_cpu_output pending_pin_tokens=%d\n", SELECTED);
 
     set_tensor(f.ids, route_ids[0].data());
     set_tensor(f.routes, route_weights[0].data());

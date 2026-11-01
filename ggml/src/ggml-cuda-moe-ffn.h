@@ -4,17 +4,6 @@
 #include "ggml-backend.h"
 #include "ggml-moe-ffn.h"
 
-enum { GGML_CUDA_MOE_FFN_PHASE_SAMPLE_CAPACITY = 4096 };
-
-typedef struct ggml_cuda_moe_ffn_phase_sample {
-    uint32_t window_n_kv;
-    int32_t device;
-    int32_t kind;       // 0: semantic operation, 1: fill worker job
-    int32_t call_kind;  // 0: unresolved/rejected, 1: all-hit, 2: any-miss
-    int32_t miss_rows;
-    uint64_t ns[8];
-} ggml_cuda_moe_ffn_phase_sample;
-
 typedef struct ggml_cuda_moe_ffn_fill_part {
     const void * source;
     void * destination;
@@ -166,19 +155,6 @@ GGML_API GGML_CALL bool ggml_backend_cuda_moe_ffn_cpu_resource_stop(ggml_backend
         int32_t resource_id);
 GGML_API GGML_CALL bool ggml_backend_cuda_moe_ffn_cpu_resource_get_stats(ggml_backend_t backend,
         int32_t resource_id, ggml_cuda_moe_ffn_cpu_resource_stats * stats);
-GGML_API GGML_CALL bool ggml_backend_cuda_moe_ffn_set_phase_profile(ggml_backend_t backend,
-        int32_t resource_id, bool enabled, uint32_t window_n_kv);
-GGML_API GGML_CALL bool ggml_backend_cuda_moe_ffn_get_phase_samples(ggml_backend_t backend,
-        int32_t resource_id, ggml_cuda_moe_ffn_phase_sample * samples, size_t capacity,
-        size_t * count, uint64_t * dropped, bool clear);
-GGML_API GGML_CALL bool ggml_backend_cuda_moe_ffn_test_hold_fill_worker(ggml_backend_t backend,
-        int32_t resource_id, bool hold);
-GGML_API GGML_CALL bool ggml_backend_cuda_moe_ffn_test_fail_next_fill_after_part(
-        ggml_backend_t backend, int32_t resource_id);
-GGML_API GGML_CALL bool ggml_backend_cuda_moe_ffn_test_wait_fill_idle(ggml_backend_t backend,
-        int32_t resource_id, uint32_t timeout_ms);
-GGML_API GGML_CALL bool ggml_backend_cuda_moe_ffn_test_fail_next_dispatch_after_start(
-        ggml_backend_t backend, int32_t binding_id);
 GGML_API GGML_CALL bool ggml_backend_cuda_moe_ffn_unregister(ggml_backend_t backend, int32_t binding_id);
 GGML_API GGML_CALL bool ggml_backend_cuda_moe_ffn_get_stats(ggml_backend_t backend, int32_t binding_id,
         ggml_cuda_moe_ffn_stats * stats);

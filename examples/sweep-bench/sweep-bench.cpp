@@ -3,13 +3,8 @@
 #include "common.h"
 #include "speculative.h"
 #include "llama-vocab.h"
-#include "llama-context.h"
-#include "llama-moe-ffn-prototype.h"
-
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
-#include <cuda_profiler_api.h>
-#include <cuda_runtime_api.h>
 #endif
 
 #ifdef _WIN32
@@ -26,10 +21,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
-#include <cstdint>
 #include <string>
-#include <utility>
-#include <unordered_set>
 #include <vector>
 
 static double get_rss_hwm_mib() {
@@ -147,202 +139,6 @@ static void print_usage(int argc, char ** argv) {
     LOG_TEE("\n");
 }
 
-struct f5a_device_stats_snapshot {
-    int device;
-    ggml_cuda_moe_ffn_stats stats;
-    ggml_cuda_moe_ffn_cpu_resource_stats resource;
-};
-
-struct f5a_stats_checkpoint {
-    unsigned int n_kv;
-    ggml_cuda_moe_ffn_stats aggregate;
-    ggml_cuda_moe_ffn_cpu_resource_stats aggregate_resource;
-    std::vector<f5a_device_stats_snapshot> devices;
-};
-
-static bool collect_f5a_stats(llama_context * ctx, unsigned int n_kv, f5a_stats_checkpoint & checkpoint) {
-    if (ctx == nullptr || !ctx->moe_ffn_prototype) return false;
-    checkpoint.n_kv = n_kv;
-    if (!ctx->moe_ffn_prototype->collect_stats(checkpoint.aggregate) ||
-            !ctx->moe_ffn_prototype->collect_resource_stats(checkpoint.aggregate_resource)) return false;
-    checkpoint.devices.clear();
-    checkpoint.devices.reserve(ctx->moe_ffn_prototype->devices.size());
-    for (const auto & device : ctx->moe_ffn_prototype->devices) {
-        f5a_device_stats_snapshot snapshot{};
-        snapshot.device = device.device;
-        if (!ctx->moe_ffn_prototype->collect_device_stats(device.cuda_backend, snapshot.stats) ||
-                !ctx->moe_ffn_prototype->collect_device_resource_stats(device.cuda_backend, snapshot.resource)) return false;
-        checkpoint.devices.push_back(snapshot);
-    }
-    return true;
-}
-
-static uint64_t f5a_delta(uint64_t current, uint64_t previous) {
-    return current >= previous ? current - previous : 0;
-}
-
-static void print_f5a_stats(const char * scope, unsigned int n_kv, int device,
-        const ggml_cuda_moe_ffn_stats & s, const ggml_cuda_moe_ffn_cpu_resource_stats & r) {
-    const uint64_t rows = s.gpu_hit_draws + s.cpu_miss_draws;
-    const double row_hit_rate = rows == 0 ? 0.0 : 100.0 * (double) s.gpu_hit_draws / (double) rows;
-    const uint64_t calls = s.all_hit_calls + s.any_miss_calls;
-    const double all_hit_rate = calls == 0 ? 0.0 : 100.0 * (double) s.all_hit_calls / (double) calls;
-    LOG_TEE("f5a_stats scope=%s n_kv=%u device=%d all_hit_calls=%llu any_miss_calls=%llu rejected_calls=%llu output_commits=%llu "
-            "all_hit_call_rate=%.4f selected_ids=%llu id_readback_bytes=%llu slot_map_upload_bytes=%llu input_copy_bytes=%llu output_copy_bytes=%llu "
-            "cuda_copy_calls=%llu cpu_copy_calls=%llu synchronizations=%llu capture_bypasses=%llu cuda_calls=%llu cpu_calls=%llu cpu_expert_calls=%llu "
-            "partitioned_calls=%llu complete_cpu_fallback_calls=%llu gpu_pending_at_cpu_start=%llu gpu_completed_during_cpu=%llu "
-            "full_expert_weight_copy_bytes=%llu eligible_rows=%llu gpu_hit_rows=%llu cpu_miss_rows=%llu row_hit_rate=%.4f "
-            "resource_cpu_calls=%llu max_parallel_calls=%llu active_bindings=%llu pin_resolve_calls=%llu pin_acquisitions=%llu pin_releases=%llu "
-            "pending_pin_releases=%llu pin_release_failures=%llu pending_pins=%llu fills_accepted=%llu fills_completed=%llu fills_rejected=%llu "
-            "fills_failed=%llu pending_jobs=%llu fill_parts_completed=%llu fill_bytes_completed=%llu\n",
-            scope, n_kv, device,
-            (unsigned long long) s.all_hit_calls, (unsigned long long) s.any_miss_calls,
-            (unsigned long long) s.rejected_calls, (unsigned long long) s.output_commits, all_hit_rate,
-            (unsigned long long) s.selected_ids, (unsigned long long) s.id_readback_bytes,
-            (unsigned long long) s.slot_map_upload_bytes, (unsigned long long) s.input_copy_bytes,
-            (unsigned long long) s.output_copy_bytes, (unsigned long long) s.cuda_copy_calls,
-            (unsigned long long) s.cpu_copy_calls, (unsigned long long) s.synchronizations,
-            (unsigned long long) s.capture_bypasses, (unsigned long long) s.cuda_calls,
-            (unsigned long long) s.cpu_calls, (unsigned long long) s.cpu_expert_calls,
-            (unsigned long long) s.partitioned_calls, (unsigned long long) s.complete_cpu_fallback_calls,
-            (unsigned long long) s.gpu_pending_at_cpu_start, (unsigned long long) s.gpu_completed_during_cpu,
-            (unsigned long long) s.full_expert_weight_copy_bytes,
-            (unsigned long long) rows, (unsigned long long) s.gpu_hit_draws,
-            (unsigned long long) s.cpu_miss_draws, row_hit_rate,
-            (unsigned long long) r.cpu_calls, (unsigned long long) r.max_parallel_calls,
-            (unsigned long long) r.active_bindings, (unsigned long long) r.pin_resolve_calls,
-            (unsigned long long) r.pin_acquisitions, (unsigned long long) r.pin_releases,
-            (unsigned long long) r.pending_pin_releases, (unsigned long long) r.pin_release_failures,
-            (unsigned long long) r.pending_pin_active, (unsigned long long) r.fills_accepted,
-            (unsigned long long) r.fills_completed, (unsigned long long) r.fills_rejected,
-            (unsigned long long) r.fills_failed, (unsigned long long) r.fill_outstanding,
-            (unsigned long long) r.fill_parts_completed, (unsigned long long) r.fill_bytes_completed);
-}
-
-static ggml_cuda_moe_ffn_stats f5a_stats_difference(const ggml_cuda_moe_ffn_stats & now,
-        const ggml_cuda_moe_ffn_stats & before) {
-    ggml_cuda_moe_ffn_stats d{};
-#define F5A_DIFF_STAT(field) d.field = f5a_delta(now.field, before.field)
-    F5A_DIFF_STAT(all_hit_calls); F5A_DIFF_STAT(any_miss_calls); F5A_DIFF_STAT(rejected_calls);
-    F5A_DIFF_STAT(selected_ids); F5A_DIFF_STAT(id_readback_bytes); F5A_DIFF_STAT(slot_map_upload_bytes);
-    F5A_DIFF_STAT(input_copy_bytes); F5A_DIFF_STAT(output_copy_bytes); F5A_DIFF_STAT(cuda_copy_calls);
-    F5A_DIFF_STAT(cpu_copy_calls); F5A_DIFF_STAT(synchronizations); F5A_DIFF_STAT(cuda_calls);
-    F5A_DIFF_STAT(cpu_calls); F5A_DIFF_STAT(capture_bypasses); F5A_DIFF_STAT(output_commits);
-    F5A_DIFF_STAT(full_expert_weight_copy_bytes); F5A_DIFF_STAT(gpu_hit_draws); F5A_DIFF_STAT(cpu_miss_draws);
-    F5A_DIFF_STAT(cpu_expert_calls); F5A_DIFF_STAT(gpu_pending_at_cpu_start); F5A_DIFF_STAT(gpu_completed_during_cpu);
-    F5A_DIFF_STAT(partitioned_calls); F5A_DIFF_STAT(complete_cpu_fallback_calls);
-#undef F5A_DIFF_STAT
-    return d;
-}
-
-static ggml_cuda_moe_ffn_cpu_resource_stats f5a_resource_difference(
-        const ggml_cuda_moe_ffn_cpu_resource_stats & now,
-        const ggml_cuda_moe_ffn_cpu_resource_stats & before) {
-    ggml_cuda_moe_ffn_cpu_resource_stats d{};
-#define F5A_DIFF_RESOURCE(field) d.field = f5a_delta(now.field, before.field)
-    F5A_DIFF_RESOURCE(cpu_calls); F5A_DIFF_RESOURCE(pin_resolve_calls); F5A_DIFF_RESOURCE(pin_acquisitions);
-    F5A_DIFF_RESOURCE(pin_releases); F5A_DIFF_RESOURCE(pending_pin_releases); F5A_DIFF_RESOURCE(pin_release_failures);
-    F5A_DIFF_RESOURCE(fills_accepted); F5A_DIFF_RESOURCE(fills_completed); F5A_DIFF_RESOURCE(fills_rejected);
-    F5A_DIFF_RESOURCE(fills_failed); F5A_DIFF_RESOURCE(fill_parts_completed); F5A_DIFF_RESOURCE(fill_bytes_completed);
-#undef F5A_DIFF_RESOURCE
-    d.max_parallel_calls = now.max_parallel_calls;
-    d.active_bindings = now.active_bindings;
-    d.pending_pin_active = now.pending_pin_active;
-    d.fill_outstanding = now.fill_outstanding;
-    return d;
-}
-
-static bool report_f5a_checkpoint_deltas(const std::vector<f5a_stats_checkpoint> & checkpoints) {
-    if (checkpoints.size() < 2) return false;
-    for (size_t i = 1; i < checkpoints.size(); ++i) {
-        const auto & before = checkpoints[i - 1];
-        const auto & now = checkpoints[i];
-        if (before.devices.size() != now.devices.size()) return false;
-        const unsigned int from_n_kv = before.n_kv == UINT32_MAX ? 0 : before.n_kv + 1024;
-        const unsigned int to_n_kv = now.n_kv + 1024;
-        LOG_TEE("f5a_checkpoint_window from_n_kv=%u to_n_kv=%u rows=8\n", from_n_kv, to_n_kv);
-        for (size_t d = 0; d < now.devices.size(); ++d) {
-            if (before.devices[d].device != now.devices[d].device) return false;
-            print_f5a_stats("interval", now.n_kv, now.devices[d].device,
-                    f5a_stats_difference(now.devices[d].stats, before.devices[d].stats),
-                    f5a_resource_difference(now.devices[d].resource, before.devices[d].resource));
-        }
-        print_f5a_stats("interval_aggregate", now.n_kv, -1,
-                f5a_stats_difference(now.aggregate, before.aggregate),
-                f5a_resource_difference(now.aggregate_resource, before.aggregate_resource));
-    }
-    return true;
-}
-
-static bool report_moe_prototype_stats(llama_context * ctx, bool enabled) {
-    if (!enabled) {
-        LOG_TEE("f4c_prototype_stats mode=blocking state=absent resources=0 bindings=0 leases=0\n");
-        return true;
-    }
-
-    if (!ctx->moe_ffn_prototype) return false;
-    auto & prototype = *ctx->moe_ffn_prototype;
-    for (const auto & device : prototype.devices) {
-        if (!ggml_backend_cuda_moe_ffn_cpu_resource_stop(device.cuda_backend, device.cpu_resource_id)) {
-            LOG_TEE("f4c_prototype_stats error=resource_stop device=%d\n", device.device);
-            return false;
-        }
-    }
-
-    ggml_cuda_moe_ffn_stats aggregate{};
-    ggml_cuda_moe_ffn_cpu_resource_stats aggregate_resource{};
-    if (!prototype.collect_stats(aggregate) || !prototype.collect_resource_stats(aggregate_resource)) return false;
-
-    for (const auto & device : prototype.devices) {
-        ggml_cuda_moe_ffn_stats stats{};
-        ggml_cuda_moe_ffn_cpu_resource_stats resource{};
-        if (!prototype.collect_device_stats(device.cuda_backend, stats) ||
-                !prototype.collect_device_resource_stats(device.cuda_backend, resource)) return false;
-        LOG_TEE("f5a_layout device=%d groups=%zu bindings=%zu cpu_graphs=%zu resources=1 legacy_full_expert_copy_bytes=%llu\n",
-                device.device, device.groups.size(), device.layer_bindings.size(), device.layer_bindings.size(),
-                (unsigned long long) stats.full_expert_weight_copy_bytes);
-        print_f5a_stats("total", UINT32_MAX, device.device, stats, resource);
-    }
-
-    print_f5a_stats("total_aggregate", 0, -1, aggregate, aggregate_resource);
-    return true;
-}
-
-#ifdef GGML_USE_CUDA
-static bool set_f5a_phase_profile(llama_context * ctx, bool enabled, unsigned int n_kv) {
-    if (!ctx || !ctx->moe_ffn_prototype) return false;
-    for (const auto & device : ctx->moe_ffn_prototype->devices) {
-        if (!ggml_backend_cuda_moe_ffn_set_phase_profile(device.cuda_backend,
-                    device.cpu_resource_id, enabled, n_kv)) return false;
-    }
-    return true;
-}
-
-static bool report_f5a_phase_samples(llama_context * ctx) {
-    if (!ctx || !ctx->moe_ffn_prototype) return false;
-    LOG_TEE("f5a_phase_header kind=device_call_kind_miss_rows_window_ns0_mutex_ns1_ids_sync_ns2_resolve_admission_ns3_miss_input_sync_ns4_gpu_submit_ns5_cpu_compute_ns6_join_commit_ns7_total;fill_ns0_copy_submit_ns1_stream_sync_ns2_publication\n");
-    for (const auto & device : ctx->moe_ffn_prototype->devices) {
-        std::vector<ggml_cuda_moe_ffn_phase_sample> samples(GGML_CUDA_MOE_FFN_PHASE_SAMPLE_CAPACITY);
-        size_t count = 0;
-        uint64_t dropped = 0;
-        if (!ggml_backend_cuda_moe_ffn_get_phase_samples(device.cuda_backend,
-                    device.cpu_resource_id, samples.data(), samples.size(), &count, &dropped, false)) return false;
-        LOG_TEE("f5a_phase_samples device=%d count=%zu dropped=%llu\n", device.device, count,
-                (unsigned long long) dropped);
-        for (size_t i = 0; i < count; ++i) {
-            const auto & s = samples[i];
-            LOG_TEE("f5a_phase_sample device=%d kind=%d call_kind=%d miss_rows=%d window_n_kv=%u ns0=%llu ns1=%llu ns2=%llu ns3=%llu ns4=%llu ns5=%llu ns6=%llu ns7=%llu\n",
-                    s.device, s.kind, s.call_kind, s.miss_rows, s.window_n_kv,
-                    (unsigned long long) s.ns[0], (unsigned long long) s.ns[1],
-                    (unsigned long long) s.ns[2], (unsigned long long) s.ns[3],
-                    (unsigned long long) s.ns[4], (unsigned long long) s.ns[5],
-                    (unsigned long long) s.ns[6], (unsigned long long) s.ns[7]);
-        }
-    }
-    return true;
-}
-#endif
-
 int main(int argc, char ** argv) {
 
     gpt_params params;
@@ -354,55 +150,6 @@ int main(int argc, char ** argv) {
     }
     if (params.nrep < 1) params.nrep = 1;
     if (params.sweep_stride < 1) params.sweep_stride = 1;
-
-    const char * prototype_env = std::getenv("IK_LLAMA_MOE_HYBRID_PROTOTYPE");
-    const bool use_moe_prototype = prototype_env != nullptr;
-    if (use_moe_prototype && std::strcmp(prototype_env, "1") != 0) {
-        fprintf(stderr, "%s: error: IK_LLAMA_MOE_HYBRID_PROTOTYPE accepts only the value 1\n", __func__);
-        return 2;
-    }
-#ifndef GGML_USE_CUDA
-    if (use_moe_prototype) {
-        fprintf(stderr, "%s: error: IK_LLAMA_MOE_HYBRID_PROTOTYPE requires a CUDA build\n", __func__);
-        return 2;
-    }
-#endif
-    if (use_moe_prototype && params.split_mode != LLAMA_SPLIT_MODE_LAYER) {
-        fprintf(stderr, "%s: error: IK_LLAMA_MOE_HYBRID_PROTOTYPE requires --split-mode layer\n", __func__);
-        return 2;
-    }
-
-    const char * f5a_checkpoints_env = std::getenv("IK_LLAMA_F5A_COUNTER_CHECKPOINTS");
-    const bool f5a_checkpoints = f5a_checkpoints_env != nullptr;
-    if (f5a_checkpoints && (std::strcmp(f5a_checkpoints_env, "1") != 0 || !use_moe_prototype)) {
-        fprintf(stderr, "%s: error: IK_LLAMA_F5A_COUNTER_CHECKPOINTS requires value 1 and prototype mode\n", __func__);
-        return 2;
-    }
-
-    const char * f5a_profile_env = std::getenv("IK_LLAMA_F5A_PROFILE_WINDOWS");
-    const bool f5a_profile_windows = f5a_profile_env != nullptr;
-    if (f5a_profile_windows && std::strcmp(f5a_profile_env, "1") != 0) {
-        fprintf(stderr, "%s: error: IK_LLAMA_F5A_PROFILE_WINDOWS accepts only the value 1\n", __func__);
-        return 2;
-    }
-#ifndef GGML_USE_CUDA
-    if (f5a_profile_windows) {
-        fprintf(stderr, "%s: error: IK_LLAMA_F5A_PROFILE_WINDOWS requires a CUDA build\n", __func__);
-        return 2;
-    }
-#endif
-    const char * f5a_phase_env = std::getenv("IK_LLAMA_F5A_PHASE_PROFILE");
-    const bool f5a_phase_profile = f5a_phase_env != nullptr;
-    if (f5a_phase_profile && (std::strcmp(f5a_phase_env, "1") != 0 || !use_moe_prototype || !f5a_profile_windows)) {
-        fprintf(stderr, "%s: error: IK_LLAMA_F5A_PHASE_PROFILE requires value 1, prototype mode and bounded profile windows\n", __func__);
-        return 2;
-    }
-#ifndef GGML_USE_CUDA
-    if (f5a_phase_profile) {
-        fprintf(stderr, "%s: error: IK_LLAMA_F5A_PHASE_PROFILE requires a CUDA build\n", __func__);
-        return 2;
-    }
-#endif
 
     const bool use_text = !params.prompt_file.empty() && !params.prompt_is_binary;
     if (use_text && params.prompt.empty()) {
@@ -439,76 +186,11 @@ int main(int argc, char ** argv) {
     }
 
     llama_context_params ctx_params = common_context_params_to_llama(params);
-    if (use_moe_prototype && ctx_params.n_threads <= 0) {
-        fprintf(stderr, "%s: error: prototype CPU resource requires a positive context thread count\n", __func__);
-        llama_free_model(model);
-        llama_backend_free();
-        return 2;
-    }
-
-    llama_moe_ffn_prototype_lifecycle prototype_lifecycle{};
-    llama_moe_ffn_prototype_config prototype_config{};
-    prototype_config.all_devices = true;
-    prototype_config.cpu_threads = ctx_params.n_threads;
-    prototype_config.lifecycle = &prototype_lifecycle;
-
-    llama_context * ctx = use_moe_prototype
-        ? llama_init_from_model_with_moe_ffn_prototype(model, ctx_params, prototype_config)
-        : llama_init_from_model(model, ctx_params);
+    llama_context * ctx = llama_init_from_model(model, ctx_params);
 
     if (ctx == NULL) {
         fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
         return 1;
-    }
-
-    if (use_moe_prototype) {
-        int visible_devices = 0;
-#ifdef GGML_USE_CUDA
-        visible_devices = ggml_backend_cuda_get_device_count();
-#endif
-        const auto * prototype = ctx->moe_ffn_prototype.get();
-        bool valid = prototype && prototype->valid() && !prototype->devices.empty() && visible_devices > 0;
-        std::unordered_set<int32_t> owned_devices;
-        size_t groups = 0;
-        size_t bindings = 0;
-        if (prototype) {
-            for (const auto & device : prototype->devices) {
-                const bool device_owned = device.cuda_backend && device.cpu_resource_id > 0 &&
-                        device.device >= 0 && device.device < visible_devices &&
-                        owned_devices.insert(device.device).second && !device.groups.empty() &&
-                        !device.layer_bindings.empty();
-                valid = valid && device_owned;
-                groups += device.groups.size();
-                bindings += device.layer_bindings.size();
-                for (const auto & group : device.groups) {
-                    valid = valid && group.lease && group.snapshot.owner_backend == device.cuda_backend &&
-                            group.snapshot.device_group == device.device;
-                }
-                for (const auto & layer : device.layer_bindings) {
-                    valid = valid && layer.cuda_backend == device.cuda_backend &&
-                            layer.cpu_resource_id == device.cpu_resource_id &&
-                            layer.snapshot.owner_backend == device.cuda_backend &&
-                            layer.snapshot.device_group == device.device;
-                }
-            }
-        }
-        if (!valid || groups == 0 || bindings == 0 || bindings != prototype->layer_count()) {
-            fprintf(stderr, "%s: error: prototype failed discovered device/group/binding ownership validation\n", __func__);
-            llama_free(ctx);
-            llama_free_model(model);
-            llama_backend_free();
-            return 1;
-        }
-        LOG_TEE("f4c_prototype_activation enabled=1 visible_cuda_devices=%d owned_devices=%zu groups=%zu compatible_layers=%zu cpu_threads_per_device=%d seed_experts=0\n",
-                visible_devices, prototype->devices.size(), groups, bindings, prototype_config.cpu_threads);
-    } else if (ctx->moe_ffn_prototype) {
-        fprintf(stderr, "%s: error: ordinary context unexpectedly created prototype state\n", __func__);
-        llama_free(ctx);
-        llama_free_model(model);
-        llama_backend_free();
-        return 1;
-    } else {
-        LOG_TEE("f4c_prototype_activation enabled=0 mode=ordinary blocking-cache-path=1 prototype_resources=0\n");
     }
 
     const bool use_checkpoint = common_speculative_needs_checkpoint(model);
@@ -627,15 +309,6 @@ int main(int argc, char ** argv) {
 
     int i_loop = 0;
     std::vector<uint8_t> checkpoint_data;
-    std::vector<f5a_stats_checkpoint> f5a_checkpoints_data;
-    if (f5a_checkpoints) {
-        f5a_stats_checkpoint initial{};
-        if (!collect_f5a_stats(ctx, UINT32_MAX, initial)) {
-            LOG_TEE("f5a_counter_checkpoint error=initial_snapshot\n");
-            return 1;
-        }
-        f5a_checkpoints_data.push_back(std::move(initial));
-    }
 
     for (unsigned int n_kv = 0; n_kv < n_kv_max; n_kv += params.n_ubatch) {
         // clean up KV cache before generation
@@ -659,7 +332,6 @@ int main(int argc, char ** argv) {
         // first measure token generation performance at this context size
         int64_t t_tg_start = 0;
         int64_t t_tg_end   = 0;
-        const bool f5a_profile_this_row = f5a_profile_windows && (n_kv == 0 || n_kv == 24576);
 
         if (measure) {
             t_tg_start = ggml_time_us();
@@ -675,18 +347,6 @@ int main(int argc, char ** argv) {
                     llama_kv_cache_seq_rm(ctx, 0, n_kv, -1);
                 }
 
-#ifdef GGML_USE_CUDA
-                if (f5a_phase_profile && f5a_profile_this_row && irep == 0 &&
-                        !set_f5a_phase_profile(ctx, true, n_kv)) {
-                    LOG_TEE("f5a_phase_profile error=enable n_kv=%u\n", n_kv);
-                    return 1;
-                }
-                if (f5a_profile_this_row && irep == 0 && cudaProfilerStart() != cudaSuccess) {
-                    LOG_TEE("f5a_profile error=start n_kv=%u\n", n_kv);
-                    return 1;
-                }
-#endif
-
                 for (unsigned int i = 0; i < tg; ++i) {
                     common_batch_clear(batch);
                     common_batch_add(batch, use_text ? text[(n_kv + i) % text.size()] : std::rand() % n_vocab, n_kv + i, { 0 }, true);
@@ -701,20 +361,6 @@ int main(int argc, char ** argv) {
             //fprintf(stderr, "======================================== tg_end for n_kv = %u\n", n_kv);
             //printf("======================================== tg_end for n_kv = %u\n", n_kv);
             t_tg_end = ggml_time_us();
-#ifdef GGML_USE_CUDA
-            if (f5a_profile_this_row) {
-                const cudaError_t profile_status = cudaProfilerStop();
-                if (profile_status != cudaSuccess) {
-                    LOG_TEE("f5a_profile error=stop n_kv=%u cuda_error=%s\n", n_kv, cudaGetErrorString(profile_status));
-                    return 1;
-                }
-                if (f5a_phase_profile && !set_f5a_phase_profile(ctx, false, n_kv)) {
-                    LOG_TEE("f5a_phase_profile error=disable n_kv=%u\n", n_kv);
-                    return 1;
-                }
-                LOG_TEE("f5a_profile_window_complete n_kv=%u tg_tokens=%u\n", n_kv, tg);
-            }
-#endif
         } else {
             // keep the token stream aligned with a stride-1 sweep
             for (unsigned int i = 0; i < tg; ++i) {
@@ -814,48 +460,15 @@ int main(int argc, char ** argv) {
             }
         }
 
-        // Read counters only after the measured TG and PP intervals have ended.
-        if (f5a_checkpoints && ((n_kv + pp) % (8 * pp) == 0 || n_kv + pp == n_kv_max)) {
-            f5a_stats_checkpoint checkpoint{};
-            if (!collect_f5a_stats(ctx, n_kv, checkpoint)) {
-                LOG_TEE("f5a_counter_checkpoint error=snapshot n_kv=%u\n", n_kv);
-                return 1;
-            }
-            f5a_checkpoints_data.push_back(std::move(checkpoint));
-        }
-
         ++i_loop;
-    }
-
-    if (f5a_checkpoints && !report_f5a_checkpoint_deltas(f5a_checkpoints_data)) {
-        LOG_TEE("f5a_counter_checkpoint error=report\n");
-        return 1;
     }
 
     llama_print_timings(ctx);
 
     llama_batch_free(batch);
 
-    const bool prototype_stats_ok = report_moe_prototype_stats(ctx, use_moe_prototype);
-#ifdef GGML_USE_CUDA
-    const bool phase_stats_ok = !f5a_phase_profile || report_f5a_phase_samples(ctx);
-#else
-    const bool phase_stats_ok = true;
-#endif
-
     llama_free(ctx);
     llama_free_model(model);
-
-    LOG_TEE("f4c_prototype_lifecycle_after_context_free mode=%s leases=%d resources=%d bindings=%d cpu_graphs=%d cpu_graph_context_bytes=%zu\n",
-            use_moe_prototype ? "hybrid" : "blocking", prototype_lifecycle.live_leases,
-            prototype_lifecycle.live_cpu_resources, prototype_lifecycle.live_bindings,
-            prototype_lifecycle.live_cpu_graphs, prototype_lifecycle.cpu_graph_context_bytes);
-    if (!prototype_stats_ok || !phase_stats_ok || prototype_lifecycle.live_leases != 0 ||
-            prototype_lifecycle.live_cpu_resources != 0 || prototype_lifecycle.live_bindings != 0 ||
-            prototype_lifecycle.live_cpu_graphs != 0) {
-        llama_backend_free();
-        return 1;
-    }
 
     llama_backend_free();
 

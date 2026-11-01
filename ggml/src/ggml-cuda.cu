@@ -113,8 +113,6 @@ struct ggml_cuda_moe_ffn_cpu_resource_state {
     bool fill_stopping = false;
     bool transport_stopped = false;
     bool accepting_fills = true;
-    bool test_hold_fill_worker = false;
-    bool test_fail_next_fill_after_part = false;
     uint64_t fills_accepted = 0;
     uint64_t fills_completed = 0;
     uint64_t fills_rejected = 0;
@@ -147,15 +145,7 @@ struct ggml_cuda_moe_ffn_cpu_resource_state {
     uint64_t pin_releases = 0;
     uint64_t pending_pin_releases = 0;
     uint64_t pin_release_failures = 0;
-    bool test_fail_next_dispatch_after_start = false;
     std::atomic<bool> accepting_bindings{true};
-    std::atomic<bool> phase_profile_enabled{false};
-    std::atomic<uint32_t> phase_profile_window{0};
-    std::atomic<uint64_t> phase_operation_sequence{0};
-    std::mutex phase_mutex;
-    ggml_cuda_moe_ffn_phase_sample phase_samples[GGML_CUDA_MOE_FFN_PHASE_SAMPLE_CAPACITY]{};
-    size_t phase_sample_count = 0;
-    uint64_t phase_samples_dropped = 0;
     pending_pin_record pending_pins{};
     std::vector<ggml_cuda_moe_ffn_pin_token> resolved_pins;
     std::vector<int32_t> fill_candidates;
@@ -177,31 +167,6 @@ struct ggml_cuda_moe_ffn_cpu_resource_state {
         if (host_stage) cudaFreeHost(host_stage);
         cudaSetDevice(previous_device);
         if (resource.cpu_backend) ggml_backend_free(resource.cpu_backend);
-    }
-};
-
-static void ggml_cuda_moe_ffn_record_phase_sample(
-        ggml_cuda_moe_ffn_cpu_resource_state & resource,
-        const ggml_cuda_moe_ffn_phase_sample & sample) {
-    std::lock_guard<std::mutex> lock(resource.phase_mutex);
-    if (resource.phase_sample_count >= GGML_CUDA_MOE_FFN_PHASE_SAMPLE_CAPACITY) {
-        ++resource.phase_samples_dropped;
-        return;
-    }
-    resource.phase_samples[resource.phase_sample_count++] = sample;
-}
-
-struct ggml_cuda_moe_ffn_phase_scope {
-    ggml_cuda_moe_ffn_cpu_resource_state * resource = nullptr;
-    ggml_cuda_moe_ffn_phase_sample sample{};
-    bool active = false;
-    std::chrono::steady_clock::time_point start{};
-
-    ~ggml_cuda_moe_ffn_phase_scope() {
-        if (!active || !resource) return;
-        sample.ns[7] = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start).count();
-        ggml_cuda_moe_ffn_record_phase_sample(*resource, sample);
     }
 };
 
@@ -347,13 +312,7 @@ static bool ggml_cuda_moe_ffn_validate_fill_job(const ggml_cuda_moe_ffn_binding 
 
 static int ggml_cuda_moe_ffn_copy_fill_request(
         ggml_cuda_moe_ffn_cpu_resource_state & resource,
-        const ggml_cuda_moe_ffn_cpu_resource_state::fill_request & request, bool fail_after_first_part) {
-    const bool profile = resource.phase_profile_enabled.load(std::memory_order_relaxed);
-    ggml_cuda_moe_ffn_phase_sample phase{};
-    phase.kind = 1;
-    phase.device = resource.device;
-    phase.window_n_kv = resource.phase_profile_window.load(std::memory_order_relaxed);
-    auto phase_start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const ggml_cuda_moe_ffn_cpu_resource_state::fill_request & request) {
     const auto & job = request.owner_job;
     if (!request.callbacks || !request.callbacks->finish_fill || !request.cache_context) return 0;
     auto rollback = [&]() { return request.callbacks->finish_fill(request.cache_context, &job, false) ? 1 : 0; };
@@ -384,43 +343,22 @@ static int ggml_cuda_moe_ffn_copy_fill_request(
             copied = false;
             break;
         }
-        if (fail_after_first_part && i == 0) {
-            copied = false;
-            break;
-        }
-    }
-    if (profile) {
-        const auto submitted = std::chrono::steady_clock::now();
-        phase.ns[0] = std::chrono::duration_cast<std::chrono::nanoseconds>(submitted - phase_start).count();
-        phase_start = submitted;
     }
     const cudaError_t drained = cudaStreamSynchronize(resource.fill_stream);
-    if (profile) {
-        const auto synchronized = std::chrono::steady_clock::now();
-        phase.ns[1] = std::chrono::duration_cast<std::chrono::nanoseconds>(synchronized - phase_start).count();
-        phase_start = synchronized;
-    }
     if (drained != cudaSuccess) {
-        if (profile) ggml_cuda_moe_ffn_record_phase_sample(resource, phase);
         return 0;
     }
     if (!request.callbacks->finish_fill(request.cache_context, &job, copied)) return 0;
-    if (profile) {
-        phase.ns[2] = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - phase_start).count();
-        ggml_cuda_moe_ffn_record_phase_sample(resource, phase);
-    }
     return copied ? 2 : 1;
 }
 
 static void ggml_cuda_moe_ffn_fill_worker(ggml_cuda_moe_ffn_cpu_resource_state * resource) {
     for (;;) {
         ggml_cuda_moe_ffn_cpu_resource_state::fill_request request{};
-        bool fail_after_first_part = false;
         {
             std::unique_lock<std::mutex> lock(resource->fill_mutex);
             resource->fill_cv.wait(lock, [&]() {
-                return resource->fill_stopping || (resource->fill_queued && !resource->test_hold_fill_worker);
+                return resource->fill_stopping || resource->fill_queued;
             });
             if (!resource->fill_queued) {
                 if (resource->fill_stopping) return;
@@ -430,11 +368,9 @@ static void ggml_cuda_moe_ffn_fill_worker(ggml_cuda_moe_ffn_cpu_resource_state *
             resource->queued_fill = {};
             resource->fill_queued = false;
             resource->fill_active = true;
-            fail_after_first_part = resource->test_fail_next_fill_after_part;
-            resource->test_fail_next_fill_after_part = false;
         }
 
-        const int result = ggml_cuda_moe_ffn_copy_fill_request(*resource, request, fail_after_first_part);
+        const int result = ggml_cuda_moe_ffn_copy_fill_request(*resource, request);
         {
             std::lock_guard<std::mutex> lock(resource->fill_mutex);
             resource->fill_active = false;
@@ -4497,21 +4433,7 @@ static bool ggml_cuda_moe_ffn_compute(ggml_backend_cuda_context & ctx, ggml_tens
     auto state = ggml_cuda_moe_ffn_lookup(ctx, params.binding_id, params.generation);
     if (!state) return false;
     auto & resource = *state->cpu_resource;
-    const bool phase_candidate = resource.phase_profile_enabled.load(std::memory_order_relaxed) &&
-            resource.phase_operation_sequence.fetch_add(1, std::memory_order_relaxed) % 8 == 0;
-    const auto phase_lock_start = phase_candidate ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::unique_lock<std::mutex> request_lock(resource.execution_mutex);
-    ggml_cuda_moe_ffn_phase_scope phase_scope{};
-    phase_scope.resource = &resource;
-    phase_scope.active = phase_candidate;
-    phase_scope.start = phase_lock_start;
-    if (phase_candidate) {
-        phase_scope.sample.kind = 0;
-        phase_scope.sample.device = ctx.device;
-        phase_scope.sample.window_n_kv = resource.phase_profile_window.load(std::memory_order_relaxed);
-        phase_scope.sample.ns[0] = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - phase_lock_start).count();
-    }
     auto & b = state->binding;
     auto & stats = state->stats;
     if (!state->active || !ggml_cuda_moe_ffn_shape_matches(ctx, op, params, b)) return false;
@@ -4523,7 +4445,6 @@ static bool ggml_cuda_moe_ffn_compute(ggml_backend_cuda_context & ctx, ggml_tens
     const size_t route_bytes = size_t(b.layout.n_experts_used) * sizeof(float);
     const size_t output_bytes = size_t(b.layout.n_embd) * sizeof(float);
 
-    auto phase_mark = phase_candidate ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (cudaMemcpyAsync(resource.host_ids, op->src[1]->data, ids_bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
         ++stats.rejected_calls;
         return false;
@@ -4535,11 +4456,6 @@ static bool ggml_cuda_moe_ffn_compute(ggml_backend_cuda_context & ctx, ggml_tens
         return false;
     }
     ++stats.synchronizations;
-    if (phase_candidate) {
-        const auto phase_end = std::chrono::steady_clock::now();
-        phase_scope.sample.ns[1] = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_end - phase_mark).count();
-        phase_mark = phase_end;
-    }
 
     if (!ggml_cuda_moe_ffn_release_pending_pins(resource)) {
         ++stats.rejected_calls;
@@ -4607,11 +4523,6 @@ static bool ggml_cuda_moe_ffn_compute(ggml_backend_cuda_context & ctx, ggml_tens
     for (int32_t i = 0; i < n_fill_candidates; ++i) {
         ggml_cuda_moe_ffn_enqueue_fill(resource, b, params.binding_id, resource.fill_candidates[i]);
     }
-    if (phase_candidate) {
-        const auto phase_end = std::chrono::steady_clock::now();
-        phase_scope.sample.ns[2] = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_end - phase_mark).count();
-        phase_mark = phase_end;
-    }
     bool cpu_inputs_ready = false;
     const auto read_cpu_inputs = [&]() {
         if (cudaMemcpyAsync(resource.host_activations, op->src[0]->data, activation_bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
@@ -4632,11 +4543,6 @@ static bool ggml_cuda_moe_ffn_compute(ggml_backend_cuda_context & ctx, ggml_tens
         ++stats.rejected_calls;
         return false;
     }
-    if (phase_candidate && n_misses > 0) {
-        const auto phase_end = std::chrono::steady_clock::now();
-        phase_scope.sample.ns[3] = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_end - phase_mark).count();
-        phase_mark = phase_end;
-    }
     if (n_misses > 0) {
         int32_t packed_hits = 0;
         for (int32_t i = 0; i < b.layout.n_experts_used; ++i) {
@@ -4652,42 +4558,24 @@ static bool ggml_cuda_moe_ffn_compute(ggml_backend_cuda_context & ctx, ggml_tens
 
     if (n_misses == 0) {
         ++stats.all_hit_calls;
-        phase_scope.sample.call_kind = 1;
     } else {
         ++stats.any_miss_calls;
-        phase_scope.sample.call_kind = 2;
     }
-    phase_scope.sample.miss_rows = n_misses;
     stats.gpu_hit_draws += n_hits;
     stats.cpu_miss_draws += n_misses;
 
     const auto complete_cpu_fallback = [&]() {
         if (!cpu_inputs_ready) {
-            const auto input_start = phase_candidate ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (!read_cpu_inputs()) return false;
-            if (phase_candidate) {
-                phase_scope.sample.ns[3] += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - input_start).count();
-            }
         }
         ++stats.complete_cpu_fallback_calls;
         ++stats.cpu_calls;
-        const auto cpu_start = phase_candidate ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (!ggml_cuda_moe_ffn_cpu_draws(b, resource, stats, false, activation_bytes)) return false;
-        if (phase_candidate) {
-            phase_scope.sample.ns[5] += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - cpu_start).count();
-        }
-        const auto commit_start = phase_candidate ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (cudaMemcpyAsync(op->data, resource.host_output, output_bytes,
                     cudaMemcpyHostToDevice, stream) != cudaSuccess) return false;
         ++stats.cuda_copy_calls;
         stats.output_copy_bytes += output_bytes;
         ++stats.output_commits;
-        if (phase_candidate) {
-            phase_scope.sample.ns[6] += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - commit_start).count();
-        }
         return true;
     };
 
@@ -4698,20 +4586,10 @@ static bool ggml_cuda_moe_ffn_compute(ggml_backend_cuda_context & ctx, ggml_tens
     }
 
     bool kernels_started = false;
-    if (phase_candidate) phase_mark = std::chrono::steady_clock::now();
     bool dispatch_ok = ggml_cuda_moe_ffn_enqueue_hit_rows(ctx, op, b, resource, stats, n_hits,
             n_misses > 0, kernels_started);
-    if (phase_candidate) {
-        const auto phase_end = std::chrono::steady_clock::now();
-        phase_scope.sample.ns[4] = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_end - phase_mark).count();
-        phase_mark = phase_end;
-    }
     if (kernels_started) {
         ggml_cuda_moe_ffn_store_pending_pins(resource, b, resolved);
-        if (resource.test_fail_next_dispatch_after_start) {
-            resource.test_fail_next_dispatch_after_start = false;
-            dispatch_ok = false;
-        }
     } else if (!release_current_pins()) {
         GGML_ABORT("failed to release MoE cache pins after pre-dispatch rejection");
     }
@@ -4725,16 +4603,11 @@ static bool ggml_cuda_moe_ffn_compute(ggml_backend_cuda_context & ctx, ggml_tens
     }
 
     if (n_misses == 0) {
-        if (phase_candidate) phase_mark = std::chrono::steady_clock::now();
         if (!ggml_cuda_moe_ffn_reduce_commit(ctx, op, b, resource, stats, n_hits, false)) {
             if (cudaStreamSynchronize(stream) != cudaSuccess || !complete_cpu_fallback()) {
                 ++stats.rejected_calls;
                 return false;
             }
-        }
-        if (phase_candidate) {
-            phase_scope.sample.ns[6] += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - phase_mark).count();
         }
         return true;
     }
@@ -4748,12 +4621,7 @@ static bool ggml_cuda_moe_ffn_compute(ggml_backend_cuda_context & ctx, ggml_tens
     if (hit_pending_at_cpu_start) ++stats.gpu_pending_at_cpu_start;
 
     ++stats.cpu_calls;
-    if (phase_candidate) phase_mark = std::chrono::steady_clock::now();
     if (!ggml_cuda_moe_ffn_cpu_draws(b, resource, stats, true, activation_bytes)) {
-        if (phase_candidate) {
-            phase_scope.sample.ns[5] += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - phase_mark).count();
-        }
         if (cudaStreamSynchronize(stream) != cudaSuccess) {
             ++stats.rejected_calls;
             return false;
@@ -4762,16 +4630,10 @@ static bool ggml_cuda_moe_ffn_compute(ggml_backend_cuda_context & ctx, ggml_tens
         if (!complete_cpu_fallback()) { ++stats.rejected_calls; return false; }
         return true;
     }
-    if (phase_candidate) {
-        const auto phase_end = std::chrono::steady_clock::now();
-        phase_scope.sample.ns[5] += std::chrono::duration_cast<std::chrono::nanoseconds>(phase_end - phase_mark).count();
-        phase_mark = phase_end;
-    }
     if (hit_pending_at_cpu_start && cudaEventQuery(resource.hit_kernels_done) == cudaSuccess) {
         ++stats.gpu_completed_during_cpu;
     }
     ++stats.partitioned_calls;
-    if (phase_candidate) phase_mark = std::chrono::steady_clock::now();
     if (!ggml_cuda_moe_ffn_reduce_commit(ctx, op, b, resource, stats, n_hits, true)) {
         if (cudaStreamSynchronize(stream) != cudaSuccess) {
             ++stats.rejected_calls;
@@ -4779,10 +4641,6 @@ static bool ggml_cuda_moe_ffn_compute(ggml_backend_cuda_context & ctx, ggml_tens
         }
         --stats.cpu_calls;
         if (!complete_cpu_fallback()) { ++stats.rejected_calls; return false; }
-    }
-    if (phase_candidate) {
-        phase_scope.sample.ns[6] += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - phase_mark).count();
     }
     return true;
 }
@@ -6918,7 +6776,6 @@ static bool ggml_cuda_moe_ffn_stop_transport(ggml_backend_cuda_context * ctx,
         std::lock_guard<std::mutex> lock(state.fill_mutex);
         state.accepting_fills = false;
         state.fill_stopping = true;
-        state.test_hold_fill_worker = false;
     }
     state.fill_cv.notify_all();
     if (state.fill_worker.joinable()) state.fill_worker.join();
@@ -6961,62 +6818,6 @@ GGML_CALL bool ggml_backend_cuda_moe_ffn_cpu_resource_stop(ggml_backend_t backen
         state = it->second;
     }
     return ggml_cuda_moe_ffn_stop_transport(ctx, *state);
-}
-
-GGML_CALL bool ggml_backend_cuda_moe_ffn_test_hold_fill_worker(ggml_backend_t backend,
-        int32_t resource_id, bool hold) {
-    if (!ggml_backend_is_cuda(backend) || resource_id <= 0) return false;
-    auto * ctx = (ggml_backend_cuda_context *) backend->context;
-    std::shared_ptr<ggml_cuda_moe_ffn_cpu_resource_state> state;
-    {
-        std::lock_guard<std::mutex> lock(ctx->moe_ffn_mutex);
-        auto it = ctx->moe_ffn_cpu_resources.find(resource_id);
-        if (it == ctx->moe_ffn_cpu_resources.end()) return false;
-        state = it->second;
-    }
-    {
-        std::lock_guard<std::mutex> lock(state->fill_mutex);
-        if (state->fill_stopping || state->transport_stopped) return false;
-        state->test_hold_fill_worker = hold;
-    }
-    state->fill_cv.notify_all();
-    return true;
-}
-
-GGML_CALL bool ggml_backend_cuda_moe_ffn_test_fail_next_fill_after_part(
-        ggml_backend_t backend, int32_t resource_id) {
-    if (!ggml_backend_is_cuda(backend) || resource_id <= 0) return false;
-    auto * ctx = (ggml_backend_cuda_context *) backend->context;
-    std::shared_ptr<ggml_cuda_moe_ffn_cpu_resource_state> state;
-    {
-        std::lock_guard<std::mutex> lock(ctx->moe_ffn_mutex);
-        auto it = ctx->moe_ffn_cpu_resources.find(resource_id);
-        if (it == ctx->moe_ffn_cpu_resources.end()) return false;
-        state = it->second;
-    }
-    std::lock_guard<std::mutex> lock(state->fill_mutex);
-    if (state->fill_stopping || state->transport_stopped || state->fill_outstanding ||
-            state->test_fail_next_fill_after_part) return false;
-    state->test_fail_next_fill_after_part = true;
-    return true;
-}
-
-GGML_CALL bool ggml_backend_cuda_moe_ffn_test_wait_fill_idle(ggml_backend_t backend,
-        int32_t resource_id, uint32_t timeout_ms) {
-    if (!ggml_backend_is_cuda(backend) || resource_id <= 0) return false;
-    auto * ctx = (ggml_backend_cuda_context *) backend->context;
-    std::shared_ptr<ggml_cuda_moe_ffn_cpu_resource_state> state;
-    {
-        std::lock_guard<std::mutex> lock(ctx->moe_ffn_mutex);
-        auto it = ctx->moe_ffn_cpu_resources.find(resource_id);
-        if (it == ctx->moe_ffn_cpu_resources.end()) return false;
-        state = it->second;
-    }
-    std::unique_lock<std::mutex> lock(state->fill_mutex);
-    if (!state->fill_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&]() {
-                return !state->fill_outstanding || state->fill_stuck;
-            })) return false;
-    return !state->fill_outstanding && !state->fill_stuck;
 }
 
 GGML_CALL bool ggml_backend_cuda_moe_ffn_cpu_resource_unregister(ggml_backend_t backend, int32_t resource_id) {
@@ -7085,63 +6886,6 @@ GGML_CALL bool ggml_backend_cuda_moe_ffn_cpu_resource_get_stats(ggml_backend_t b
         stats->fill_parts_completed = state->fill_parts_completed;
         stats->fill_bytes_completed = state->fill_bytes_completed;
     }
-    return true;
-}
-
-GGML_CALL bool ggml_backend_cuda_moe_ffn_set_phase_profile(ggml_backend_t backend,
-        int32_t resource_id, bool enabled, uint32_t window_n_kv) {
-    if (!ggml_backend_is_cuda(backend) || resource_id <= 0) return false;
-    auto * ctx = (ggml_backend_cuda_context *) backend->context;
-    std::shared_ptr<ggml_cuda_moe_ffn_cpu_resource_state> state;
-    {
-        std::lock_guard<std::mutex> lock(ctx->moe_ffn_mutex);
-        auto it = ctx->moe_ffn_cpu_resources.find(resource_id);
-        if (it == ctx->moe_ffn_cpu_resources.end()) return false;
-        state = it->second;
-    }
-    state->phase_profile_window.store(window_n_kv, std::memory_order_relaxed);
-    state->phase_profile_enabled.store(enabled, std::memory_order_release);
-    return true;
-}
-
-GGML_CALL bool ggml_backend_cuda_moe_ffn_get_phase_samples(ggml_backend_t backend,
-        int32_t resource_id, ggml_cuda_moe_ffn_phase_sample * samples, size_t capacity,
-        size_t * count, uint64_t * dropped, bool clear) {
-    if (!ggml_backend_is_cuda(backend) || resource_id <= 0 || !count || !dropped ||
-            (capacity != 0 && !samples)) return false;
-    auto * ctx = (ggml_backend_cuda_context *) backend->context;
-    std::shared_ptr<ggml_cuda_moe_ffn_cpu_resource_state> state;
-    {
-        std::lock_guard<std::mutex> lock(ctx->moe_ffn_mutex);
-        auto it = ctx->moe_ffn_cpu_resources.find(resource_id);
-        if (it == ctx->moe_ffn_cpu_resources.end()) return false;
-        state = it->second;
-    }
-    std::lock_guard<std::mutex> lock(state->phase_mutex);
-    *count = std::min(capacity, state->phase_sample_count);
-    *dropped = state->phase_samples_dropped;
-    if (*count > 0) std::memcpy(samples, state->phase_samples, *count * sizeof(*samples));
-    if (clear) {
-        state->phase_sample_count = 0;
-        state->phase_samples_dropped = 0;
-    }
-    return true;
-}
-
-GGML_CALL bool ggml_backend_cuda_moe_ffn_test_fail_next_dispatch_after_start(
-        ggml_backend_t backend, int32_t binding_id) {
-    if (!ggml_backend_is_cuda(backend) || binding_id <= 0) return false;
-    auto * ctx = (ggml_backend_cuda_context *) backend->context;
-    std::shared_ptr<ggml_cuda_moe_ffn_binding_state> state;
-    {
-        std::lock_guard<std::mutex> lock(ctx->moe_ffn_mutex);
-        auto it = ctx->moe_ffn_bindings.find(binding_id);
-        if (it == ctx->moe_ffn_bindings.end()) return false;
-        state = it->second;
-    }
-    std::lock_guard<std::mutex> request_lock(state->cpu_resource->execution_mutex);
-    if (!state->active || state->cpu_resource->test_fail_next_dispatch_after_start) return false;
-    state->cpu_resource->test_fail_next_dispatch_after_start = true;
     return true;
 }
 
