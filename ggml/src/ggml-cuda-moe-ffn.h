@@ -8,8 +8,7 @@ typedef struct ggml_cuda_moe_ffn_fill_part {
     const void * source;
     void * destination;
     size_t bytes;
-    // A merged up+gate parent is one physical payload, but the loader may
-    // store its two logical views in separate expert planes.
+    // A merged up+gate could store two logical views in separate expert planes
     const void * source2;
     void * destination2;
     size_t bytes2;
@@ -74,7 +73,6 @@ typedef struct ggml_cuda_moe_ffn_resource_signature {
 
 typedef struct ggml_cuda_moe_ffn_cpu_resource {
     ggml_backend_t cpu_backend; // ownership transfers on successful registration
-    // Scratch-capacity envelope covering the explicitly registered signatures.
     int32_t n_embd;
     int32_t n_ff;
     int32_t n_experts_used;
@@ -84,21 +82,12 @@ typedef struct ggml_cuda_moe_ffn_cpu_resource {
 } ggml_cuda_moe_ffn_cpu_resource;
 
 typedef struct ggml_cuda_moe_ffn_cpu_resource_stats {
-    uint64_t cpu_calls;
-    uint64_t max_parallel_calls;
     uint64_t active_bindings;
-    uint64_t pin_resolve_calls;
-    uint64_t pin_acquisitions;
-    uint64_t pin_releases;
-    uint64_t pending_pin_releases;
-    uint64_t pin_release_failures;
     uint64_t pending_pin_active;
     uint64_t fills_accepted;
     uint64_t fills_completed;
-    uint64_t fills_rejected;
     uint64_t fills_failed;
     uint64_t fill_outstanding;
-    uint64_t fill_parts_completed;
     uint64_t fill_bytes_completed;
 } ggml_cuda_moe_ffn_cpu_resource_stats;
 
@@ -118,31 +107,10 @@ typedef struct ggml_cuda_moe_ffn_binding {
 typedef struct ggml_cuda_moe_ffn_stats {
     uint64_t all_hit_calls;
     uint64_t any_miss_calls;
-    uint64_t rejected_calls;
-    uint64_t selected_ids;
-    uint64_t id_readback_bytes;
-    uint64_t slot_map_upload_bytes;
-    uint64_t input_copy_bytes;
-    uint64_t output_copy_bytes;
-    uint64_t cuda_copy_calls;
-    uint64_t cpu_copy_calls;
-    uint64_t synchronizations;
-    uint64_t cuda_calls;
-    uint64_t cpu_calls;
-    uint64_t capture_bypasses;
-    uint64_t output_commits;
-    uint64_t full_expert_weight_copy_bytes;
     uint64_t gpu_hit_draws;
     uint64_t cpu_miss_draws;
-    uint64_t cpu_expert_calls;
-    uint64_t gpu_pending_at_cpu_start;
-    uint64_t gpu_completed_during_cpu;
-    uint64_t partitioned_calls;
-    uint64_t complete_cpu_fallback_calls;
 } ggml_cuda_moe_ffn_stats;
 
-// Internal model-free binding. The registered CPU resource owns the CPU backend;
-// each binding borrows it until binding unregister completes.
 GGML_API GGML_CALL bool ggml_backend_cuda_moe_ffn_layout_supported(ggml_backend_t backend,
         const struct ggml_moe_ffn_layout * layout);
 GGML_API GGML_CALL int32_t ggml_backend_cuda_moe_ffn_register(ggml_backend_t backend,

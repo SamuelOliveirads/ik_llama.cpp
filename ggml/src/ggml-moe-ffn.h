@@ -26,8 +26,6 @@ enum ggml_moe_ffn_graph_flag {
     GGML_MOE_FFN_GRAPH_NO_HADAMARD = 1u << 5,
 };
 
-// Immutable description of a routed FFN's logical operands and physical storage.
-// Tensor pointers are identities; their metadata is validated by the query.
 struct ggml_moe_ffn_layout {
     int32_t n_experts, n_experts_used, n_embd, n_ff, n_slots;
     int32_t device, cache_group, cache_layer;
@@ -44,9 +42,6 @@ struct ggml_moe_ffn_layout {
     uint32_t graph_flags;
 };
 
-// Router-side inputs are deliberately absent from this predicate: the semantic
-// op receives completed selected IDs and final route weights. Only values that
-// alter expert arithmetic or its representation belong here.
 static inline bool ggml_moe_ffn_expert_execution_inputs_supported(
         const struct ggml_tensor * up_bias, const struct ggml_tensor * gate_bias,
         const struct ggml_tensor * down_bias, const struct ggml_tensor * merged_up_gate_bias,
@@ -77,8 +72,7 @@ static inline bool ggml_moe_ffn_tensor_layout(const struct ggml_tensor * tensor,
         return false;
     }
 
-    // The executor addresses experts with nb[2], so each slice must be exactly
-    // its packed row extent: no inter-row padding, inter-expert padding or aliasing.
+    // The executor addresses experts with nb[2], so each slice must be exactly its packed row extent
     return tensor->nb[1] == row_bytes && tensor->nb[2] == expert_bytes &&
         tensor->nb[3] == expert_bytes * (size_t) ne2 && ggml_is_contiguous(tensor);
 }
@@ -122,10 +116,8 @@ static inline bool ggml_moe_ffn_merged_views_match(const struct ggml_tensor * up
     const size_t gate_offset = gate->view_offs - parent->view_offs;
     expected_up_offset = part_bytes;
     const size_t parent_extent = parent_bytes * (size_t) parent->ne[2];
-    // Native merged tensors expose per-expert interleaved views. The model
-    // loader's merge flag instead creates a single parent with gate and up
-    // stored as full expert planes. Both are safe if their complete ranges fit
-    // inside the one physical parent and do not overlap.
+    // Native merged tensors expose per-expert interleaved views. The model loader's
+    // merge flag instead creates a single parent tensor. Both layouts are supported.
     const bool interleaved = gate_offset == 0 && up_offset == expected_up_offset &&
         up->nb[2] == parent->nb[2] && gate->nb[2] == parent->nb[2];
     const bool expert_planes = gate_offset == 0 &&
