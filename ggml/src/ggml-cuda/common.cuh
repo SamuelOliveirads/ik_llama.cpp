@@ -69,6 +69,11 @@
 #endif
 
 #define GGML_CUDA_MAX_STREAMS 8
+constexpr int32_t GGML_CUDA_STREAM_COMPUTE = 0;
+constexpr int32_t GGML_CUDA_STREAM_MOE_FILL = 1;
+static_assert(GGML_CUDA_STREAM_MOE_FILL > GGML_CUDA_STREAM_COMPUTE &&
+        GGML_CUDA_STREAM_MOE_FILL < GGML_CUDA_MAX_STREAMS,
+        "MoE fill transport requires a reserved non-compute CUDA stream");
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
@@ -966,7 +971,13 @@ struct ggml_backend_cuda_context {
     }
 
     cudaStream_t stream() {
-        return stream(device, 0);
+        return stream(device, GGML_CUDA_STREAM_COMPUTE);
+    }
+
+    // Stream 0 is ordinary backend compute; MoE fill publication uses a
+    // separate non-blocking transport stream so cache copies do not own it.
+    cudaStream_t moe_fill_stream() {
+        return stream(device, GGML_CUDA_STREAM_MOE_FILL);
     }
 
     cublasHandle_t cublas_handle(int device) {

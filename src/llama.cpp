@@ -25,7 +25,7 @@
 #include "llama-hparams.h"
 #include "llama-context.h"
 #include "llama-moe-cache.h"
-#include "llama-moe-ffn-prototype.h"
+#include "llama-moe-cache-ffn.h"
 #include "llama-spec-features.h"
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
@@ -910,9 +910,9 @@ llama_context::~llama_context() {
     free_dflash_kv_cache_tensors();
     free_dsv4_cache_tensors();
     ggml_backend_sched_free(sched);
-    if (moe_ffn_prototype) {
-        moe_ffn_prototype->shutdown();
-        moe_ffn_prototype.reset();
+    if (moe_cache_ffn) {
+        moe_cache_ffn->shutdown();
+        moe_cache_ffn.reset();
     }
     moe_cache.reset();
 
@@ -8992,6 +8992,7 @@ struct llama_context_params llama_context_default_params() {
         /*.dflash_query_capacity       =*/ 0,
         /*.cpu_affinity                =*/ nullptr,
         /*.n_cpu_affinity              =*/ 0,
+        /*.moe_cache_async             =*/ false,
     };
 
     return result;
@@ -9325,13 +9326,23 @@ static void llama_repack_up_gate_exps(llama_context & lctx) {
 
 static struct llama_context * llama_init_from_model_internal(
                  struct llama_model * model,
-        struct llama_context_params   params,
-        const llama_moe_ffn_prototype_config * prototype_config) {
+        struct llama_context_params   params) {
 
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
     }
+
+    if (params.moe_cache_async && params.moe_cache_size == 0) {
+        LLAMA_LOG_ERROR("%s: --moe-cache-async requires a nonzero --moe-cache-mib budget\n", __func__);
+        return nullptr;
+    }
+#ifndef GGML_USE_CUDA
+    if (params.moe_cache_async) {
+        LLAMA_LOG_ERROR("%s: --moe-cache-async requires a CUDA-enabled build\n", __func__);
+        return nullptr;
+    }
+#endif
 
     if (params.moe_cache_size > 0) {
         if (model->fit) {
@@ -10075,17 +10086,15 @@ static struct llama_context * llama_init_from_model_internal(
                 }
             }
 
-            if (prototype_config) {
-                if (!ctx->moe_cache || (!prototype_config->all_devices &&
-                        (prototype_config->layer < 0 ||
-                         (size_t) prototype_config->layer >= model->layers.size()))) {
-                    LLAMA_LOG_ERROR("%s: MoE FFN prototype requires a valid cache-group anchor layer\n", __func__);
+            if (params.moe_cache_async) {
+                if (!ctx->moe_cache) {
+                    LLAMA_LOG_ERROR("%s: --moe-cache-async requires the MoE cache\n", __func__);
                     llama_free(ctx);
                     return nullptr;
                 }
-                ctx->moe_ffn_prototype = std::make_unique<llama_moe_ffn_prototype_state>();
-                if (!ctx->moe_ffn_prototype->initialize(*ctx->moe_cache, *model, *prototype_config)) {
-                    LLAMA_LOG_ERROR("%s: failed to initialize the internal MoE FFN prototype\n", __func__);
+                ctx->moe_cache_ffn = std::make_unique<llama_moe_cache_ffn_state>();
+                if (!ctx->moe_cache_ffn->initialize(*ctx->moe_cache, *model, cparams.n_threads)) {
+                    LLAMA_LOG_ERROR("%s: failed to initialize CUDA hybrid MoE FFN execution\n", __func__);
                     llama_free(ctx);
                     return nullptr;
                 }
@@ -10213,12 +10222,7 @@ static struct llama_context * llama_init_from_model_internal(
 }
 
 struct llama_context * llama_init_from_model(struct llama_model * model, struct llama_context_params params) {
-    return llama_init_from_model_internal(model, params, nullptr);
-}
-
-struct llama_context * llama_init_from_model_with_moe_ffn_prototype(struct llama_model * model,
-        struct llama_context_params params, const llama_moe_ffn_prototype_config & config) {
-    return llama_init_from_model_internal(model, params, &config);
+    return llama_init_from_model_internal(model, params);
 }
 
 void llama_free(struct llama_context * ctx) {

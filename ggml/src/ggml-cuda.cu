@@ -76,8 +76,6 @@
 #include <mutex>
 #include <thread>
 
-static constexpr int32_t MOE_CACHE_TRANSPORT_STREAM = 1;
-
 struct ggml_cuda_moe_ffn_cpu_resource_state {
     struct fill_request {
         ggml_cuda_moe_ffn_fill_job owner_job{};
@@ -6740,11 +6738,7 @@ GGML_CALL int32_t ggml_backend_cuda_moe_ffn_cpu_resource_register(ggml_backend_t
         !alloc_device((void **) &state->device_output, output_bytes) ||
         cudaEventCreateWithFlags(&state->hit_kernels_done, cudaEventDisableTiming) != cudaSuccess) return -1;
 
-    if (MOE_CACHE_TRANSPORT_STREAM <= 0 || MOE_CACHE_TRANSPORT_STREAM >= GGML_CUDA_MAX_STREAMS) return -1;
-    if (ctx->streams[ctx->device][MOE_CACHE_TRANSPORT_STREAM] == nullptr &&
-            cudaStreamCreateWithFlags(&ctx->streams[ctx->device][MOE_CACHE_TRANSPORT_STREAM],
-                    cudaStreamNonBlocking) != cudaSuccess) return -1;
-    state->fill_stream = ctx->streams[ctx->device][MOE_CACHE_TRANSPORT_STREAM];
+    state->fill_stream = ctx->moe_fill_stream();
 
     ggml_backend_cpu_set_n_threads(resource->cpu_backend, resource->n_threads);
     state->resource = *resource; // Ownership transfers only after successful warm allocation.

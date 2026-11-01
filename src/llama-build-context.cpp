@@ -3,7 +3,7 @@
 #include "llama-cparams.h"
 #include "llama-model.h"
 #include "llama-context.h"
-#include "llama-moe-ffn-prototype.h"
+#include "llama-moe-cache-ffn.h"
 #include "llama-moe-cache.h"
 #include "llama-delta-net.h"
 
@@ -1717,11 +1717,11 @@ llm_expert_gating_func_type   gating_op,
         ggml_build_forward_expand(graph, weights);
     }
 
-    if (lctx.moe_ffn_prototype) {
-        auto & proto = *lctx.moe_ffn_prototype;
-        const auto * prototype_layer = proto.find_layer(il);
-        if (prototype_layer) {
-            ggml_moe_ffn_layout layout = prototype_layer->layout;
+    if (lctx.moe_cache_ffn) {
+        auto & cache_ffn = *lctx.moe_cache_ffn;
+        const auto * cache_ffn_layer = cache_ffn.find_layer(il);
+        if (cache_ffn_layer) {
+            ggml_moe_ffn_layout layout = cache_ffn_layer->layout;
             layout.n_experts = n_expert > 0 && n_expert <= INT32_MAX ? (int32_t) n_expert : 0;
             layout.n_experts_used = n_expert_used > 0 && n_expert_used <= INT32_MAX ? (int32_t) n_expert_used : 0;
             layout.up = up_exps; layout.gate = gate_exps; layout.down = down_exps;
@@ -1743,9 +1743,9 @@ llm_expert_gating_func_type   gating_op,
                     (!gate_exps || !lctx.model.hadamard_rotation(gate_exps)) &&
                     (!down_exps || !lctx.model.hadamard_rotation(down_exps)))
                 layout.graph_flags |= GGML_MOE_FFN_GRAPH_NO_HADAMARD;
-            ggml_tensor * semantic = proto.build_node(ctx, lctx.sched, layout);
+            ggml_tensor * semantic = cache_ffn.build_node(ctx, lctx.sched, layout);
             if (semantic) {
-                cb(semantic, "moe_ffn_prototype", il);
+                cb(semantic, "moe_cache_ffn", il);
                 return semantic;
             }
         }
