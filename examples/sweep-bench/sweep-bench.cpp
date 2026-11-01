@@ -3,6 +3,7 @@
 #include "common.h"
 #include "speculative.h"
 #include "llama-vocab.h"
+
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -186,6 +187,7 @@ int main(int argc, char ** argv) {
     }
 
     llama_context_params ctx_params = common_context_params_to_llama(params);
+
     llama_context * ctx = llama_init_from_model(model, ctx_params);
 
     if (ctx == NULL) {

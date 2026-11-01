@@ -1160,7 +1160,6 @@ extern "C" {
             struct ggml_tensor  * b);
 
     // Selected-expert FFN contribution: route weights are normalized and reduced into F32 output.
-    // The backend-specific weights are resolved by a context-local binding ID, not graph sources.
     GGML_API struct ggml_tensor * ggml_moe_ffn(
             struct ggml_context * ctx,
             struct ggml_tensor  * activations,

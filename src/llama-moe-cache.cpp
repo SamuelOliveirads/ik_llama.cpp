@@ -77,8 +77,7 @@ struct moe_cache_lru {
     }
 
     uint64_t advance_generation(int32_t s) {
-        // Advance on assignment and on each pin epoch so a replayed release
-        // cannot decrement a later read of the same resident owner.
+        // Assignment and pin epochs reject stale or ABA releases for a reused slot.
         if (++slot_generation[s] == 0) ++slot_generation[s];
         return slot_generation[s];
     }
@@ -671,7 +670,7 @@ struct llama_moe_cache::impl {
     }
 
     bool freeze_group_for_layer(int32_t il, ggml_backend * expected_backend,
-            const std::vector<int32_t> & seed_experts, llama_moe_cache_frozen_layer & out) {
+            llama_moe_cache_frozen_layer & out) {
         std::lock_guard<std::mutex> lock(state_mutex);
         if (il < 0 || (size_t) il >= layers.size() || layers[il].group < 0) return false;
         layer & l = layers[il];
@@ -681,47 +680,11 @@ struct llama_moe_cache::impl {
                 l.host_up == nullptr || l.host_gate == nullptr || l.host_down == nullptr ||
                 l.experts.size() != g.banks.size()) return false;
 
-        const int32_t n_experts = g.lru.n_expert;
-        std::vector<uint8_t> seen(n_experts, 0);
-        size_t n_unique = 0;
-        for (const int32_t expert : seed_experts) {
-            if (expert < 0 || expert >= n_experts) return false;
-            if (!seen[expert]) { seen[expert] = 1; ++n_unique; }
-        }
-        if (n_unique > (size_t) g.n_slots) return false;
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             if (!l.experts[ip] || !l.experts[ip]->data || !g.banks[ip]) return false;
             auto it = bindings.find(l.experts[ip]);
             if (it == bindings.end() || !it->second.cached) return false;
         }
-
-        // This is invocation-local setup state. The ordinary cache uses the
-        // shared fills scratch, but a prior seed plan must never leak into an
-        // empty freeze of another layer in this group.
-        std::vector<moe_cache_lru::fill> seed_fills;
-        if (!seed_experts.empty()) {
-            size_t n_hit = 0;
-            size_t n_eviction = 0;
-            if (!g.lru.plan(il, seed_experts.data(), seed_experts.size(), seed_fills, n_hit, n_eviction)) return false;
-        }
-        size_t seed_bytes = 0;
-        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
-            const ggml_tensor * weights = l.experts[ip];
-            ggml_tensor * bank = g.banks[ip];
-            const size_t expert_size = weights->nb[2];
-            for (size_t i = 0; i < seed_fills.size();) {
-                size_t n = 1;
-                while (i + n < seed_fills.size() && seed_fills[i+n].expert == seed_fills[i].expert + (int32_t)n &&
-                        seed_fills[i+n].slot == seed_fills[i].slot + (int32_t)n) ++n;
-                ggml_backend_tensor_set_async(d.backend, bank,
-                        (const uint8_t *) weights->data + seed_fills[i].expert * expert_size,
-                        seed_fills[i].slot * expert_size, n * expert_size);
-                seed_bytes += n * expert_size;
-                i += n;
-            }
-        }
-        if (!seed_fills.empty()) ggml_backend_synchronize(d.backend);
-
         for (int32_t s = 0; s < g.lru.n_slots; ++s) {
             g.lru.state[s] = g.lru.key_of[s] >= 0 ? moe_cache_lru::slot_state::READY : moe_cache_lru::slot_state::FREE;
         }
@@ -729,7 +692,6 @@ struct llama_moe_cache::impl {
         if (++g.generation == 0) ++g.generation;
         g.frozen = true;
         GGML_ASSERT(make_frozen_snapshot(l.group, g, il, out));
-        out.seed_bytes = seed_bytes;
         return true;
     }
 
@@ -953,7 +915,7 @@ bool llama_moe_cache::reserve_fill(int32_t device, int32_t group_id, int32_t il,
     if (!pimpl->build_fill_descriptor(this, device, group_id, il, owner_generation,
                 expert, slot, key, part_capacity, pending, parts)) return false;
 
-    // Descriptor validation is complete before the old owner is removed or the slot enters COPYING.
+    // Validate the full descriptor before removing its old owner or publishing COPYING.
     if (old_key >= 0) {
         const int32_t old_layer = old_key / g.lru.n_expert;
         const int32_t old_expert = old_key % g.lru.n_expert;
@@ -1027,10 +989,10 @@ const ggml_cuda_moe_ffn_cache_callbacks * llama_moe_cache_get_cuda_callbacks() {
 }
 
 bool llama_moe_cache::freeze_group_for_layer(int32_t il, ggml_backend * expected_backend,
-        const std::vector<int32_t> & seed_experts, frozen_lease & lease) {
+        frozen_lease & lease) {
     if (lease) return false;
     llama_moe_cache_frozen_layer descriptor;
-    if (!pimpl->freeze_group_for_layer(il, expected_backend, seed_experts, descriptor)) return false;
+    if (!pimpl->freeze_group_for_layer(il, expected_backend, descriptor)) return false;
     lease.owner = this;
     lease.descriptor = std::move(descriptor);
     return true;

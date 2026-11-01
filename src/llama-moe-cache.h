@@ -25,7 +25,6 @@ struct llama_moe_cache_frozen_layer {
     int32_t n_experts = 0;
     int32_t n_slots = 0;
     uint64_t generation = 0;
-    size_t seed_bytes = 0;
     const ggml_tensor * host_up = nullptr;
     const ggml_tensor * host_gate = nullptr;
     const ggml_tensor * host_down = nullptr;
@@ -58,7 +57,6 @@ public:
 
     private:
         friend class llama_moe_cache;
-        friend struct llama_moe_cache_test_access;
         llama_moe_cache * owner = nullptr;
         llama_moe_cache_frozen_layer descriptor;
     };
@@ -74,8 +72,7 @@ public:
     ggml_tensor * get_experts(const ggml_tensor * tensor) const;
     bool copy(ggml_backend * backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph,
             ggml_backend_sched_copy_phase phase);
-    bool freeze_group_for_layer(int32_t il, ggml_backend * expected_backend, const std::vector<int32_t> & seed_experts,
-            frozen_lease & lease);
+    bool freeze_group_for_layer(int32_t il, ggml_backend * expected_backend, frozen_lease & lease);
     bool frozen_layer_snapshot(const llama_moe_cache_frozen_layer & group_snapshot, int32_t il,
             llama_moe_cache_frozen_layer & snapshot) const;
     bool frozen_snapshot_valid(const llama_moe_cache_frozen_layer & descriptor) const;

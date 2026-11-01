@@ -70,14 +70,9 @@
 #include "ggml-cuda/ds4_comp.cuh"
 #include "ggml-moe-ffn.h"
 
-#include <atomic>
-#include <condition_variable>
-#include <chrono>
-#include <climits>
-#include <mutex>
-#include <thread>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -86,6 +81,8 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <condition_variable>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -1481,7 +1478,7 @@ static void * ggml_cuda_host_malloc(size_t size) {
 
     // Whether to request the kernel to attempt to defragment memory to back the region with 2M hugepages.
     // Otherwise dependent on kernel settings:
-    //   * enabled="always":  Hand over whatever 2M pages it has on hand and the rest will be 4k
+    //   * enabled="always":  Hand over whatever 2M pages it has on hand and the rest will be 4k 
     //   * enabled="madvise": 4k pages
     //   * enabled="never":   4k pages
     // Potluck on performance. If there's not much defragmentation to do, then you win. Otherwise come back in an hour.
@@ -4790,7 +4787,7 @@ static void update_cuda_graph_executable(ggml_cuda_graph * graph) {
 }
 #endif
 
-static bool evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph,
+static bool evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, 
     bool & graph_evaluated_or_captured, bool & use_cuda_graph, bool & cuda_graph_update_required) {
     // flag used to determine whether it is an integrated_gpu
     // TODO

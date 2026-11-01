@@ -1729,9 +1729,7 @@ llm_expert_gating_func_type   gating_op,
             layout.graph_flags = 0;
             if (n_tokens == 1 && !add_input) layout.graph_flags |= GGML_MOE_FFN_GRAPH_ONE_TOKEN;
             if (lctx.lora_adapters.empty()) layout.graph_flags |= GGML_MOE_FFN_GRAPH_NO_LORA;
-            // `weights` above is the completed router output after all ordinary
-            // normalization/scaling. The semantic op applies it after the FFN,
-            // so reject the distinct pre-FFN weighting graph contract.
+            // These are final route weights after ordinary router normalization/scaling.
             if (!weight_before_ffn) layout.graph_flags |= GGML_MOE_FFN_GRAPH_FINAL_ROUTE_WEIGHTS;
             const float routed_limit = lctx.model.swiglu_limit(il, false);
             if (type_op == LLM_FFN_SILU && std::isfinite(routed_limit) && routed_limit >= 0.0f)

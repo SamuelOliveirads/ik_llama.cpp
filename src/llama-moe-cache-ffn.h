@@ -14,10 +14,6 @@ struct ggml_backend;
 struct ggml_backend_buffer;
 
 struct llama_moe_cache_ffn_state {
-    struct group_state {
-        llama_moe_cache::frozen_lease lease;
-    };
-
     struct layer_binding {
         llama_moe_cache_frozen_layer snapshot;
         ggml_backend * cuda_backend = nullptr;
@@ -29,7 +25,6 @@ struct llama_moe_cache_ffn_state {
         ggml_tensor * cpu_routes = nullptr;
         ggml_tensor * cpu_output = nullptr;
         int32_t binding_id = 0;
-        int32_t cpu_resource_id = 0;
         ggml_moe_ffn_layout layout{};
     };
 
@@ -42,8 +37,7 @@ struct llama_moe_cache_ffn_state {
         int32_t n_ff = 0;
         int32_t n_experts_used = 0;
         std::vector<ggml_cuda_moe_ffn_resource_signature> resource_signatures;
-        bool cpu_backend_transferred = false;
-        std::vector<group_state> groups;
+        std::vector<llama_moe_cache::frozen_lease> groups;
         std::vector<layer_binding> layer_bindings;
     };
 

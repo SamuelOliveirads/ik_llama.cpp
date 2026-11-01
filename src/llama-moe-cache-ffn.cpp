@@ -107,7 +107,7 @@ bool llama_moe_cache_ffn_state::initialize(llama_moe_cache & cache, const llama_
         if (!ggml_backend_cuda_moe_ffn_layout_supported(owner, &candidate)) continue;
         bool group_seen = false;
         for (const auto & d : devices) for (const auto & g : d.groups) {
-            const auto & frozen_group = g.lease.snapshot();
+            const auto & frozen_group = g.snapshot();
             if (std::find(frozen_group.group_layers.begin(), frozen_group.group_layers.end(), il) !=
                     frozen_group.group_layers.end()) {
                 group_seen = true;
@@ -118,10 +118,10 @@ bool llama_moe_cache_ffn_state::initialize(llama_moe_cache & cache, const llama_
 
         device_state * dstate = nullptr;
         for (auto & d : devices) if (d.cuda_backend == owner) { dstate = &d; break; }
-        group_state group;
-        if (!cache.freeze_group_for_layer(il, owner, {}, group.lease))
+        llama_moe_cache::frozen_lease group;
+        if (!cache.freeze_group_for_layer(il, owner, group))
             return fail("cache group freeze");
-        const auto & frozen_group = group.lease.snapshot();
+        const auto & frozen_group = group.snapshot();
         if (frozen_group.owner_backend != owner || frozen_group.group_layers.empty())
             return fail("frozen group identity");
         llama_moe_cache_frozen_layer candidate_snapshot;
@@ -144,7 +144,7 @@ bool llama_moe_cache_ffn_state::initialize(llama_moe_cache & cache, const llama_
     size_t eligible_count = 0;
     int32_t ineligible_count = 0;
     for (auto & d : devices) for (const auto & g : d.groups) {
-        const auto & frozen_group = g.lease.snapshot();
+        const auto & frozen_group = g.snapshot();
         for (const int32_t il : frozen_group.group_layers) {
             llama_moe_cache_frozen_layer layer_snapshot;
             ggml_moe_ffn_layout descriptor{};
@@ -169,17 +169,15 @@ bool llama_moe_cache_ffn_state::initialize(llama_moe_cache & cache, const llama_
     for (auto & d : devices) {
         d.cpu_backend = ggml_backend_cpu_init();
         if (!d.cpu_backend) return fail("CPU backend allocation");
-        ggml_backend_cpu_set_n_threads(d.cpu_backend, cpu_threads);
         ggml_cuda_moe_ffn_cpu_resource resource = { d.cpu_backend, d.n_embd, d.n_ff,
             d.n_experts_used, cpu_threads, d.resource_signatures.data(),
             d.resource_signatures.size() };
         d.cpu_resource_id = ggml_backend_cuda_moe_ffn_cpu_resource_register(d.cuda_backend, &resource);
         if (d.cpu_resource_id <= 0) return fail("CUDA-owned CPU resource registration");
-        d.cpu_backend_transferred = true;
     }
 
     for (auto & d : devices) for (const auto & g : d.groups) {
-        const auto & frozen_group = g.lease.snapshot();
+        const auto & frozen_group = g.snapshot();
         for (const int32_t il : frozen_group.group_layers) {
             llama_moe_cache_frozen_layer snapshot;
             ggml_moe_ffn_layout layout{};
@@ -188,7 +186,6 @@ bool llama_moe_cache_ffn_state::initialize(llama_moe_cache & cache, const llama_
             layer_binding layer;
             layer.snapshot = std::move(snapshot);
             layer.cuda_backend = d.cuda_backend;
-            layer.cpu_resource_id = d.cpu_resource_id;
             layer.layout = layout;
             layer.cpu_ctx = ggml_init({ CPU_GRAPH_CONTEXT_BYTES, nullptr, true });
             if (!layer.cpu_ctx) return fail("per-layer CPU graph context allocation");
@@ -252,7 +249,6 @@ bool llama_moe_cache_ffn_state::initialize(llama_moe_cache & cache, const llama_
         ++indexed_bindings;
     }
     if (indexed_bindings != eligible_count) return fail("incomplete layer binding index");
-    // Binding vectors are frozen after publication, so these pointers stay stable until shutdown.
     ready = true;
 
     LLAMA_LOG_INFO("%s: devices=%zu groups=%zu compatible-layers=%zu unsupported-layers=%d resources=%zu threads/device=%d graph-context=%zu MiB\n",
@@ -317,13 +313,12 @@ void llama_moe_cache_ffn_state::shutdown() {
             if (!ggml_backend_cuda_moe_ffn_cpu_resource_unregister(d.cuda_backend, d.cpu_resource_id)) std::abort();
             d.cpu_resource_id = 0;
             d.cpu_backend = nullptr;
-            d.cpu_backend_transferred = false;
-        } else if (d.cpu_backend && !d.cpu_backend_transferred) {
+        } else if (d.cpu_backend) {
             ggml_backend_free(d.cpu_backend);
             d.cpu_backend = nullptr;
         }
-        for (auto & g : d.groups) if (g.lease) {
-            if (!g.lease.release()) std::abort();
+        for (auto & lease : d.groups) if (lease) {
+            if (!lease.release()) std::abort();
         }
         d.groups.clear();
     }

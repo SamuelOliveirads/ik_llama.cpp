@@ -9324,7 +9324,7 @@ static void llama_repack_up_gate_exps(llama_context & lctx) {
     }
 }
 
-static struct llama_context * llama_init_from_model_internal(
+struct llama_context * llama_init_from_model(
                  struct llama_model * model,
         struct llama_context_params   params) {
 
@@ -10219,10 +10219,6 @@ static struct llama_context * llama_init_from_model_internal(
     }
 
     return ctx;
-}
-
-struct llama_context * llama_init_from_model(struct llama_model * model, struct llama_context_params params) {
-    return llama_init_from_model_internal(model, params);
 }
 
 void llama_free(struct llama_context * ctx) {

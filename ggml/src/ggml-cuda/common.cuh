@@ -974,7 +974,7 @@ struct ggml_backend_cuda_context {
         return stream(device, GGML_CUDA_STREAM_COMPUTE);
     }
 
-    // Stream 0 is ordinary backend compute; MoE fill publication uses a
+    // Stream 0 is ordinary backend compute. MoE fill publication uses a
     // separate non-blocking transport stream so cache copies do not own it.
     cudaStream_t moe_fill_stream() {
         return stream(device, GGML_CUDA_STREAM_MOE_FILL);
