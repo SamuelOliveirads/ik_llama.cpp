@@ -1851,8 +1851,12 @@ llm_expert_gating_func_type   gating_op,
             layout.n_experts_used = n_expert_used > 0 && n_expert_used <= INT32_MAX ? (int32_t) n_expert_used : 0;
             layout.up = up_exps; layout.gate = gate_exps; layout.down = down_exps;
             layout.activation = cur; layout.selected_ids = selected_experts; layout.route_weights = weights;
+            layout.n_tokens = n_tokens;
             layout.graph_flags = 0;
-            if (n_tokens == 1 && !add_input) layout.graph_flags |= GGML_MOE_FFN_GRAPH_ONE_TOKEN;
+            // Multi-token hybrid execution is only valid when the graph consumes every token output.
+            if (n_tokens > 0 && n_tokens <= layout.token_capacity &&
+                    lctx.n_outputs == n_tokens && !add_input)
+                layout.graph_flags |= GGML_MOE_FFN_GRAPH_ALL_TOKEN_OUTPUTS;
             if (lctx.lora_adapters.empty()) layout.graph_flags |= GGML_MOE_FFN_GRAPH_NO_LORA;
             // These are final route weights after ordinary router normalization/scaling.
             if (!weight_before_ffn) layout.graph_flags |= GGML_MOE_FFN_GRAPH_FINAL_ROUTE_WEIGHTS;

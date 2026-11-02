@@ -10205,7 +10205,10 @@ struct llama_context * llama_init_from_model(
                     return nullptr;
                 }
                 ctx->moe_cache_ffn = std::make_unique<llama_moe_cache_ffn_state>();
-                if (!ctx->moe_cache_ffn->initialize(*ctx->moe_cache, *model, cparams.n_threads)) {
+                const int32_t token_capacity = static_cast<int32_t>(std::min(cparams.n_ubatch,
+                        llama_moe_cache::max_batch_tokens));
+                if (!ctx->moe_cache_ffn->initialize(*ctx->moe_cache, *model, cparams.n_threads,
+                            token_capacity)) {
                     LLAMA_LOG_ERROR("%s: failed to initialize CUDA hybrid MoE FFN execution\n", __func__);
                     llama_free(ctx);
                     return nullptr;

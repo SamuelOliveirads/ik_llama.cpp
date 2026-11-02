@@ -46,7 +46,8 @@ struct llama_moe_cache_ffn_state {
     std::vector<const layer_binding *> layer_by_index;
     bool ready = false;
 
-    bool initialize(llama_moe_cache & cache, const llama_model & model, int32_t cpu_threads);
+    bool initialize(llama_moe_cache & cache, const llama_model & model, int32_t cpu_threads,
+            int32_t token_capacity);
     void shutdown();
     const layer_binding * find_layer(int32_t il) const;
     ggml_tensor * build_node(ggml_context * ctx, ggml_backend_sched_t sched,

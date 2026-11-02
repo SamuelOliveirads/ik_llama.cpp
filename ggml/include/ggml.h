@@ -1184,6 +1184,7 @@ extern "C" {
             int32_t device,
             int32_t binding_id,
             uint64_t generation,
+            int32_t n_tokens,
             int32_t n_embd,
             int32_t n_ff,
             int32_t unary_op,

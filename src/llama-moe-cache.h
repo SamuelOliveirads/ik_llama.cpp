@@ -43,6 +43,8 @@ struct llama_moe_cache_frozen_layer {
 
 class llama_moe_cache {
 public:
+    static constexpr uint32_t max_batch_tokens = 32;
+
     class frozen_lease {
     public:
         frozen_lease() = default;

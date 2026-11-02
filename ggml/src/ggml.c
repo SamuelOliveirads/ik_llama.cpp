@@ -6781,6 +6781,7 @@ struct ggml_tensor * ggml_moe_ffn(
         int32_t device,
         int32_t binding_id,
         uint64_t generation,
+        int32_t n_tokens,
         int32_t n_embd,
         int32_t n_ff,
         int32_t unary_op,
@@ -6789,12 +6790,12 @@ struct ggml_tensor * ggml_moe_ffn(
     GGML_ASSERT(activations->type == GGML_TYPE_F32);
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
     GGML_ASSERT(route_weights->type == GGML_TYPE_F32);
-    GGML_ASSERT(device >= 0 && binding_id > 0 && generation > 0 && n_embd > 0 && n_ff > 0);
-    GGML_ASSERT(activations->ne[1] == 1 && activations->ne[2] == 1 && activations->ne[3] == 1);
+    GGML_ASSERT(device >= 0 && binding_id > 0 && generation > 0 && n_tokens > 0 && n_embd > 0 && n_ff > 0);
+    GGML_ASSERT(activations->ne[1] == n_tokens && activations->ne[2] == 1 && activations->ne[3] == 1);
     GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1 && route_weights->ne[3] == 1);
-    GGML_ASSERT(ids->ne[0] > 0 && ids->ne[1] == activations->ne[1]);
+    GGML_ASSERT(ids->ne[0] > 0 && ids->ne[1] == n_tokens);
     GGML_ASSERT(route_weights->ne[0] == 1 && route_weights->ne[1] == ids->ne[0]);
-    GGML_ASSERT(route_weights->ne[2] == activations->ne[1]);
+    GGML_ASSERT(route_weights->ne[2] == n_tokens);
 
     const int64_t ne[GGML_MAX_DIMS] = { n_embd, activations->ne[1], 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, ne);
@@ -6804,7 +6805,7 @@ struct ggml_tensor * ggml_moe_ffn(
     result->src[2] = route_weights;
 
     const struct ggml_moe_ffn_op_params op_params = {
-        device, binding_id, generation, n_embd, n_ff, unary_op, limit,
+        device, binding_id, generation, n_tokens, n_embd, n_ff, unary_op, limit,
     };
     memcpy(result->op_params, &op_params, sizeof(op_params));
     return result;

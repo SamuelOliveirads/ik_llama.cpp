@@ -209,8 +209,6 @@ struct llama_moe_cache::impl {
     };
     struct stats { size_t hits = 0; size_t misses = 0; size_t evictions = 0; size_t bytes = 0; };
 
-    static constexpr int64_t max_batch = 32;
-
     int32_t n_expert_used;
     std::vector<device> devices;
     std::vector<group> groups;
@@ -595,7 +593,7 @@ struct llama_moe_cache::impl {
         const layer & l = layers[il];
         const group & g = groups[l.group];
         if (g.frozen) return nullptr;
-        if (n_tokens <= 0 || n_tokens > max_batch || n_expert_used <= 0 ||
+        if (n_tokens <= 0 || n_tokens > llama_moe_cache::max_batch_tokens || n_expert_used <= 0 ||
                 n_tokens > std::numeric_limits<int64_t>::max() / n_expert_used) {
             ++large_batch_skips;
             return nullptr;
@@ -807,7 +805,7 @@ bool llama_moe_cache::resolve_and_pin(int32_t device, int32_t group_id, int32_t 
             il < 0 || (size_t) il >= pimpl->layers.size()) return false;
     auto & g = pimpl->groups[group_id];
     auto & l = pimpl->layers[il];
-    if (!g.frozen || g.generation != owner_generation || g.device != device || n_ids > g.lru.n_expert ||
+    if (!g.frozen || g.generation != owner_generation || g.device != device ||
             l.group != group_id || !g.lru.slot_map[il]) return false;
 
     int32_t n_pins = 0;

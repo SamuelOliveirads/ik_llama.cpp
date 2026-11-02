@@ -18,7 +18,7 @@ enum ggml_moe_ffn_layout_flag {
 };
 
 enum ggml_moe_ffn_graph_flag {
-    GGML_MOE_FFN_GRAPH_ONE_TOKEN = 1u << 0,
+    GGML_MOE_FFN_GRAPH_ALL_TOKEN_OUTPUTS = 1u << 0,
     GGML_MOE_FFN_GRAPH_NO_LORA = 1u << 1,
     GGML_MOE_FFN_GRAPH_FINAL_ROUTE_WEIGHTS = 1u << 2,
     GGML_MOE_FFN_GRAPH_SILU_LIMIT = 1u << 3,
@@ -28,6 +28,7 @@ enum ggml_moe_ffn_graph_flag {
 
 struct ggml_moe_ffn_layout {
     int32_t n_experts, n_experts_used, n_embd, n_ff, n_slots;
+    int32_t n_tokens, token_capacity;
     int32_t device, cache_group, cache_layer;
     enum ggml_moe_ffn_storage_topology storage_topology;
     const void * owner_backend;
@@ -75,6 +76,26 @@ static inline bool ggml_moe_ffn_tensor_layout(const struct ggml_tensor * tensor,
     // The executor addresses experts with nb[2], so each slice must be exactly its packed row extent
     return tensor->nb[1] == row_bytes && tensor->nb[2] == expert_bytes &&
         tensor->nb[3] == expert_bytes * (size_t) ne2 && ggml_is_contiguous(tensor);
+}
+
+static inline bool ggml_moe_ffn_selected_ids_layout(const struct ggml_tensor * tensor,
+        int64_t n_selected, int64_t n_tokens) {
+    if (!ggml_moe_ffn_tensor_shape(tensor, GGML_TYPE_I32, n_selected, n_tokens, 1) ||
+            tensor->nb[0] != sizeof(int32_t)) return false;
+    size_t row_bytes = 0, rows_extent = 0, visible_extent = 0;
+    if ((size_t) n_selected > SIZE_MAX / sizeof(int32_t)) return false;
+    row_bytes = (size_t) n_selected * sizeof(int32_t);
+    if (tensor->nb[1] < row_bytes || tensor->nb[1] > SIZE_MAX / (size_t) n_tokens) return false;
+    rows_extent = tensor->nb[1] * (size_t) n_tokens;
+    if (tensor->nb[2] != rows_extent || tensor->nb[3] != rows_extent ||
+            (size_t) (n_tokens - 1) > SIZE_MAX / tensor->nb[1]) return false;
+    visible_extent = (size_t) (n_tokens - 1) * tensor->nb[1];
+    if (visible_extent > SIZE_MAX - row_bytes) return false;
+    visible_extent += row_bytes;
+    if (!tensor->view_src) return ggml_is_contiguous(tensor) && tensor->nb[1] == row_bytes;
+    if (!ggml_is_contiguous(tensor->view_src) || tensor->view_offs > ggml_nbytes(tensor->view_src) ||
+            visible_extent > ggml_nbytes(tensor->view_src) - tensor->view_offs) return false;
+    return true;
 }
 
 static inline bool ggml_moe_ffn_bank_layout_matches(const struct ggml_tensor * host,
@@ -169,16 +190,15 @@ static inline bool ggml_moe_ffn_layout_supported(const struct ggml_moe_ffn_layou
 }
 
 static inline bool ggml_moe_ffn_graph_inputs_supported(const struct ggml_moe_ffn_layout * l) {
-    return ggml_moe_ffn_layout_supported(l) && l->n_slots > 0 &&
-        ggml_moe_ffn_tensor_shape(l->activation, GGML_TYPE_F32, l->n_embd, 1, 1) &&
-        ggml_moe_ffn_tensor_shape(l->selected_ids, GGML_TYPE_I32, l->n_experts_used, 1, 1) &&
-        ggml_moe_ffn_tensor_shape(l->route_weights, GGML_TYPE_F32, 1, l->n_experts_used, 1) &&
-        ggml_is_contiguous(l->activation) && ggml_is_contiguous(l->selected_ids) &&
-        ggml_is_contiguous(l->route_weights);
+    return ggml_moe_ffn_layout_supported(l) && l->n_slots > 0 && l->n_tokens > 0 &&
+        l->token_capacity > 0 && l->n_tokens <= l->token_capacity &&
+        ggml_moe_ffn_tensor_layout(l->activation, GGML_TYPE_F32, l->n_embd, l->n_tokens, 1) &&
+        ggml_moe_ffn_selected_ids_layout(l->selected_ids, l->n_experts_used, l->n_tokens) &&
+        ggml_moe_ffn_tensor_layout(l->route_weights, GGML_TYPE_F32, 1, l->n_experts_used, l->n_tokens);
 }
 
 static inline bool ggml_moe_ffn_graph_supported(const struct ggml_moe_ffn_layout * l) {
-    const uint32_t required = GGML_MOE_FFN_GRAPH_ONE_TOKEN | GGML_MOE_FFN_GRAPH_NO_LORA |
+    const uint32_t required = GGML_MOE_FFN_GRAPH_ALL_TOKEN_OUTPUTS | GGML_MOE_FFN_GRAPH_NO_LORA |
         GGML_MOE_FFN_GRAPH_FINAL_ROUTE_WEIGHTS | GGML_MOE_FFN_GRAPH_SILU_LIMIT |
         GGML_MOE_FFN_GRAPH_NO_EXPERT_EXECUTION_EXTRAS | GGML_MOE_FFN_GRAPH_NO_HADAMARD;
     return l && (l->graph_flags & required) == required && ggml_moe_ffn_graph_inputs_supported(l);
@@ -188,6 +208,7 @@ struct ggml_moe_ffn_op_params {
     int32_t device;
     int32_t binding_id;
     uint64_t generation;
+    int32_t n_tokens;
     int32_t n_embd;
     int32_t n_ff;
     int32_t unary_op;

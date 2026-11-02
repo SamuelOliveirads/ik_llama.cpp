@@ -69,6 +69,7 @@ typedef struct ggml_cuda_moe_ffn_resource_signature {
     int32_t n_embd;
     int32_t n_ff;
     int32_t n_experts_used;
+    int32_t token_capacity;
 } ggml_cuda_moe_ffn_resource_signature;
 
 typedef struct ggml_cuda_moe_ffn_cpu_resource {
@@ -76,6 +77,7 @@ typedef struct ggml_cuda_moe_ffn_cpu_resource {
     int32_t n_embd;
     int32_t n_ff;
     int32_t n_experts_used;
+    int32_t token_capacity;
     int32_t n_threads;
     const ggml_cuda_moe_ffn_resource_signature * signatures; // copied on registration
     size_t n_signatures;

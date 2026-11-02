@@ -17,6 +17,26 @@ namespace {
 
 constexpr size_t CPU_GRAPH_CONTEXT_BYTES = 1024 * 1024;
 
+bool has_routed_expert_tensors(const llama_layer & layer) {
+    return layer.ffn_up_exps || layer.ffn_gate_exps || layer.ffn_down_exps;
+}
+
+#ifdef GGML_USE_CUDA
+void release_resource(llama_moe_cache_ffn_state::device_state & device, bool stopped = false) {
+    if (device.cpu_resource_id > 0) {
+        if ((!stopped && !ggml_backend_cuda_moe_ffn_cpu_resource_stop(device.cuda_backend, device.cpu_resource_id)) ||
+                !ggml_backend_cuda_moe_ffn_cpu_resource_unregister(device.cuda_backend, device.cpu_resource_id)) {
+            std::abort();
+        }
+        device.cpu_resource_id = 0;
+        device.cpu_backend = nullptr; // Ownership transferred to the CUDA resource at registration.
+    } else if (device.cpu_backend) {
+        ggml_backend_free(device.cpu_backend);
+        device.cpu_backend = nullptr;
+    }
+}
+#endif
+
 bool model_layer_layout(const llama_model & model, int32_t il, ggml_moe_ffn_layout & layout) {
     if (il < 0 || (size_t) il >= model.layers.size()) return false;
     const auto & w = model.layers[il];
@@ -50,8 +70,9 @@ bool model_layer_layout(const llama_model & model, int32_t il, ggml_moe_ffn_layo
 
 bool layer_is_eligible(const llama_model & model, int32_t il, const llama_moe_cache & cache,
         const llama_moe_cache_frozen_layer & s, int32_t device, ggml_backend * backend,
-        ggml_moe_ffn_layout & layout) {
+        int32_t token_capacity, ggml_moe_ffn_layout & layout) {
     if (!model_layer_layout(model, il, layout)) return false;
+    layout.token_capacity = token_capacity;
     layout.n_slots = s.n_slots;
     layout.device = s.device_group;
     layout.cache_group = s.group;
@@ -80,30 +101,85 @@ void add_stats(ggml_cuda_moe_ffn_stats & dst, const ggml_cuda_moe_ffn_stats & sr
 } // namespace
 
 bool llama_moe_cache_ffn_state::initialize(llama_moe_cache & cache, const llama_model & model,
-        int32_t cpu_threads) {
+        int32_t cpu_threads, int32_t token_capacity) {
 #ifndef GGML_USE_CUDA
     GGML_UNUSED(cache);
     GGML_UNUSED(model);
     GGML_UNUSED(cpu_threads);
+    GGML_UNUSED(token_capacity);
     return false;
 #else
     const auto fail = [](const char * stage) {
         LLAMA_LOG_ERROR("%s: MoE cache FFN initialization failed at %s\n", __func__, stage);
         return false;
     };
-    if (cpu_threads <= 0) return fail("invalid CPU thread count");
+    if (cpu_threads <= 0 || token_capacity <= 0) return fail("invalid resource envelope");
 
     this->cache = &cache;
 
     const int32_t first_layer = 0;
     const int32_t last_layer = (int32_t) model.layers.size();
+    // Establish every device signature and allocate its complete context envelope before freezing cache groups.
     for (int32_t il = first_layer; il < last_layer; ++il) {
         ggml_moe_ffn_layout candidate{};
         if (!model_layer_layout(model, il, candidate)) continue;
         ggml_backend * owner = cache.backend(il);
         if (!owner) continue;
         candidate.owner_backend = owner;
+        candidate.device = -1;
+        candidate.token_capacity = token_capacity;
+        if (!ggml_backend_cuda_moe_ffn_layout_supported(owner, &candidate)) continue;
+
+        auto it = std::find_if(devices.begin(), devices.end(), [&](const auto & d) {
+            return d.cuda_backend == owner;
+        });
+        if (it == devices.end()) {
+            devices.emplace_back();
+            devices.back().cuda_backend = owner;
+            it = std::prev(devices.end());
+        }
+        const ggml_cuda_moe_ffn_resource_signature signature{
+            candidate.n_embd, candidate.n_ff, candidate.n_experts_used, token_capacity };
+        if (std::find_if(it->resource_signatures.begin(), it->resource_signatures.end(), [&](const auto & current) {
+                    return current.n_embd == signature.n_embd && current.n_ff == signature.n_ff &&
+                        current.n_experts_used == signature.n_experts_used &&
+                        current.token_capacity == signature.token_capacity;
+                }) == it->resource_signatures.end()) it->resource_signatures.push_back(signature);
+        it->n_embd = std::max(it->n_embd, candidate.n_embd);
+        it->n_ff = std::max(it->n_ff, candidate.n_ff);
+        it->n_experts_used = std::max(it->n_experts_used, candidate.n_experts_used);
+    }
+    for (auto & d : devices) {
+        d.cpu_backend = ggml_backend_cpu_init();
+        if (!d.cpu_backend) {
+            LLAMA_LOG_WARN("%s: CPU resource allocation failed; leaving backend on blocking cache path\n", __func__);
+            continue;
+        }
+        ggml_cuda_moe_ffn_cpu_resource resource = { d.cpu_backend, d.n_embd, d.n_ff,
+            d.n_experts_used, token_capacity, cpu_threads, d.resource_signatures.data(),
+            d.resource_signatures.size() };
+        d.cpu_resource_id = ggml_backend_cuda_moe_ffn_cpu_resource_register(d.cuda_backend, &resource);
+        if (d.cpu_resource_id <= 0) {
+            ggml_backend_free(d.cpu_backend);
+            d.cpu_backend = nullptr;
+            LLAMA_LOG_WARN("%s: hybrid resource does not cover token capacity %d; leaving backend on blocking cache path\n",
+                    __func__, token_capacity);
+        }
+    }
+    devices.erase(std::remove_if(devices.begin(), devices.end(), [](const auto & d) {
+        return d.cpu_resource_id <= 0;
+    }), devices.end());
+
+    std::vector<bool> rejected_group_layers(model.layers.size(), false);
+    for (int32_t il = first_layer; il < last_layer; ++il) {
+        if (rejected_group_layers[il]) continue;
+        ggml_moe_ffn_layout candidate{};
+        if (!model_layer_layout(model, il, candidate)) continue;
+        ggml_backend * owner = cache.backend(il);
+        if (!owner) continue;
+        candidate.owner_backend = owner;
         candidate.device = -1; // The CUDA-owned query resolves and checks this backend's device.
+        candidate.token_capacity = token_capacity;
         if (!ggml_backend_cuda_moe_ffn_layout_supported(owner, &candidate)) continue;
         bool group_seen = false;
         for (const auto & d : devices) for (const auto & g : d.groups) {
@@ -118,71 +194,90 @@ bool llama_moe_cache_ffn_state::initialize(llama_moe_cache & cache, const llama_
 
         device_state * dstate = nullptr;
         for (auto & d : devices) if (d.cuda_backend == owner) { dstate = &d; break; }
+        if (!dstate || dstate->cpu_resource_id <= 0) continue;
         llama_moe_cache::frozen_lease group;
         if (!cache.freeze_group_for_layer(il, owner, group))
             return fail("cache group freeze");
         const auto & frozen_group = group.snapshot();
         if (frozen_group.owner_backend != owner || frozen_group.group_layers.empty())
             return fail("frozen group identity");
-        llama_moe_cache_frozen_layer candidate_snapshot;
-        ggml_moe_ffn_layout descriptor{};
-        const bool snapshot_ok = cache.frozen_layer_snapshot(frozen_group, il, candidate_snapshot);
-        const bool eligible = snapshot_ok && layer_is_eligible(model, il, cache, candidate_snapshot,
-                frozen_group.device_group, owner, descriptor);
-        if (!eligible) continue;
-        if (!dstate) {
-            devices.emplace_back();
-            dstate = &devices.back();
-            dstate->cuda_backend = owner;
+
+        bool group_eligible = true;
+        bool group_has_routed_layer = false;
+        for (const int32_t group_layer : frozen_group.group_layers) {
+            if (group_layer < 0 || (size_t) group_layer >= model.layers.size()) {
+                group_eligible = false;
+                break;
+            }
+            const auto & weights = model.layers[group_layer];
+            if (!has_routed_expert_tensors(weights)) continue;
+            group_has_routed_layer = true;
+            if (!weights.ffn_up_exps || !weights.ffn_gate_exps || !weights.ffn_down_exps) {
+                group_eligible = false;
+                break;
+            }
+            llama_moe_cache_frozen_layer snapshot;
+            ggml_moe_ffn_layout descriptor{};
+            if (!cache.frozen_layer_snapshot(frozen_group, group_layer, snapshot) ||
+                    !layer_is_eligible(model, group_layer, cache, snapshot, frozen_group.device_group,
+                        owner, token_capacity, descriptor)) {
+                group_eligible = false;
+                break;
+            }
+        }
+        if (!group_eligible || !group_has_routed_layer) {
+            for (const int32_t group_layer : frozen_group.group_layers) {
+                if (group_layer >= 0 && (size_t) group_layer < rejected_group_layers.size())
+                    rejected_group_layers[group_layer] = true;
+            }
+            if (!group.release()) return fail("ineligible cache group release");
+            continue;
         }
         if (dstate->device < 0) dstate->device = frozen_group.device_group;
         if (dstate->device != frozen_group.device_group) return fail("backend spans incompatible cache devices");
         dstate->groups.push_back(std::move(group));
     }
-    if (devices.empty()) return fail("no eligible cache groups discovered");
-
     size_t eligible_count = 0;
-    int32_t ineligible_count = 0;
+    size_t routed_layer_count = 0;
+    for (const auto & layer : model.layers) if (has_routed_expert_tensors(layer)) ++routed_layer_count;
     for (auto & d : devices) for (const auto & g : d.groups) {
         const auto & frozen_group = g.snapshot();
         for (const int32_t il : frozen_group.group_layers) {
+            if (il < 0 || (size_t) il >= model.layers.size() ||
+                    !has_routed_expert_tensors(model.layers[il])) continue;
             llama_moe_cache_frozen_layer layer_snapshot;
             ggml_moe_ffn_layout descriptor{};
-            if (cache.frozen_layer_snapshot(frozen_group, il, layer_snapshot) &&
-                    layer_is_eligible(model, il, cache, layer_snapshot, d.device,
-                        d.cuda_backend, descriptor)) {
-                const ggml_cuda_moe_ffn_resource_signature signature{
-                    descriptor.n_embd, descriptor.n_ff, descriptor.n_experts_used };
-                if (std::find_if(d.resource_signatures.begin(), d.resource_signatures.end(), [&](const auto & current) {
-                            return current.n_embd == signature.n_embd && current.n_ff == signature.n_ff &&
-                                current.n_experts_used == signature.n_experts_used;
-                        }) == d.resource_signatures.end()) d.resource_signatures.push_back(signature);
-                d.n_embd = std::max(d.n_embd, descriptor.n_embd);
-                d.n_ff = std::max(d.n_ff, descriptor.n_ff);
-                d.n_experts_used = std::max(d.n_experts_used, descriptor.n_experts_used);
-                ++eligible_count;
-            } else ++ineligible_count;
+            if (!cache.frozen_layer_snapshot(frozen_group, il, layer_snapshot) ||
+                    !layer_is_eligible(model, il, cache, layer_snapshot, d.device,
+                        d.cuda_backend, token_capacity, descriptor)) return fail("retained group changed after validation");
+            ++eligible_count;
         }
     }
-    if (eligible_count == 0) return fail("no compatible layers in frozen groups");
+    const size_t ineligible_count = routed_layer_count - std::min(routed_layer_count, eligible_count);
 
-    for (auto & d : devices) {
-        d.cpu_backend = ggml_backend_cpu_init();
-        if (!d.cpu_backend) return fail("CPU backend allocation");
-        ggml_cuda_moe_ffn_cpu_resource resource = { d.cpu_backend, d.n_embd, d.n_ff,
-            d.n_experts_used, cpu_threads, d.resource_signatures.data(),
-            d.resource_signatures.size() };
-        d.cpu_resource_id = ggml_backend_cuda_moe_ffn_cpu_resource_register(d.cuda_backend, &resource);
-        if (d.cpu_resource_id <= 0) return fail("CUDA-owned CPU resource registration");
+    for (auto & d : devices) if (d.groups.empty()) release_resource(d);
+    devices.erase(std::remove_if(devices.begin(), devices.end(), [](const auto & d) {
+        return d.groups.empty();
+    }), devices.end());
+
+    if (eligible_count == 0) {
+        layer_by_index.assign(model.layers.size(), nullptr);
+        ready = true;
+        LLAMA_LOG_WARN("%s: no cache group could use the declared token capacity %d; retaining blocking cache path\n",
+                __func__, token_capacity);
+        return true;
     }
 
     for (auto & d : devices) for (const auto & g : d.groups) {
         const auto & frozen_group = g.snapshot();
         for (const int32_t il : frozen_group.group_layers) {
+            if (il < 0 || (size_t) il >= model.layers.size() ||
+                    !has_routed_expert_tensors(model.layers[il])) continue;
             llama_moe_cache_frozen_layer snapshot;
             ggml_moe_ffn_layout layout{};
             if (!cache.frozen_layer_snapshot(frozen_group, il, snapshot) ||
-                    !layer_is_eligible(model, il, cache, snapshot, d.device, d.cuda_backend, layout)) continue;
+                    !layer_is_eligible(model, il, cache, snapshot, d.device, d.cuda_backend,
+                        token_capacity, layout)) return fail("retained group changed before binding");
             layer_binding layer;
             layer.snapshot = std::move(snapshot);
             layer.cuda_backend = d.cuda_backend;
@@ -251,7 +346,7 @@ bool llama_moe_cache_ffn_state::initialize(llama_moe_cache & cache, const llama_
     if (indexed_bindings != eligible_count) return fail("incomplete layer binding index");
     ready = true;
 
-    LLAMA_LOG_INFO("%s: devices=%zu groups=%zu compatible-layers=%zu unsupported-layers=%d resources=%zu threads/device=%d graph-context=%zu MiB\n",
+    LLAMA_LOG_INFO("%s: devices=%zu groups=%zu compatible-layers=%zu unsupported-layers=%zu resources=%zu threads/device=%d graph-context=%zu MiB\n",
             __func__, devices.size(), std::accumulate(devices.begin(), devices.end(), size_t(0),
                 [](size_t n, const device_state & d) { return n + d.groups.size(); }),
             indexed_bindings, ineligible_count, devices.size(), cpu_threads,
@@ -309,14 +404,7 @@ void llama_moe_cache_ffn_state::shutdown() {
             if (layer.cpu_ctx) { ggml_free(layer.cpu_ctx); layer.cpu_ctx = nullptr; }
         }
         d.layer_bindings.clear();
-        if (d.cpu_resource_id > 0) {
-            if (!ggml_backend_cuda_moe_ffn_cpu_resource_unregister(d.cuda_backend, d.cpu_resource_id)) std::abort();
-            d.cpu_resource_id = 0;
-            d.cpu_backend = nullptr;
-        } else if (d.cpu_backend) {
-            ggml_backend_free(d.cpu_backend);
-            d.cpu_backend = nullptr;
-        }
+        release_resource(d, true);
         for (auto & lease : d.groups) if (lease) {
             if (!lease.release()) std::abort();
         }
@@ -346,6 +434,7 @@ ggml_tensor * llama_moe_cache_ffn_state::build_node(ggml_context * ctx, ggml_bac
             layout.n_experts != layer->layout.n_experts || layout.n_experts_used != layer->layout.n_experts_used ||
             layout.n_embd != layer->layout.n_embd || layout.n_ff != layer->layout.n_ff ||
             layout.n_slots != layer->layout.n_slots || layout.storage_topology != layer->layout.storage_topology ||
+            layout.token_capacity != layer->layout.token_capacity ||
             layout.up != layer->layout.up || layout.gate != layer->layout.gate || layout.down != layer->layout.down ||
             layout.bank_up != layer->layout.bank_up || layout.bank_gate != layer->layout.bank_gate ||
             layout.bank_down != layer->layout.bank_down || layout.up_gate_storage != layer->layout.up_gate_storage ||
@@ -354,7 +443,7 @@ ggml_tensor * llama_moe_cache_ffn_state::build_node(ggml_context * ctx, ggml_bac
             layout.limit != layer->layout.limit || layout.flags != layer->layout.flags) return nullptr;
     ggml_tensor * op = ggml_moe_ffn(ctx, const_cast<ggml_tensor *>(layout.activation),
             const_cast<ggml_tensor *>(layout.selected_ids), const_cast<ggml_tensor *>(layout.route_weights),
-            layout.device, layer->binding_id, layer->snapshot.generation,
+            layout.device, layer->binding_id, layer->snapshot.generation, layout.n_tokens,
             layout.n_embd, layout.n_ff, layout.unary_op, layout.limit);
     if (!ggml_backend_supports_op(layer->cuda_backend, op)) return nullptr;
     ggml_backend_sched_set_tensor_backend(sched, op, layer->cuda_backend);
